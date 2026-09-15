@@ -1,0 +1,57 @@
+# Bhaskera inference config — Param2-17B-A2.4B-Thinking + COLOSSUS/ZSSR
+# ─────────────────────────────────────────────────────────────────
+# Same model as inference_param2.yaml, but expert weights are served via
+# COLOSSUS column-level offload instead of dense device_map=auto:
+#   VRAM: ~19.6GB total with INT4-row scoring replica (fits 1x24GB)
+#         vs ~34GB bf16 dense (needs 2x24GB or 1x40GB+).
+#
+# Frozen ZSSR: L0 frequency fallback, L>=1 h_{L-1}@W_L Top-8 (zero params),
+# E=(silu(h@Wg)*(h@Wu))^2 fixed packets 50x5+25x3=325 cols, GPU LRU 32/expert,
+# prefetch inside the ~136us MHA window, exact SA-FFN. Fresh every token.
+#
+# Run with:
+#   bhaskera-infer --config configs/inference_colossus.yaml \
+#                  --prompt "Explain the attention mechanism."
+
+model:
+  name: bharatgenai/Param2-17B-A2.4B-Thinking
+  dtype: bfloat16
+  attn_impl: null
+  trust_remote_code: true      # REQUIRED — custom param2moe modeling code
+
+inference:
+  max_new_tokens: 512
+  temperature: 0.7
+  top_p: 0.9
+  top_k: 50
+  do_sample: true
+  batch_size: 1
+  device: auto
+
+  kv_cache: turboquant
+
+  turboquant:
+    key_bits: 4
+    value_bits: 2
+    residual_window: 128
+    protected_layers: 2
+
+  speculative:
+    enabled: false
+    draft_model_name: ""
+    num_draft_tokens: 5
+
+  # COLOSSUS + ZSSR (opt-in; dense path untouched when disabled)
+  colossus:
+    enabled: true
+    replica: int4_row         # int8 on H100 (19.3GB) | int4_row on 24GB (9.7GB)
+    budget: tiered_fwd        # 50x5+25x3=325 cols | uniform40 = 40x8=320
+    top_k_experts: 8
+    lru_slots_per_expert: 32
+
+  torch_compile: false
+
+logging:
+  tracker: null
+  project: bhaskera
+  run_name: infer-param2-colossus

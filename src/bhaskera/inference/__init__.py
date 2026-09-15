@@ -10,6 +10,7 @@ kv_cache      StaticKVCache, TurboQuantKVCache — KV cache strategies
 lloyd_max     LloydMaxCodebook — optimal scalar quantizer for TurboQuant
 speculative   SpeculativeDecoder — lossless 2–3× decode speedup
 sampling      top_k_filter, top_p_filter, sample_from_logits — sampling utils
+colossus      ZSSRPredictor, ColumnDirectory — COLOSSUS MoE offload (opt-in)
 
 Quick start
 -----------
@@ -59,6 +60,15 @@ from .sampling   import (
     top_p_filter,
 )
 from .speculative import SpeculativeDecoder, build_speculative_decoder
+from .colossus import (
+    ColumnDirectory,
+    ZSSRPredictor,
+    columns_batched,
+    columns_loop,
+    plan_fixed_packets,
+    quantize_int8,
+    stack_expert_weights,
+)
 
 __all__ = [
     # Engine
@@ -80,4 +90,12 @@ __all__ = [
     # Speculative
     "SpeculativeDecoder",
     "build_speculative_decoder",
+    # COLOSSUS (opt-in, default-off)
+    "ZSSRPredictor",
+    "quantize_int8",
+    "columns_batched",
+    "columns_loop",
+    "stack_expert_weights",
+    "ColumnDirectory",
+    "plan_fixed_packets",
 ]

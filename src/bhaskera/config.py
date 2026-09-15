@@ -63,6 +63,19 @@ class SpeculativeConfig:
 
 
 @dataclass
+class ColossusConfig:
+    """COLOSSUS + ZSSR column-level MoE offload (default-off)."""
+
+    enabled: bool = False
+    # Scoring replica: "int8" (H100, 19.3GB Qwen3) | "int4_row" (24GB, 9.7GB, -2pts).
+    replica: str = "int8"
+    # Fixed-packet budget preset: "tiered_fwd" (50x5+25x3=325) | "uniform40" (40x8=320).
+    budget: str = "tiered_fwd"
+    top_k_experts: int = 8
+    lru_slots_per_expert: int = 32
+
+
+@dataclass
 class InferenceConfig:
     max_new_tokens: int = 512
     temperature: float = 1.0
@@ -75,6 +88,7 @@ class InferenceConfig:
     torch_compile: bool = False
     turboquant: TurboQuantConfig = field(default_factory=TurboQuantConfig)
     speculative: SpeculativeConfig = field(default_factory=SpeculativeConfig)
+    colossus: ColossusConfig = field(default_factory=ColossusConfig)
 
 
 @dataclass
@@ -278,6 +292,7 @@ def _dict_to_config(raw: dict) -> Config:
     infer_raw   = _get(raw, "inference", default={}) or {}
     tq_raw      = _get(raw, "inference", "turboquant", default={}) or {}
     spec_raw    = _get(raw, "inference", "speculative", default={}) or {}
+    col_raw     = _get(raw, "inference", "colossus", default={}) or {}
 
     mon_raw     = _get(raw, "monitoring", default={}) or {}
     prom_raw    = _get(raw, "monitoring", "prometheus", default={}) or {}
@@ -407,6 +422,13 @@ def _dict_to_config(raw: dict) -> Config:
                 enabled=bool(spec_raw.get("enabled", False)),
                 draft_model_name=str(spec_raw.get("draft_model_name", "")),
                 num_draft_tokens=int(spec_raw.get("num_draft_tokens", 5)),
+            ),
+            colossus=ColossusConfig(
+                enabled=bool(col_raw.get("enabled", False)),
+                replica=str(col_raw.get("replica", "int8")),
+                budget=str(col_raw.get("budget", "tiered_fwd")),
+                top_k_experts=int(col_raw.get("top_k_experts", 8)),
+                lru_slots_per_expert=int(col_raw.get("lru_slots_per_expert", 32)),
             ),
         ),
         monitoring=MonitoringConfig(
