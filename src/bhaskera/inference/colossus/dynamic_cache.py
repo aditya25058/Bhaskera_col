@@ -1,18 +1,18 @@
-"""Dynamic MoE Expert Cache for COLOSSUS.
+"""Pre-allocated Slot-Based Dynamic MoE Expert Cache for COLOSSUS.
 
-Implements dynamic GPU residency with ZSSR speculative prefetch and exact router execution.
-Contract:
-  - Router is NEVER modified (lossless guarantee).
-  - Selected experts compute native forward pass.
-  - Active GPU working set bounded to capacity C << E_total.
-  - ZSSR initiates non-blocking CUDA stream prefetch ahead of gate/inference.
-  - Misses fall back to demand-paging into LRU slots.
+Architecture:
+  - Exactly C expert slots pre-allocated on GPU per layer (zero cudaMalloc in forward).
+  - 64 experts initialized on GPU pointing to pre-allocated slot buffers or dummy tensors.
+  - Master expert copies reside permanently in pinned CPU host memory.
+  - Streaming CPU -> GPU DMA transfers via non-blocking CUDA streams.
+  - Zero modifications to model router (lossless contract).
+  - Exact native moe_infer execution.
 """
 from __future__ import annotations
 
 import logging
 import time
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import torch
 import torch.nn as nn
@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 
 class DynamicMoELayerWrapper(nn.Module):
-    """Wraps a SparseMoeBlock with dynamic GPU expert residency and ZSSR prefetch."""
+    """Wraps SparseMoeBlock with pre-allocated GPU slot cache and async DMA streaming."""
 
     def __init__(
         self,
@@ -47,30 +47,48 @@ class DynamicMoELayerWrapper(nn.Module):
         else:
             self.router_weight = None
 
-        # Pin all expert weights to CPU host memory
-        self.pinned_cpu_experts: List[nn.Module] = []
+        sample_exp = self.block.experts[0]
+        self.config = sample_exp.config
+        self.intermediate_size = sample_exp.intermediate_size
+        self.dtype = sample_exp.gate_proj.weight.dtype
+
+        # 1. Master CPU expert copies in pinned memory
+        self.cpu_experts = []
         for e in self.block.experts:
             e.to("cpu")
             for p in e.parameters():
                 p.requires_grad_(False)
                 if not p.data.is_pinned():
                     p.data = p.data.pin_memory()
-            self.pinned_cpu_experts.append(e)
+            self.cpu_experts.append(e)
 
-        # Gate and shared experts stay permanently on GPU
-        if hasattr(self.block, "gate"):
-            self.block.gate.to(device)
-        if hasattr(self.block, "shared_experts") and self.block.shared_experts is not None:
-            self.block.shared_experts.to(device)
+        # 2. Pre-allocate exactly C GPU slots (constant VRAM buffer)
+        self.slots = [
+            sample_exp.__class__(self.config, intermediate_size=self.intermediate_size).to(
+                device=device, dtype=self.dtype
+            ).requires_grad_(False)
+            for _ in range(capacity)
+        ]
 
-        # Residency tracking
-        self.resident_set: Set[int] = set()
-        self.lru_order: List[int] = []  # most recent at end
+        # 3. Create a shared 1-element dummy tensor on GPU for inactive experts
+        self.dummy = torch.zeros(1, dtype=self.dtype, device=device)
+        self.block.to(device)
+        for e in self.block.experts:
+            e.requires_grad_(False)
+            e.gate_proj.weight.data = self.dummy
+            e.up_proj.weight.data = self.dummy
+            e.down_proj.weight.data = self.dummy
 
-        # Prefetch stream
+        # 4. Slot & LRU tracking
+        self.expert_to_slot: Dict[int, int] = {}
+        self.slot_to_expert: Dict[int, int] = {}
+        self.free_slots: List[int] = list(range(capacity))
+        self.slot_lru: List[int] = []  # most recently used at end
+
+        # 5. Dedicated prefetch CUDA stream
         self.prefetch_stream = torch.cuda.Stream(device=device)
 
-        # Performance & accuracy statistics
+        # 6. Performance metrics
         self.hits = 0
         self.misses = 0
         self.prefetch_bytes = 0
@@ -79,55 +97,81 @@ class DynamicMoELayerWrapper(nn.Module):
         self.total_routing_decisions = 0
         self.total_tokens_processed = 0
 
-        # Warm up initial cache up to capacity
+        # Warmup cache with first C experts
         self.warmup(list(range(min(self.capacity, self.num_experts))))
 
     def warmup(self, initial_ids: List[int]):
-        """Warm up GPU cache with initial expert weights."""
+        """Warm up slots with initial experts."""
         for e_id in initial_ids[:self.capacity]:
-            self._bring_to_gpu(e_id, non_blocking=False)
+            self._load_to_slot(e_id, non_blocking=False)
         self.prefetch_bytes = 0
         self.demand_bytes = 0
 
-    def _bring_to_gpu(self, expert_id: int, non_blocking: bool = True, stream=None,
-                      locked_set: Optional[Set[int]] = None) -> None:
-        """Transfer an expert module to GPU and update LRU tracking."""
-        if expert_id in self.resident_set:
-            self.lru_order.remove(expert_id)
-            self.lru_order.append(expert_id)
-            return
+    def _load_to_slot(self, expert_id: int, non_blocking: bool = True, stream=None,
+                      locked_slots: Optional[Set[int]] = None) -> int:
+        """Stream expert weights from pinned CPU into assigned GPU slot via DMA."""
+        if expert_id in self.expert_to_slot:
+            slot_idx = self.expert_to_slot[expert_id]
+            self.slot_lru.remove(slot_idx)
+            self.slot_lru.append(slot_idx)
+            return slot_idx
 
-        # If cache is at or above capacity, evict LRU expert that is NOT in locked_set
-        if len(self.resident_set) >= self.capacity:
-            evictable = [e for e in self.lru_order if locked_set is None or e not in locked_set]
-            if evictable:
-                evict_id = evictable[0]
-                self.lru_order.remove(evict_id)
-                self.block.experts[evict_id].to("cpu")
-                self.resident_set.remove(evict_id)
+        # Acquire a slot: free slot if available, else LRU slot not in locked_slots
+        if self.free_slots:
+            slot_idx = self.free_slots.pop(0)
+        else:
+            candidates = [s for s in self.slot_lru if locked_slots is None or s not in locked_slots]
+            if not candidates:
+                candidates = self.slot_lru  # fallback
+            slot_idx = candidates[0]
+            self.slot_lru.remove(slot_idx)
+            old_expert = self.slot_to_expert.pop(slot_idx)
+            del self.expert_to_slot[old_expert]
+            # Unbind old expert weights
+            old_mod = self.block.experts[old_expert]
+            old_mod.gate_proj.weight.data = self.dummy
+            old_mod.up_proj.weight.data = self.dummy
+            old_mod.down_proj.weight.data = self.dummy
 
-        # Transfer expert to GPU
-        expert = self.block.experts[expert_id]
+        self.expert_to_slot[expert_id] = slot_idx
+        self.slot_to_expert[slot_idx] = expert_id
+        self.slot_lru.append(slot_idx)
+
+        # DMA transfer into target slot
+        slot = self.slots[slot_idx]
+        src = self.cpu_experts[expert_id]
+
         stream_ctx = torch.cuda.stream(stream) if stream else torch.cuda.stream(torch.cuda.current_stream())
         with stream_ctx:
-            expert.to(self.device, non_blocking=non_blocking)
-            b = sum(p.numel() * p.element_size() for p in expert.parameters())
+            slot.gate_proj.weight.data.copy_(src.gate_proj.weight.data, non_blocking=non_blocking)
+            slot.up_proj.weight.data.copy_(src.up_proj.weight.data, non_blocking=non_blocking)
+            slot.down_proj.weight.data.copy_(src.down_proj.weight.data, non_blocking=non_blocking)
+            b = (
+                src.gate_proj.weight.numel() * src.gate_proj.weight.element_size() +
+                src.up_proj.weight.numel() * src.up_proj.weight.element_size() +
+                src.down_proj.weight.numel() * src.down_proj.weight.element_size()
+            )
             if stream is not None:
                 self.prefetch_bytes += b
             else:
                 self.demand_bytes += b
 
-        self.resident_set.add(expert_id)
-        self.lru_order.append(expert_id)
+        # Bind active expert to this slot's tensors
+        exp_mod = self.block.experts[expert_id]
+        exp_mod.gate_proj.weight.data = slot.gate_proj.weight.data
+        exp_mod.up_proj.weight.data = slot.up_proj.weight.data
+        exp_mod.down_proj.weight.data = slot.down_proj.weight.data
 
-    def async_prefetch(self, expert_ids: List[int], locked_set: Optional[Set[int]] = None) -> None:
+        return slot_idx
+
+    def async_prefetch(self, expert_ids: List[int], locked_slots: Optional[Set[int]] = None) -> None:
         """Stream predicted experts to GPU via dedicated non-blocking CUDA stream."""
         for e_id in expert_ids:
-            if e_id not in self.resident_set:
-                self._bring_to_gpu(e_id, non_blocking=True, stream=self.prefetch_stream, locked_set=locked_set)
+            if e_id not in self.expert_to_slot:
+                self._load_to_slot(e_id, non_blocking=True, stream=self.prefetch_stream, locked_slots=locked_slots)
 
     def synchronize_prefetch(self) -> None:
-        """Synchronize prefetch stream before execution."""
+        """Synchronize prefetch stream before expert execution."""
         torch.cuda.current_stream().wait_stream(self.prefetch_stream)
 
     def forward(self, hidden_states: torch.Tensor, *args, **kwargs):
@@ -147,25 +191,26 @@ class DynamicMoELayerWrapper(nn.Module):
         # ── 2. Native Model Router (UNTOUCHED - Exact Execution) ─────────────
         topk_idx, topk_weight, router_logits = self.block.gate(hidden_states)
 
-        # Track prediction recall vs actual routing
         actual_flat = topk_idx.unique().tolist()
         pred_set = set(predicted_topk)
         actual_set = set(actual_flat)
         self.prediction_matches += len(pred_set.intersection(actual_set))
         self.total_routing_decisions += len(actual_set)
 
-        # ── 3. Ensure All Actual Experts Are Resident on GPU ─────────────────
+        # ── 3. Ensure All Actual Experts Are Resident in GPU Slots ───────────
+        locked_slots: Set[int] = {self.expert_to_slot[e] for e in actual_flat if e in self.expert_to_slot}
         for e_id in actual_flat:
-            if e_id in self.resident_set:
+            if e_id in self.expert_to_slot:
                 self.hits += 1
-                self.lru_order.remove(e_id)
-                self.lru_order.append(e_id)
+                slot_idx = self.expert_to_slot[e_id]
+                self.slot_lru.remove(slot_idx)
+                self.slot_lru.append(slot_idx)
             else:
                 self.misses += 1
-                # Demand fetch fallback: lock the active set from being evicted
-                self._bring_to_gpu(e_id, non_blocking=False, locked_set=actual_set)
+                slot_idx = self._load_to_slot(e_id, non_blocking=False, locked_slots=locked_slots)
+                locked_slots.add(slot_idx)
 
-        # Wait for prefetch stream to ensure prefetched experts are ready
+        # Synchronize prefetch stream
         self.synchronize_prefetch()
 
         # ── 4. Native moe_infer (100% Mathematically Identical) ───────────────
@@ -185,16 +230,6 @@ class DynamicMoELayerWrapper(nn.Module):
 
         if self.block.config.num_shared_experts is not None:
             y = y + self.block.shared_experts(identity)
-
-        # Prune excess experts back to capacity if prefill temporarily expanded cache
-        while len(self.resident_set) > self.capacity:
-            evictable = [e for e in self.lru_order if e not in actual_set]
-            if not evictable:
-                break
-            evict_id = evictable[0]
-            self.lru_order.remove(evict_id)
-            self.block.experts[evict_id].to("cpu")
-            self.resident_set.remove(evict_id)
 
         return y, (router_logits.view(bsz, seq_len, -1), topk_idx.view(bsz, seq_len, -1))
 
