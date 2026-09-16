@@ -55,6 +55,55 @@ class ExpertOffloadManager:
         self._bytes_offloaded: int = 0
         self._bytes_total_experts: int = 0
         self._profiled: bool = False
+        # JIT-wrapped experts (for cleanup during restore)
+        self._jit_wrapped: List[Any] = []
+        self._jit_fetches: int = 0  # count of JIT GPU fetches during generation
+
+    # -- JIT prefetch wrappers -------------------------------------------
+    def _install_jit_wrapper(self, expert_module) -> None:
+        """Replace expert.forward with a wrapper that auto-migrates to GPU.
+
+        When the model's router dispatches tokens to a cold expert:
+          1. Move expert params to GPU (self.device)
+          2. Run original forward
+          3. Move expert params back to CPU
+
+        This keeps VRAM low (cold experts reside on CPU) while allowing
+        correct execution for *any* routing decision the model makes.
+        """
+        import torch
+
+        original_forward = expert_module.forward
+        device = self.device
+        mgr = self  # capture for closure
+
+        def _jit_forward(*args, **kwargs):
+            expert_module.to(device)
+            mgr._jit_fetches += 1
+            try:
+                out = original_forward(*args, **kwargs)
+            finally:
+                expert_module.to("cpu")
+            return out
+
+        expert_module.forward = _jit_forward
+        expert_module._colossus_original_forward = original_forward
+        self._jit_wrapped.append(expert_module)
+
+    def _uninstall_all_jit_wrappers(self) -> None:
+        """Restore original forward methods on all JIT-wrapped experts."""
+        for mod in self._jit_wrapped:
+            orig = getattr(mod, "_colossus_original_forward", None)
+            if orig is not None:
+                mod.forward = orig
+                del mod._colossus_original_forward
+        if self._jit_fetches > 0:
+            logger.info(
+                f"[Colossus] JIT fetched {self._jit_fetches} cold experts "
+                f"to GPU during generation"
+            )
+        self._jit_wrapped.clear()
+        self._jit_fetches = 0
 
     def profile_prompt(
         self,
@@ -159,6 +208,10 @@ class ExpertOffloadManager:
                     self._offloaded[layer_idx].add(e_idx)
                     self._bytes_offloaded += expert_bytes
                     total_offloaded += 1
+                    # Install JIT prefetch wrapper: transparently move to GPU
+                    # when the model's router dispatches tokens to this expert,
+                    # then move back to CPU after forward completes.
+                    self._install_jit_wrapper(expert)
                 else:
                     total_kept += 1
 
@@ -181,8 +234,11 @@ class ExpertOffloadManager:
         }
 
     def restore_all_experts(self, model: Any) -> None:
-        """Move all offloaded experts back to GPU."""
+        """Move all offloaded experts back to GPU and remove JIT wrappers."""
         import torch
+
+        # Remove JIT wrappers first (before moving back to GPU)
+        self._uninstall_all_jit_wrappers()
 
         if not self._offloaded:
             return
