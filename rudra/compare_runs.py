@@ -27,6 +27,7 @@ def parse_log(path: Path) -> dict:
         return info
 
     text = path.read_text(encoding="utf-8", errors="ignore")
+    text = re.sub(r"\x1b\[[0-9;]*m", "", text)
 
     # Tokens / sec / elapsed
     m = re.search(r"Generated \d+ response\(s\) \|\s*(\d+) tokens \|\s*([\d\.]+)s \|\s*([\d\.]+) tok/s", text)
