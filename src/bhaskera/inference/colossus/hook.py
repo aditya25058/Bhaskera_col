@@ -54,6 +54,10 @@ class ColossusMoEHook:
         # Active-mode offload manager (set by build() when offload_enabled)
         self._offload_mgr: Optional[Any] = None
         self._offload_stats: dict = {}
+        # Dynamic MoE expert cache
+        self._wrapped_layers: Dict[int, Any] = {}
+        self._dynamic_cache_enabled: bool = False
+        self._cache_capacity: int = 16
 
     # -- construction ----------------------------------------------------
     @classmethod
@@ -110,25 +114,47 @@ class ColossusMoEHook:
                    budget_preset=str(getattr(colossus_cfg, "budget", "tiered_fwd")))
         hook._layers = sorted(pred.router.keys())
 
-        # Active-mode: create offload manager if requested
+        # Active-mode dynamic cache
         offload_enabled = bool(getattr(colossus_cfg, "offload_enabled", False))
         if offload_enabled:
-            from .offload import ExpertOffloadManager
-            hot_topk = int(getattr(colossus_cfg, "hot_expert_topk", 8) or 8)
-            hook._offload_mgr = ExpertOffloadManager(
-                hot_expert_topk=hot_topk,
-                device="cuda" if torch.cuda.is_available() else "cpu",
-            )
+            hot_topk = int(getattr(colossus_cfg, "hot_expert_topk", 16) or 16)
+            hook._dynamic_cache_enabled = True
+            hook._cache_capacity = hot_topk
             logger.info(
-                f"[Colossus] Active-mode offload enabled "
-                f"(hot_expert_topk={hot_topk})"
+                f"[Colossus] Dynamic expert cache enabled (capacity={hot_topk} experts per layer)"
             )
 
         return hook
 
     # -- attach ----------------------------------------------------------
     def attach(self, model, profile) -> int:
-        """Hook decoder layers; returns number of layers hooked."""
+        """Hook decoder layers or install dynamic MoE cache wrappers."""
+        if getattr(self, "_dynamic_cache_enabled", False):
+            from .dynamic_cache import DynamicMoELayerWrapper
+
+            layers_container = getattr(model, "model", model)
+            model_layers = getattr(layers_container, "layers", None)
+            if model_layers is not None:
+                device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+                for idx in range(1, len(model_layers)):
+                    layer = model_layers[idx]
+                    mlp = getattr(layer, "mlp", None)
+                    if mlp is not None and hasattr(mlp, "experts") and len(mlp.experts) > 1:
+                        wrapper = DynamicMoELayerWrapper(
+                            layer_idx=idx,
+                            moe_block=mlp,
+                            capacity=self._cache_capacity,
+                            device=device,
+                        )
+                        layer.mlp = wrapper
+                        self._wrapped_layers[idx] = wrapper
+            logger.info(
+                f"[Colossus] DynamicMoELayerWrapper installed on {len(self._wrapped_layers)} MoE layers"
+                f" (capacity={self._cache_capacity})"
+            )
+            return len(self._wrapped_layers)
+
+        # Shadow-mode fallback: passive hooks on decoder layers
         cls = getattr(profile, "decoder_layer_cls", None)
         targets = []
         if cls is not None:
@@ -140,8 +166,7 @@ class ColossusMoEHook:
             self._states[layer_idx] = deque(maxlen=_SHADOW_DEPTH)
             handle = mod.register_forward_hook(self._make_hook(layer_idx))
             self._handles.append(handle)
-        logger.info(f"[Colossus] hook on {len(self._handles)} decoder layers"
-                    f" (mode={'active' if self._offload_mgr else 'shadow'})")
+        logger.info(f"[Colossus] hook on {len(self._handles)} decoder layers (mode=shadow)")
         return len(self._handles)
 
     def _make_hook(self, layer_idx: int):
@@ -167,13 +192,17 @@ class ColossusMoEHook:
                 pass
         self._handles = []
 
-    # -- active-mode offload API ----------------------------------------
+    # -- active-mode offload / dynamic cache API ------------------------
     def maybe_offload(self, model, input_ids) -> Optional[dict]:
-        """If active-mode is enabled, profile the prompt and offload cold
-        experts.  Returns offload stats or None if shadow-mode.
-
-        Called by ``_HFBackend.generate()`` before ``model.generate()``.
+        """If dynamic cache is active, log VRAM and return status.
+        If legacy offload manager is set, profile and offload.
         """
+        if self._wrapped_layers:
+            if torch.cuda.is_available():
+                vram = torch.cuda.memory_allocated() / (1024 ** 3)
+                logger.info(f"[Colossus] Dynamic cache active ({len(self._wrapped_layers)} layers) | VRAM: {vram:.2f} GB")
+            return {"mode": "dynamic_cache", "capacity": self._cache_capacity, "layers": len(self._wrapped_layers)}
+
         if self._offload_mgr is None:
             return None
         try:
@@ -190,10 +219,11 @@ class ColossusMoEHook:
             return self._offload_stats
 
     def maybe_restore(self, model) -> None:
-        """If active-mode is enabled, restore all experts to GPU.
-
-        Called by ``_HFBackend.generate()`` after ``model.generate()``.
+        """If dynamic cache is active, nothing to restore (continuous dynamic LRU).
+        If legacy offload manager is set, restore experts.
         """
+        if self._wrapped_layers:
+            return
         if self._offload_mgr is None:
             return
         try:
@@ -251,18 +281,44 @@ class ColossusMoEHook:
         return y_total
 
     def stats(self) -> dict:
-        mode = "active" if self._offload_mgr else "shadow"
+        mode = "dynamic_cache" if self._wrapped_layers else ("active" if self._offload_mgr else "shadow")
         base = {
             "mode": mode,
-            "layers_hooked": len(self._handles),
+            "layers_hooked": len(self._handles) or len(self._wrapped_layers),
             "shadow_steps": self._steps,
             "hits_count": self._hits_count,
             "misses_count": self._misses_count,
             "layers_with_router": list(self._layers),
             "disabled_reason": self.disabled_reason,
         }
-        # Add offload stats if in active mode
-        if self._offload_mgr is not None:
+        if self._wrapped_layers:
+            layer_metrics = [
+                w.get_stats()
+                for w in sorted(self._wrapped_layers.values(), key=lambda x: x.layer_idx)
+            ]
+            total_hits = sum(m["hits"] for m in layer_metrics)
+            total_misses = sum(m["misses"] for m in layer_metrics)
+            total_accesses = total_hits + total_misses
+            hit_rate = (total_hits / total_accesses * 100.0) if total_accesses > 0 else 100.0
+            total_prefetch_mb = sum(m["prefetch_mb"] for m in layer_metrics)
+            total_demand_mb = sum(m["demand_mb"] for m in layer_metrics)
+            avg_recall = (
+                sum(m["recall_pct"] for m in layer_metrics) / len(layer_metrics)
+                if layer_metrics
+                else 0.0
+            )
+            base["dynamic_cache"] = {
+                "capacity": self._cache_capacity,
+                "layers_wrapped": len(self._wrapped_layers),
+                "hits": total_hits,
+                "misses": total_misses,
+                "hit_rate_pct": hit_rate,
+                "prefetch_mb": total_prefetch_mb,
+                "demand_mb": total_demand_mb,
+                "recall_pct": avg_recall,
+                "layers": layer_metrics,
+            }
+        elif self._offload_mgr is not None:
             base["offload"] = self._offload_mgr.vram_savings()
             base.update(self._offload_stats)
         return base

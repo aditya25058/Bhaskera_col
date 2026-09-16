@@ -317,7 +317,7 @@ def main(argv: List[str] = None) -> None:
     except Exception:
         pass
 
-    # COLOSSUS MoE offload stats
+    # COLOSSUS MoE offload / dynamic cache stats
     cstats = engine.colossus_status()
     if cstats and cstats.get("mode") != "off":
         print(
@@ -327,15 +327,29 @@ def main(argv: List[str] = None) -> None:
             f"hits={cstats.get('hits_count', 0)} | "
             f"misses={cstats.get('misses_count', 0)}"
         )
-        # Active-mode VRAM savings
-        offload = cstats.get("offload", {})
-        if offload.get("mode") == "active":
-            print(
-                f"COLOSSUS offload: "
-                f"{offload.get('vram_saved_gb', 0):.2f} GB freed | "
-                f"{offload.get('offload_ratio', 0)*100:.0f}% experts offloaded | "
-                f"{offload.get('experts_offloaded', 0)} experts on CPU"
-            )
+        dc = cstats.get("dynamic_cache")
+        if dc:
+            print("=" * 80)
+            print(f"COLOSSUS DYNAMIC CACHE SUMMARY (Capacity C={dc['capacity']} of 64 Experts across {dc['layers_wrapped']} Layers):")
+            print(f"  Hit Rate     : {dc['hit_rate_pct']:.1f}% ({dc['hits']} hits / {dc['misses']} demand misses)")
+            print(f"  ZSSR Recall@6: {dc['recall_pct']:.1f}%")
+            print(f"  PCIe DMA     : {dc['prefetch_mb']:.1f} MB Prefetched | {dc['demand_mb']:.1f} MB Demand Fetched")
+            print("-" * 80)
+            print(f"{'Layer':>6} | {'C':>3} | {'Hit Rate':>9} | {'Hits':>6} | {'Misses':>6} | {'Prefetch MB':>12} | {'Demand MB':>10} | {'Recall@6':>9}")
+            print("-" * 80)
+            for m in dc.get("layers", []):
+                print(f"{m['layer_idx']:6d} | {m['capacity']:3d} | {m['hit_rate_pct']:8.1f}% | {m['hits']:6d} | {m['misses']:6d} | {m['prefetch_mb']:11.1f} | {m['demand_mb']:9.1f} | {m['recall_pct']:8.1f}%")
+            print("=" * 80)
+        else:
+            # Legacy offload stats
+            offload = cstats.get("offload", {})
+            if offload.get("mode") == "active":
+                print(
+                    f"COLOSSUS offload: "
+                    f"{offload.get('vram_saved_gb', 0):.2f} GB freed | "
+                    f"{offload.get('offload_ratio', 0)*100:.0f}% experts offloaded | "
+                    f"{offload.get('experts_offloaded', 0)} experts on CPU"
+                )
 
     # Thinking model note
     if is_thinking and not args.show_thinking:

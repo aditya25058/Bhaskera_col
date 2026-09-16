@@ -22,6 +22,6 @@ python -m bhaskera.launcher.infer \
   --config configs/inference_param2.yaml \
   --model "$MODEL_DIR" \
   --prompt-file rudra/prompts.txt \
-  --max-new-tokens 128 \
+  --max-new-tokens 64 \
   --no-sample \
   --output-file /home/bapic_iiitd/2_group/outputs_base.txt
