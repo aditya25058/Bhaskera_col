@@ -74,7 +74,7 @@ def main() -> int:
     hook = ColossusMoEHook(predictor=pred, directory=directory)
 
     B = 4
-    x = torch.randn(B, H, generator=g, device=device)
+    x = torch.randn(B, H, generator=g).to(device)
 
     # 1. Dense MoE forward
     t0 = time.perf_counter()
