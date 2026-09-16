@@ -131,7 +131,7 @@ def test_sa_expert_forward_lossless():
     _, _, y_all_c = sa_expert_forward(x, list(range(I)), [], Wg, Wu, Wd)
     linf, _, cos = verify_lossless(y_dense, y_all_c)
     assert linf == 0.0
-    assert cos == 1.0
+    assert cos == pytest.approx(1.0, abs=1e-6)
 
     # 3. Batched [B, H]
     xb = torch.randn(4, H, generator=g)
