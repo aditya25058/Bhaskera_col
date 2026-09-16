@@ -86,9 +86,11 @@ class GPUExpertCache:
 
         # Pre-allocate exactly C expert slots on GPU
         self.slots = [
-            sample_exp.__class__(self.config, intermediate_size=self.intermediate_size).to(device)
+            sample_exp.__class__(self.config, intermediate_size=self.intermediate_size).to(device).requires_grad_(False)
             for _ in range(capacity)
         ]
+        for e in self.cpu_experts:
+            e.requires_grad_(False)
 
         # Tracking: expert_id <-> slot_idx
         self.expert_to_slot: Dict[int, int] = {}
@@ -140,10 +142,10 @@ class GPUExpertCache:
         src_cpu = self.cpu_experts[expert_id]
 
         stream_ctx = torch.cuda.stream(stream) if stream else torch.cuda.stream(torch.cuda.current_stream())
-        with stream_ctx:
-            target_slot.gate_proj.weight.copy_(src_cpu.gate_proj.weight, non_blocking=non_blocking)
-            target_slot.up_proj.weight.copy_(src_cpu.up_proj.weight, non_blocking=non_blocking)
-            target_slot.down_proj.weight.copy_(src_cpu.down_proj.weight, non_blocking=non_blocking)
+        with stream_ctx, torch.no_grad():
+            target_slot.gate_proj.weight.data.copy_(src_cpu.gate_proj.weight.data, non_blocking=non_blocking)
+            target_slot.up_proj.weight.data.copy_(src_cpu.up_proj.weight.data, non_blocking=non_blocking)
+            target_slot.down_proj.weight.data.copy_(src_cpu.down_proj.weight.data, non_blocking=non_blocking)
             # 3 weight matrices per expert
             bytes_copied = (
                 src_cpu.gate_proj.weight.numel() * src_cpu.gate_proj.weight.element_size() +
