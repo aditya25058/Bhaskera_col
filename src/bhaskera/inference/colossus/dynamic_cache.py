@@ -70,14 +70,23 @@ class DynamicMoELayerWrapper(nn.Module):
             for _ in range(capacity)
         ]
 
-        # 3. Create a shared 1-element dummy tensor on GPU for inactive experts
-        self.dummy = torch.zeros(1, dtype=self.dtype, device=device)
+        # 3. Create a shared dummy expert on GPU for inactive experts (proper shapes)
+        self.dummy_expert = sample_exp.__class__(self.config, intermediate_size=self.intermediate_size).to(
+            device=device, dtype=self.dtype
+        ).requires_grad_(False)
+        self.dummy_expert.gate_proj.weight.data.zero_()
+        self.dummy_expert.up_proj.weight.data.zero_()
+        self.dummy_expert.down_proj.weight.data.zero_()
+
         self.block.to(device)
         for e in self.block.experts:
             e.requires_grad_(False)
-            e.gate_proj.weight.data = self.dummy
-            e.up_proj.weight.data = self.dummy
-            e.down_proj.weight.data = self.dummy
+            e.gate_proj.weight.data = self.dummy_expert.gate_proj.weight.data
+            e.up_proj.weight.data = self.dummy_expert.up_proj.weight.data
+            e.down_proj.weight.data = self.dummy_expert.down_proj.weight.data
+
+        # Ensure wrapper is in eval mode
+        self.eval()
 
         # 4. Slot & LRU tracking
         self.expert_to_slot: Dict[int, int] = {}
@@ -127,11 +136,11 @@ class DynamicMoELayerWrapper(nn.Module):
             self.slot_lru.remove(slot_idx)
             old_expert = self.slot_to_expert.pop(slot_idx)
             del self.expert_to_slot[old_expert]
-            # Unbind old expert weights
+            # Unbind old expert weights back to dummy
             old_mod = self.block.experts[old_expert]
-            old_mod.gate_proj.weight.data = self.dummy
-            old_mod.up_proj.weight.data = self.dummy
-            old_mod.down_proj.weight.data = self.dummy
+            old_mod.gate_proj.weight.data = self.dummy_expert.gate_proj.weight.data
+            old_mod.up_proj.weight.data = self.dummy_expert.up_proj.weight.data
+            old_mod.down_proj.weight.data = self.dummy_expert.down_proj.weight.data
 
         self.expert_to_slot[expert_id] = slot_idx
         self.slot_to_expert[slot_idx] = expert_id
@@ -179,13 +188,13 @@ class DynamicMoELayerWrapper(nn.Module):
         bsz, seq_len, h = hidden_states.shape
         self.total_tokens_processed += (bsz * seq_len)
 
-        # ── 1. ZSSR Speculative Prediction ──────────────────────────────────
-        predicted_topk = []
+        # ── 1. Speculative Prefetch for Next Step ────────────────────────────
+        predicted_topk: List[int] = []
         if self.router_weight is not None:
             with torch.no_grad():
-                h_flat = hidden_states.reshape(-1, self.router_weight.shape[1])[-1].float()
-                spec_logits = h_flat @ self.router_weight.T
-                predicted_topk = torch.topk(spec_logits, k=self.top_k).indices.tolist()
+                h_rep = hidden_states[:, -1, :].to(dtype=self.router_weight.dtype)
+                projected_logits = torch.matmul(h_rep, self.router_weight.t())
+                predicted_topk = torch.topk(projected_logits, k=self.top_k, dim=-1).indices.view(-1).tolist()
                 self.async_prefetch(predicted_topk)
 
         # ── 2. Native Model Router (UNTOUCHED - Exact Execution) ─────────────
@@ -197,36 +206,64 @@ class DynamicMoELayerWrapper(nn.Module):
         self.prediction_matches += len(pred_set.intersection(actual_set))
         self.total_routing_decisions += len(actual_set)
 
-        # ── 3. Ensure All Actual Experts Are Resident in GPU Slots ───────────
-        locked_slots: Set[int] = {self.expert_to_slot[e] for e in actual_flat if e in self.expert_to_slot}
-        for e_id in actual_flat:
-            if e_id in self.expert_to_slot:
-                self.hits += 1
-                slot_idx = self.expert_to_slot[e_id]
-                self.slot_lru.remove(slot_idx)
-                self.slot_lru.append(slot_idx)
-            else:
-                self.misses += 1
-                slot_idx = self._load_to_slot(e_id, non_blocking=False, locked_slots=locked_slots)
-                locked_slots.add(slot_idx)
-
-        # Synchronize prefetch stream
-        self.synchronize_prefetch()
-
-        # ── 4. Native moe_infer (100% Mathematically Identical) ───────────────
+        # ── 3. Expert Execution (Lossless & Robust to Prefill vs Generation) ───
         hidden_states_2d = hidden_states.view(-1, h)
-        if self.training:
-            flat_topk_idx = topk_idx.view(-1)
-            hidden_states_rep = hidden_states_2d.repeat_interleave(self.top_k, dim=0)
-            y = torch.empty_like(hidden_states_rep)
-            for i, expert in enumerate(self.block.experts):
-                mask = (flat_topk_idx == i)
-                if mask.any():
-                    y[mask] = expert(hidden_states_rep[mask])
-            y = (y.view(*topk_weight.shape, -1) * topk_weight.unsqueeze(-1)).sum(dim=1)
-            y = y.to(hidden_states.dtype).view(bsz, seq_len, h)
-        else:
+
+        if len(actual_flat) <= self.capacity:
+            # Standard generation step: all required experts fit in GPU slots simultaneously
+            locked_slots: Set[int] = set()
+            for e_id in actual_flat:
+                if e_id in self.expert_to_slot:
+                    self.hits += 1
+                    slot_idx = self.expert_to_slot[e_id]
+                    self.slot_lru.remove(slot_idx)
+                    self.slot_lru.append(slot_idx)
+                    locked_slots.add(slot_idx)
+                else:
+                    self.misses += 1
+                    slot_idx = self._load_to_slot(e_id, non_blocking=False, locked_slots=locked_slots)
+                    locked_slots.add(slot_idx)
+
+            self.synchronize_prefetch()
             y = self.block.moe_infer(hidden_states_2d, topk_idx, topk_weight).view(bsz, seq_len, h)
+        else:
+            # Prefill step with many tokens: unique experts exceed slot capacity
+            # Execute sequentially per expert so slots can be reused without memory errors
+            cnts = topk_idx.new_zeros((topk_idx.shape[0], len(self.block.experts)))
+            cnts.scatter_(1, topk_idx, 1)
+            tokens_per_expert = cnts.sum(dim=0).cpu().numpy()
+            idxs = topk_idx.view(-1).argsort()
+            sorted_tokens = hidden_states_2d[idxs // topk_idx.shape[1]]
+            outputs = []
+            start_idx = 0
+            for i, num_tokens in enumerate(tokens_per_expert):
+                end_idx = start_idx + num_tokens
+                if num_tokens == 0:
+                    continue
+                if i in self.expert_to_slot:
+                    self.hits += 1
+                    slot_idx = self.expert_to_slot[i]
+                    self.slot_lru.remove(slot_idx)
+                    self.slot_lru.append(slot_idx)
+                else:
+                    self.misses += 1
+                    self._load_to_slot(i, non_blocking=False)
+                expert = self.block.experts[i]
+                tokens_for_this_expert = sorted_tokens[start_idx:end_idx]
+                expert_out = expert(tokens_for_this_expert)
+                outputs.append(expert_out.to(hidden_states.device))
+                start_idx = end_idx
+
+            outs = torch.cat(outputs, dim=0) if len(outputs) else sorted_tokens.new_empty(0)
+            new_x = torch.empty_like(outs)
+            new_x[idxs] = outs
+            y = (
+                new_x.view(*topk_idx.shape, -1)
+                .type(topk_weight.dtype)
+                .mul_(topk_weight.unsqueeze(dim=-1))
+                .sum(dim=1)
+                .type(new_x.dtype)
+            ).view(bsz, seq_len, h)
 
         if self.block.config.num_shared_experts is not None:
             y = y + self.block.shared_experts(identity)
