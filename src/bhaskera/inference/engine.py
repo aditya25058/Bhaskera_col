@@ -192,6 +192,26 @@ class _HFBackend:
         from bhaskera.introspect import introspect_model
         self._profile = introspect_model(self._model)
 
+        # ── COLOSSUS shadow hook (opt-in, MoE only, never alters numerics) ─
+        self._colossus = None
+        self._colossus_state = {"mode": "off", "reason": "disabled in config"}
+        _cc = getattr(infer_cfg, "colossus", None)
+        if _cc is not None and getattr(_cc, "enabled", False):
+            if getattr(self._profile, "is_moe", False):
+                try:
+                    from bhaskera.inference.colossus.hook import ColossusMoEHook
+                    hook = ColossusMoEHook.build(self._model, self._profile, _cc)
+                    hook.attach(self._model, self._profile)
+                    self._colossus = hook
+                    self._colossus_state = hook.stats()
+                    logger.info("[Engine] COLOSSUS shadow hook attached ✓")
+                except Exception as e:
+                    self._colossus_state = {"mode": "off", "reason": str(e)}
+                    logger.warning(f"[Engine] COLOSSUS disabled ({e}); dense path unchanged")
+            else:
+                self._colossus_state = {"mode": "off", "reason": "dense model, MoE hook N/A"}
+                logger.info("[Engine] COLOSSUS off — dense model")
+
         # ── KV Cache ─────────────────────────────────────────────────
         self._kv_cache = self._build_kv_cache()
 
@@ -406,6 +426,14 @@ class _HFBackend:
             return self._kv_cache.compression_stats()
         return {"bytes": self._kv_cache.memory_bytes()}
 
+    def colossus_status(self) -> dict:
+        """Shadow-hook state; dense numerics are identical either way."""
+        state = dict(getattr(self, "_colossus_state", {"mode": "off"}))
+        hook = getattr(self, "_colossus", None)
+        if hook is not None:
+            state.update(hook.stats())
+        return state
+
 
 # ---------------------------------------------------------------------------
 # Ray Actor wrapper — optional, zero-cost if Ray not available
@@ -525,6 +553,13 @@ class InferenceEngine:
         if hasattr(self._backend, "kv_cache_stats"):
             return self._backend.kv_cache_stats()
         return None
+
+    def colossus_status(self) -> Optional[dict]:
+        if not self._loaded:
+            return None
+        if hasattr(self._backend, "colossus_status"):
+            return self._backend.colossus_status()
+        return {"mode": "off", "reason": "vLLM backend has no COLOSSUS hook"}
 
     # ------------------------------------------------------------------
     # Param2-Thinking interface

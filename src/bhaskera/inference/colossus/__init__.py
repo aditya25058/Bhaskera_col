@@ -26,8 +26,8 @@ from __future__ import annotations
 
 from .columns import columns_batched, columns_loop, stack_expert_weights
 from .directory import ColumnDirectory, plan_fixed_packets
-from .predictor import ZSSRPredictor, quantize_int8
 from .sa_ffn import dense_expert_forward, sa_expert_forward, verify_lossless
+from .predictor import ZSSRPredictor, quantize_int8
 
 __all__ = [
     "ZSSRPredictor",
@@ -41,3 +41,10 @@ __all__ = [
     "sa_expert_forward",
     "verify_lossless",
 ]
+
+try:  # torch-only; keeps CPU-only config imports working
+    from .hook import ColossusMoEHook
+
+    __all__.append("ColossusMoEHook")
+except ImportError:  # pragma: no cover
+    pass
