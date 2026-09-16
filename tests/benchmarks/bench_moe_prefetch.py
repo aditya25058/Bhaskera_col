@@ -80,7 +80,8 @@ class GPUExpertCache:
         for e in experts:
             e.to("cpu")
             for p in e.parameters():
-                p.data = p.data.pin_memory()
+                if not p.data.is_pinned():
+                    p.data = p.data.pin_memory()
             self.cpu_experts.append(e)
 
         # Pre-allocate exactly C expert slots on GPU
@@ -187,6 +188,7 @@ def run_experiment_1(moe_block: nn.Module, inputs: torch.Tensor, router_weight: 
     print(f"EXPERIMENT 1: Single MoE Layer Baseline vs COLOSSUS Cache (Tokens: {inputs.shape[0]})")
     print("=" * 80)
 
+    inputs = inputs.to(device)
     # 1. Baseline: All 64 experts resident on GPU
     moe_block.to(device)
     torch.cuda.synchronize()
@@ -238,7 +240,7 @@ def run_experiment_1(moe_block: nn.Module, inputs: torch.Tensor, router_weight: 
 
                 # --- STEP 1: ZSSR Speculative Prediction for step t ---
                 # Use current h_t (or h_{t-1} in continuous stream) against router W
-                h_flat = h_t.reshape(-1, router_weight.shape[1])[-1].to(device)
+                h_flat = h_t.reshape(-1, router_weight.shape[1])[-1].float()
                 spec_logits = h_flat @ router_weight.T
                 predicted_topk = torch.topk(spec_logits, k=moe_block.num_experts_per_tok).indices.tolist()
 
@@ -352,7 +354,7 @@ def run_experiment_2(router_weight: torch.Tensor, inputs: torch.Tensor,
     actual_routings: List[Set[int]] = []
     with torch.no_grad():
         for t in range(T):
-            h_t = inputs[t].reshape(-1, router_weight.shape[1])[-1].to(device)
+            h_t = inputs[t].reshape(-1, router_weight.shape[1])[-1].to(device).float()
             logits = h_t @ router_weight.T
             topk = torch.topk(logits, k=6).indices.cpu().tolist()
             actual_routings.append(set(topk))
@@ -363,7 +365,7 @@ def run_experiment_2(router_weight: torch.Tensor, inputs: torch.Tensor,
         matches = 0
         total = 0
         for t in range(T - L):
-            h_t = inputs[t].reshape(-1, router_weight.shape[1])[-1].to(device)
+            h_t = inputs[t].reshape(-1, router_weight.shape[1])[-1].to(device).float()
             pred_logits = h_t @ router_weight.T
             pred_topk = set(torch.topk(pred_logits, k=6).indices.cpu().tolist())
 
