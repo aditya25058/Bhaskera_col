@@ -179,3 +179,78 @@ def test_moe_scaffolding_dense_vs_colossus():
 
     assert cos == pytest.approx(1.0, abs=1e-6)
     assert rel < 1e-5
+
+
+def test_expert_offload_manager_cpu_migration():
+    """Verify ExpertOffloadManager moves cold experts to CPU and restores them."""
+    from bhaskera.inference.colossus.offload import ExpertOffloadManager
+
+    H, I, E = 128, 64, 8
+
+    # Build a minimal model structure: model.layers[L].mlp.experts
+    class FakeModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = nn.Module()
+            layers = nn.ModuleList()
+            for _ in range(3):
+                layer = nn.Module()
+                mlp = nn.Module()
+                experts = nn.ModuleList([
+                    SyntheticSwiGLUExpert(H, I) for _ in range(E)
+                ])
+                mlp.experts = experts
+                mlp.gate = nn.Linear(H, E, bias=False)
+                layer.mlp = mlp
+                layers.append(layer)
+            self.model.layers = layers
+
+    fake_model = FakeModel()
+    # All experts start on CPU (since we don't have CUDA in tests)
+    device = "cpu"
+
+    mgr = ExpertOffloadManager(hot_expert_topk=2, device=device)
+
+    # Define hot_map: layers 1 and 2 have hot experts [0, 1]
+    hot_map = {
+        1: [0, 1],
+        2: [3, 5],
+    }
+
+    # Offload cold experts
+    result = mgr.offload_cold_experts(fake_model, hot_map)
+
+    assert result["status"] == "offloaded"
+    assert result["experts_offloaded"] == (E - 2) * 2  # 6 cold per layer × 2 layers
+    assert result["experts_kept"] == 2 * 2  # 2 hot per layer × 2 layers
+    assert result["bytes_offloaded"] > 0
+    assert result["vram_saved_gb"] >= 0
+
+    # Verify VRAM savings report
+    savings = mgr.vram_savings()
+    assert savings["mode"] == "active"
+    assert savings["offload_ratio"] > 0.5  # Most experts should be offloaded
+    assert savings["layers_affected"] == 2
+
+    # Restore all
+    mgr.restore_all_experts(fake_model)
+    savings_after = mgr.vram_savings()
+    assert savings_after["bytes_offloaded"] == 0
+
+
+def test_hook_active_mode_stats():
+    """Verify that hook.stats() reports active mode when offload_mgr is set."""
+    from bhaskera.inference.colossus.offload import ExpertOffloadManager
+
+    pred = ZSSRPredictor(top_k_experts=4, top_cols=16, num_col_experts=4)
+    directory = ColumnDirectory(num_experts=8, num_columns=64, capacity_per_expert=32)
+    hook = ColossusMoEHook(predictor=pred, directory=directory)
+
+    # Without offload manager -> shadow mode
+    assert hook.stats()["mode"] == "shadow"
+
+    # With offload manager -> active mode
+    hook._offload_mgr = ExpertOffloadManager(hot_expert_topk=4, device="cpu")
+    stats = hook.stats()
+    assert stats["mode"] == "active"
+    assert "offload" in stats

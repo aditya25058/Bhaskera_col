@@ -44,7 +44,9 @@ __all__ = [
 
 try:  # torch-only; keeps CPU-only config imports working
     from .hook import ColossusMoEHook
+    from .offload import ExpertOffloadManager
 
-    __all__.append("ColossusMoEHook")
+    __all__.extend(["ColossusMoEHook", "ExpertOffloadManager"])
 except ImportError:  # pragma: no cover
     pass
+

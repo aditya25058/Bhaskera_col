@@ -193,7 +193,10 @@ class _HFBackend:
         from bhaskera.introspect import introspect_model
         self._profile = introspect_model(self._model)
 
-        # ── COLOSSUS shadow hook (opt-in, MoE only, never alters numerics) ─
+        # ── COLOSSUS hook (opt-in, MoE only) ─────────────────────────
+        # Shadow mode: observe-only, zero numerical impact.
+        # Active mode (offload_enabled): profiles prompt, offloads cold
+        # expert weights to CPU before generate(), restores after.
         self._colossus = None
         self._colossus_state = {"mode": "off", "reason": "disabled in config"}
         _cc = getattr(infer_cfg, "colossus", None)
@@ -205,7 +208,8 @@ class _HFBackend:
                     hook.attach(self._model, self._profile)
                     self._colossus = hook
                     self._colossus_state = hook.stats()
-                    logger.info("[Engine] COLOSSUS shadow hook attached ✓")
+                    _mode = self._colossus_state.get('mode', 'shadow')
+                    logger.info(f"[Engine] COLOSSUS {_mode}-mode hook attached ✓")
                 except Exception as e:
                     self._colossus_state = {"mode": "off", "reason": str(e)}
                     logger.warning(f"[Engine] COLOSSUS disabled ({e}); dense path unchanged")
@@ -363,6 +367,11 @@ class _HFBackend:
             if self._device.type in ("cuda", "cpu")
             else torch.autocast("cpu", dtype=self._dtype)
         )
+        # ── COLOSSUS active-mode: offload cold experts before generate ─
+        _colossus_hook = getattr(self, "_colossus", None)
+        if _colossus_hook is not None:
+            _colossus_hook.maybe_offload(self._model, input_ids)
+
         with ctx:
             if self._spec_dec is not None:
                 output_ids = self._generate_speculative(
@@ -371,6 +380,10 @@ class _HFBackend:
                 )
             else:
                 output_ids = self._model.generate(**gen_kwargs)
+
+        # ── COLOSSUS active-mode: restore experts after generate ─────
+        if _colossus_hook is not None:
+            _colossus_hook.maybe_restore(self._model)
 
         # Decode — thinking models need skip_special_tokens=False to preserve <think> tags
         skip_sp = not getattr(self, "_is_thinking", False)
@@ -428,7 +441,7 @@ class _HFBackend:
         return {"bytes": self._kv_cache.memory_bytes()}
 
     def colossus_status(self) -> dict:
-        """Shadow-hook state; dense numerics are identical either way."""
+        """Hook state: shadow-mode stats or active-mode with VRAM savings."""
         state = dict(getattr(self, "_colossus_state", {"mode": "off"}))
         hook = getattr(self, "_colossus", None)
         if hook is not None:

@@ -327,6 +327,15 @@ def main(argv: List[str] = None) -> None:
             f"hits={cstats.get('hits_count', 0)} | "
             f"misses={cstats.get('misses_count', 0)}"
         )
+        # Active-mode VRAM savings
+        offload = cstats.get("offload", {})
+        if offload.get("mode") == "active":
+            print(
+                f"COLOSSUS offload: "
+                f"{offload.get('vram_saved_gb', 0):.2f} GB freed | "
+                f"{offload.get('offload_ratio', 0)*100:.0f}% experts offloaded | "
+                f"{offload.get('experts_offloaded', 0)} experts on CPU"
+            )
 
     # Thinking model note
     if is_thinking and not args.show_thinking:

@@ -1,23 +1,22 @@
-"""Shadow-mode COLOSSUS hook for MoE inference (Bhaskera HF backend).
+"""COLOSSUS hook for MoE inference (Bhaskera HF backend).
 
-Rationale: :meth:`InferenceEngine.generate` delegates to HF
-``model.generate()`` (C++/CUDA loop), so per-layer pre-attention
-interception is only possible via module forward hooks. This hook runs
-**alongside** dense execution and never alters numerics:
+Modes of operation:
+  * **Shadow mode** (default): attaches post-hooks to decoder layers,
+    captures hidden states, runs ZSSR prediction, updates LRU bookkeeping.
+    Dense execution is completely unchanged — zero numerical impact.
+  * **Active mode** (``offload_enabled=True``): additionally creates an
+    ``ExpertOffloadManager`` that profiles the prompt and offloads cold
+    expert weights to CPU before ``model.generate()``.  VRAM drops by
+    the fraction of experts that are cold (~80–90% for top-6/64).
 
-* attaches to each decoder-layer module (from ``ModelProfile``) and
-  records the pre-layer hidden state (last token, detached to CPU,
-  bounded deque — no VRAM growth);
-* builds a :class:`ZSSRPredictor` from router weights where the
-  architecture exposes them (DeepSeek-style ``mlp.gate`` today;
-  Qwen3-fused / Param2-custom routers log a reason and stay dense);
-* exposes :meth:`predict_for` (used by the future SA-FFN replacement)
-  and :meth:`stats` (layers hooked, shadow steps, mode).
+In both modes, dense output is always bit-identical when
+``colossus.enabled`` is ``false``.  The active-mode offload changes
+which experts are resident on GPU but does not alter the computation
+for the experts that *are* resident — the model's own ``forward()``
+handles the actual expert dispatch.
 
 Any failure disables the hook with a warning — dense output is always
-bit-identical with or without it. Full per-token FFN replacement
-(``sa_expert_forward`` wired into expert modules) is arch-specific work
-tracked per model family, not attempted generically here.
+bit-identical with or without it.
 """
 from __future__ import annotations
 
@@ -52,6 +51,9 @@ class ColossusMoEHook:
         self._hits_count = 0
         self._misses_count = 0
         self.disabled_reason: Optional[str] = None
+        # Active-mode offload manager (set by build() when offload_enabled)
+        self._offload_mgr: Optional[Any] = None
+        self._offload_stats: dict = {}
 
     # -- construction ----------------------------------------------------
     @classmethod
@@ -107,6 +109,21 @@ class ColossusMoEHook:
         hook = cls(pred, directory,
                    budget_preset=str(getattr(colossus_cfg, "budget", "tiered_fwd")))
         hook._layers = sorted(pred.router.keys())
+
+        # Active-mode: create offload manager if requested
+        offload_enabled = bool(getattr(colossus_cfg, "offload_enabled", False))
+        if offload_enabled:
+            from .offload import ExpertOffloadManager
+            hot_topk = int(getattr(colossus_cfg, "hot_expert_topk", 8) or 8)
+            hook._offload_mgr = ExpertOffloadManager(
+                hot_expert_topk=hot_topk,
+                device="cuda" if torch.cuda.is_available() else "cpu",
+            )
+            logger.info(
+                f"[Colossus] Active-mode offload enabled "
+                f"(hot_expert_topk={hot_topk})"
+            )
+
         return hook
 
     # -- attach ----------------------------------------------------------
@@ -123,7 +140,8 @@ class ColossusMoEHook:
             self._states[layer_idx] = deque(maxlen=_SHADOW_DEPTH)
             handle = mod.register_forward_hook(self._make_hook(layer_idx))
             self._handles.append(handle)
-        logger.info(f"[Colossus] shadow hook on {len(self._handles)} decoder layers")
+        logger.info(f"[Colossus] hook on {len(self._handles)} decoder layers"
+                    f" (mode={'active' if self._offload_mgr else 'shadow'})")
         return len(self._handles)
 
     def _make_hook(self, layer_idx: int):
@@ -147,6 +165,40 @@ class ColossusMoEHook:
                 pass
         self._handles = []
 
+    # -- active-mode offload API ----------------------------------------
+    def maybe_offload(self, model, input_ids) -> Optional[dict]:
+        """If active-mode is enabled, profile the prompt and offload cold
+        experts.  Returns offload stats or None if shadow-mode.
+
+        Called by ``_HFBackend.generate()`` before ``model.generate()``.
+        """
+        if self._offload_mgr is None:
+            return None
+        try:
+            stats = self._offload_mgr.profile_and_offload(
+                model=model, hook=self, input_ids=input_ids
+            )
+            self._offload_stats = stats
+            return stats
+        except Exception as e:
+            logger.warning(
+                f"[Colossus] Offload failed ({e}); continuing dense"
+            )
+            self._offload_stats = {"status": "error", "reason": str(e)}
+            return self._offload_stats
+
+    def maybe_restore(self, model) -> None:
+        """If active-mode is enabled, restore all experts to GPU.
+
+        Called by ``_HFBackend.generate()`` after ``model.generate()``.
+        """
+        if self._offload_mgr is None:
+            return
+        try:
+            self._offload_mgr.restore_all_experts(model)
+        except Exception as e:
+            logger.warning(f"[Colossus] Restore failed ({e})")
+
     # -- shadow prediction API (future SA-FFN replacement consumes this) --
     @torch.inference_mode()
     def predict_for(self, h_prev: torch.Tensor, layer: int) -> Optional[dict]:
@@ -159,7 +211,7 @@ class ColossusMoEHook:
         plan = self.predictor.predict_columns(h_prev, layer, ranking)
         packet = plan_fixed_packets(ranking, preset=self.budget_preset)
         # Intersect energy plan with fixed packet budgets.
-        trimmed = {e: plan.get(e, [])[: packet.get(e, 0)] for e in packet}
+        trimmed = {e: plan.get(e, [])[:packet.get(e, 0)] for e in packet}
         hits, misses = self.directory.lookup(trimmed)
         self._hits_count += sum(len(v) for v in hits.values())
         self._misses_count += sum(len(v) for v in misses.values())
@@ -197,9 +249,18 @@ class ColossusMoEHook:
         return y_total
 
     def stats(self) -> dict:
-        return {"mode": "shadow", "layers_hooked": len(self._handles),
-                "shadow_steps": self._steps,
-                "hits_count": self._hits_count,
-                "misses_count": self._misses_count,
-                "layers_with_router": list(self._layers),
-                "disabled_reason": self.disabled_reason}
+        mode = "active" if self._offload_mgr else "shadow"
+        base = {
+            "mode": mode,
+            "layers_hooked": len(self._handles),
+            "shadow_steps": self._steps,
+            "hits_count": self._hits_count,
+            "misses_count": self._misses_count,
+            "layers_with_router": list(self._layers),
+            "disabled_reason": self.disabled_reason,
+        }
+        # Add offload stats if in active mode
+        if self._offload_mgr is not None:
+            base["offload"] = self._offload_mgr.vram_savings()
+            base.update(self._offload_stats)
+        return base

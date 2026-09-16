@@ -73,6 +73,13 @@ class ColossusConfig:
     budget: str = "tiered_fwd"
     top_k_experts: int = 8
     lru_slots_per_expert: int = 32
+    # Active-mode expert offloading: move cold expert weights to CPU before
+    # generation.  Requires enabled=True.  When False, COLOSSUS runs in
+    # shadow-mode (observe-only, no VRAM savings).
+    offload_enabled: bool = False
+    # Number of hot experts to keep on GPU per layer during offloading.
+    # Should be >= the model's top-k routing (6 for Param2, 8 for Qwen3).
+    hot_expert_topk: int = 8
 
 
 @dataclass
@@ -429,6 +436,8 @@ def _dict_to_config(raw: dict) -> Config:
                 budget=str(col_raw.get("budget", "tiered_fwd")),
                 top_k_experts=int(col_raw.get("top_k_experts", 8)),
                 lru_slots_per_expert=int(col_raw.get("lru_slots_per_expert", 32)),
+                offload_enabled=bool(col_raw.get("offload_enabled", False)),
+                hot_expert_topk=int(col_raw.get("hot_expert_topk", 8)),
             ),
         ),
         monitoring=MonitoringConfig(

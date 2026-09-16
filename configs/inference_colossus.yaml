@@ -48,6 +48,12 @@ inference:
     budget: tiered_fwd        # 50x5+25x3=325 cols | uniform40 = 40x8=320
     top_k_experts: 8
     lru_slots_per_expert: 32
+    # Active-mode: offload cold expert weights to CPU before generation.
+    # Reduces VRAM by ~60-80% of MoE parameter footprint.
+    offload_enabled: true
+    # Keep top-8 experts per layer on GPU (Param2 uses top-6 routing,
+    # 8 gives headroom for near-miss experts).
+    hot_expert_topk: 8
 
   torch_compile: false
 
