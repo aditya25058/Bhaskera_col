@@ -103,11 +103,7 @@ class DynamicMoELayerWrapper(nn.Module):
             if evictable:
                 evict_id = evictable[0]
                 self.lru_order.remove(evict_id)
-                evict_exp = self.block.experts[evict_id]
-                evict_exp.to("cpu")
-                for p in evict_exp.parameters():
-                    if not p.data.is_pinned():
-                        p.data = p.data.pin_memory()
+                self.block.experts[evict_id].to("cpu")
                 self.resident_set.remove(evict_id)
 
         # Transfer expert to GPU
@@ -197,11 +193,7 @@ class DynamicMoELayerWrapper(nn.Module):
                 break
             evict_id = evictable[0]
             self.lru_order.remove(evict_id)
-            evict_exp = self.block.experts[evict_id]
-            evict_exp.to("cpu")
-            for p in evict_exp.parameters():
-                if not p.data.is_pinned():
-                    p.data = p.data.pin_memory()
+            self.block.experts[evict_id].to("cpu")
             self.resident_set.remove(evict_id)
 
         return y, (router_logits.view(bsz, seq_len, -1), topk_idx.view(bsz, seq_len, -1))
