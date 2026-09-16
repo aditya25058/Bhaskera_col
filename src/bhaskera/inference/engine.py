@@ -164,6 +164,7 @@ class _HFBackend:
         model_kwargs: dict = dict(
             torch_dtype=self._dtype or "auto",
             trust_remote_code=cfg.model.trust_remote_code,
+            low_cpu_mem_usage=True,
         )
         # Multi-GPU: device_map=auto lets HF shard across all visible GPUs
         if device.type == "cuda" and torch.cuda.device_count() > 1:
