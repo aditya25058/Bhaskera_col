@@ -308,6 +308,26 @@ def main(argv: List[str] = None) -> None:
         # Cache exists but was bypassed (e.g. Param2) — still note it
         print(f"TurboQuant: active (model uses internal cache)")
 
+    # Peak VRAM
+    try:
+        import torch
+        if torch.cuda.is_available():
+            peak_vram_gb = torch.cuda.max_memory_allocated() / (1024 ** 3)
+            print(f"Peak VRAM: {peak_vram_gb:.2f} GB")
+    except Exception:
+        pass
+
+    # COLOSSUS MoE offload stats
+    cstats = engine.colossus_status()
+    if cstats and cstats.get("mode") != "off":
+        print(
+            f"COLOSSUS MoE: mode={cstats.get('mode')} | "
+            f"layers={cstats.get('layers_hooked')} | "
+            f"steps={cstats.get('shadow_steps')} | "
+            f"hits={cstats.get('hits_count', 0)} | "
+            f"misses={cstats.get('misses_count', 0)}"
+        )
+
     # Thinking model note
     if is_thinking and not args.show_thinking:
         print("(Thinking/reasoning block hidden — use --show-thinking to display)")

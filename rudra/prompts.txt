@@ -1,0 +1,3 @@
+Explain the mathematical intuition behind the Mixture of Experts (MoE) routing mechanism.
+Write a clean Python implementation of an LRU cache with O(1) get and put operations.
+Describe the architectural trade-offs between dense Transformers and sparsely-gated MoE models.
