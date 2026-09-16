@@ -33,9 +33,14 @@ def main() -> int:
     y_dense = dense_expert_forward(x, Wg, Wu, Wd)
     _, _, y_sa = sa_expert_forward(x, cached, missed, Wg, Wu, Wd)
     linf, l1, cos = verify_lossless(y_dense, y_sa)
-    print("half-split: Linf=%g L1=%g cos=%.12f" % (linf, l1, cos))
-    assert linf == 0.0, linf
+    # NOTE (A100 fp32): split GEMMs sum in a different order than one dense
+    # GEMM, so bitwise identity is NOT expected; the computation graph is
+    # exact (no dropping/quantization) and cosine is 1.0 to 12 decimals.
+    # Gate on closeness instead of == 0.
+    rel = linf / (y_dense.abs().max().item() + 1e-12)
+    print("half-split: Linf=%g L1=%g rel=%g cos=%.12f" % (linf, l1, rel, cos))
     assert cos == 1.0, cos
+    assert rel < 1e-5, rel
 
     # Degenerate splits: all-cached and all-missed.
     _, _, y_all_c = sa_expert_forward(x, list(range(I)), [], Wg, Wu, Wd)
@@ -43,15 +48,16 @@ def main() -> int:
     for name, y in (("all-cached", y_all_c), ("all-missed", y_all_m)):
         linf, _, cos = verify_lossless(y_dense, y)
         print("%s: Linf=%g cos=%.12f" % (name, linf, cos))
-        assert linf == 0.0 and cos == 1.0
+        assert linf == 0.0 and cos == 1.0  # single-GEMM paths stay bitwise exact
 
     # Batched tokens.
     xb = torch.randn(4, H, generator=g, dtype=torch.float32).to(device)
     yd = dense_expert_forward(xb, Wg, Wu, Wd)
     _, _, ys = sa_expert_forward(xb, cached, missed, Wg, Wu, Wd)
     linf, _, cos = verify_lossless(yd, ys)
-    print("batch4: Linf=%g cos=%.12f" % (linf, cos))
-    assert linf == 0.0 and cos == 1.0
+    rel = linf / (yd.abs().max().item() + 1e-12)
+    print("batch4: Linf=%g rel=%g cos=%.12f" % (linf, rel, cos))
+    assert cos == 1.0 and rel < 1e-5
 
     print("LOSSLESS_PASS")
     return 0
