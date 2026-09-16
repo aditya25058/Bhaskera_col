@@ -84,9 +84,10 @@ class GPUExpertCache:
                     p.data = p.data.pin_memory()
             self.cpu_experts.append(e)
 
-        # Pre-allocate exactly C expert slots on GPU
+        # Pre-allocate exactly C expert slots on GPU with matching dtype
+        dtype = sample_exp.gate_proj.weight.dtype
         self.slots = [
-            sample_exp.__class__(self.config, intermediate_size=self.intermediate_size).to(device).requires_grad_(False)
+            sample_exp.__class__(self.config, intermediate_size=self.intermediate_size).to(device=device, dtype=dtype).requires_grad_(False)
             for _ in range(capacity)
         ]
         for e in self.cpu_experts:
