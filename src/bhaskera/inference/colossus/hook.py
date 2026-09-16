@@ -49,27 +49,31 @@ class ColossusMoEHook:
         self._states: Dict[int, Deque] = {}
         self._steps = 0
         self._layers: List[int] = []
+        self._hits_count = 0
+        self._misses_count = 0
         self.disabled_reason: Optional[str] = None
 
     # -- construction ----------------------------------------------------
     @classmethod
     def build(cls, model, profile, colossus_cfg) -> "ColossusMoEHook":
         """Best-effort router extraction. Raises with reason if unsupported."""
-        from .columns import ColumnDirectory  # local import: cheap, no torch
-        from .directory import plan_fixed_packets  # noqa: F401 (re-exported use)
+        from .directory import ColumnDirectory, plan_fixed_packets  # noqa: F401
         from .predictor import ZSSRPredictor
 
-        _ = plan_fixed_packets
         top_k = int(getattr(colossus_cfg, "top_k_experts", 8) or 8)
         pred = ZSSRPredictor(top_k_experts=top_k, top_cols=50,
                              num_col_experts=top_k)
         n_registered = 0
         num_layers = int(getattr(profile, "num_hidden_layers", 0) or 0)
+        layers_container = getattr(model, "model", model)
+        model_layers = getattr(layers_container, "layers", None)
+        if model_layers is not None:
+            num_layers = max(num_layers, len(model_layers))
+
         for idx in range(1, max(num_layers, 1)):
-            try:
-                layer = model.model.layers[idx]
-            except Exception:
+            if model_layers is None or idx >= len(model_layers):
                 continue
+            layer = model_layers[idx]
             mlp = getattr(layer, "mlp", None)
             gate = getattr(mlp, "gate", None) if mlp is not None else None
             if gate is None or not hasattr(gate, "weight"):
@@ -79,11 +83,22 @@ class ColossusMoEHook:
                 n_registered += 1
             except Exception:
                 continue
+
+            # Populate gate_w and up_w for expert column prediction
+            experts = getattr(mlp, "experts", None)
+            if experts is not None:
+                pred.gate_w[idx] = {}
+                pred.up_w[idx] = {}
+                for e, exp_mod in enumerate(experts):
+                    if hasattr(exp_mod, "gate_proj") and hasattr(exp_mod, "up_proj"):
+                        pred.gate_w[idx][e] = exp_mod.gate_proj.weight.detach().float().cpu()
+                        pred.up_w[idx][e] = exp_mod.up_proj.weight.detach().float().cpu()
+
         if n_registered == 0:
             raise RuntimeError(
-                "no DeepSeek-style mlp.gate routers found "
+                "no DeepSeek/Param2-style mlp.gate routers found "
                 f"(router_names={list(getattr(profile, 'router_module_names', []))[:4]}); "
-                "Qwen3-fused/Param2-custom routers stay dense"
+                "Qwen3-fused routers stay dense"
             )
         slots = int(getattr(colossus_cfg, "lru_slots_per_expert", 32) or 32)
         num_experts = int(getattr(profile, "num_experts", 0) or 0)
@@ -146,11 +161,45 @@ class ColossusMoEHook:
         # Intersect energy plan with fixed packet budgets.
         trimmed = {e: plan.get(e, [])[: packet.get(e, 0)] for e in packet}
         hits, misses = self.directory.lookup(trimmed)
+        self._hits_count += sum(len(v) for v in hits.values())
+        self._misses_count += sum(len(v) for v in misses.values())
         return {"experts": ranking[: self.predictor.top_k], "ranking": ranking,
                 "columns": trimmed, "hits": hits, "misses": misses}
+
+    def execute_expert_sa(self, x: torch.Tensor, expert_idx: int, expert_mod: nn.Module) -> torch.Tensor:
+        """Lossless split execution of a SwiGLU expert using ColumnDirectory.
+
+        Divides intermediate columns into resident (cached in LRU) and
+        missed (streamed/demand), executing ``sa_expert_forward``.
+        """
+        from .sa_ffn import sa_expert_forward
+
+        Wg = expert_mod.gate_proj.weight
+        Wu = expert_mod.up_proj.weight
+        Wd = expert_mod.down_proj.weight
+        I = Wg.shape[0]
+
+        # Check which columns of this expert are currently resident
+        res = [c for c in range(I) if (expert_idx, c) in self.directory._resident]
+        if not res:
+            # Cold start: top initial packet becomes cached, remainder missed
+            initial_budget = min(self.directory.capacity, I)
+            res = list(range(initial_budget))
+            missed = list(range(initial_budget, I))
+        else:
+            res_set = set(res)
+            missed = [c for c in range(I) if c not in res_set]
+
+        # Touch/commit cached columns to LRU
+        self.directory.commit({expert_idx: res})
+
+        _, _, y_total = sa_expert_forward(x, res, missed, Wg, Wu, Wd)
+        return y_total
 
     def stats(self) -> dict:
         return {"mode": "shadow", "layers_hooked": len(self._handles),
                 "shadow_steps": self._steps,
+                "hits_count": self._hits_count,
+                "misses_count": self._misses_count,
                 "layers_with_router": list(self._layers),
                 "disabled_reason": self.disabled_reason}
