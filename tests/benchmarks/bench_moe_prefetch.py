@@ -402,15 +402,11 @@ def main():
     config = AutoConfig.from_pretrained(args.model_dir, trust_remote_code=True)
     sys.path.insert(0, args.model_dir)
 
-    # Import the model's sparse MoE block
-    try:
-        from modeling_param2moe import Param2MoESparseMoeBlock
-    except ImportError:
-        import importlib.util
-        spec = importlib.util.spec_from_file_location("modeling_param2moe", os.path.join(args.model_dir, "modeling_param2moe.py"))
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-        Param2MoESparseMoeBlock = mod.Param2MoESparseMoeBlock
+    # Import the model's sparse MoE block using transformers dynamic module loader
+    from transformers.dynamic_module_utils import get_class_from_dynamic_module
+    Param2MoESparseMoeBlock = get_class_from_dynamic_module(
+        "modeling_param2moe.Param2MoESparseMoeBlock", args.model_dir
+    )
 
     moe_block = Param2MoESparseMoeBlock(config).to(torch.bfloat16)
 
