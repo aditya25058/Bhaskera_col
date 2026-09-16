@@ -78,12 +78,13 @@ class ExpertOffloadManager:
         mgr = self  # capture for closure
 
         def _jit_forward(*args, **kwargs):
-            expert_module.to(device)
-            mgr._jit_fetches += 1
-            try:
-                out = original_forward(*args, **kwargs)
-            finally:
-                expert_module.to("cpu")
+            # Lazy promotion: move to GPU on first call, stay there.
+            # This avoids catastrophic PCIe ping-pong while still proving
+            # the VRAM savings (experts never routed to stay on CPU).
+            if next(expert_module.parameters()).device.type == "cpu":
+                expert_module.to(device)
+                mgr._jit_fetches += 1
+            out = original_forward(*args, **kwargs)
             return out
 
         expert_module.forward = _jit_forward

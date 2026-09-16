@@ -4,7 +4,7 @@
 #SBATCH --gres=gpu:1
 #SBATCH -c 4
 #SBATCH --cpus-per-task=4
-#SBATCH -t 00:05:00
+#SBATCH -t 00:10:00
 #SBATCH -J infer_col
 #SBATCH -o /home/bapic_iiitd/2_group/infer_colossus.out
 
