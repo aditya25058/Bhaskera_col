@@ -371,6 +371,13 @@ class _HFBackend:
         _colossus_hook = getattr(self, "_colossus", None)
         if _colossus_hook is not None:
             _colossus_hook.maybe_offload(self._model, input_ids)
+            # Record VRAM after offload so stats show the actual savings
+            if torch.cuda.is_available():
+                vram_after = torch.cuda.memory_allocated() / (1024 ** 3)
+                import logging as _lg
+                _lg.getLogger(__name__).info(
+                    f"[Engine] VRAM after COLOSSUS offload: {vram_after:.2f} GB"
+                )
 
         with ctx:
             if self._spec_dec is not None:
