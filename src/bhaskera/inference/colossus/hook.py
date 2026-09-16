@@ -150,7 +150,9 @@ class ColossusMoEHook:
                 h = inputs[0] if inputs else None
                 if h is None:
                     return
-                last = h[:, -1, :].detach().float().cpu()
+                # Flatten to [*, H] then take the very last hidden vector → [H]
+                H = h.shape[-1]
+                last = h.detach().float().reshape(-1, H)[-1].cpu()  # [H]
                 self._states.setdefault(layer_idx, deque(maxlen=_SHADOW_DEPTH)).append(last)
                 self._steps += 1
             except Exception:

@@ -67,14 +67,18 @@ class ZSSRPredictor:
                 self.up_w[l_idx][e] = u.cpu()
 
     def predict_experts(self, h_prev, layer: int):
-        """``h_prev``: [H] or [1,H]. Returns (ranking, logits)."""
+        """``h_prev``: [H] or [1,H] or higher-dim. Returns (ranking, logits).
+
+        Any extra leading dims are collapsed: we always use the last
+        vector along the hidden dimension to produce a flat ranking.
+        """
         import torch
 
         with torch.no_grad():
             W = self.router[layer]
-            if h_prev.dim() == 1:
-                h_prev = h_prev.unsqueeze(0)
-            logits = (h_prev.float() @ W.T).squeeze(0)
+            # Collapse to exactly [H] — handles [1,H], [1,1,H], [B,S,H] etc.
+            h = h_prev.detach().float().reshape(-1, W.shape[1])[-1]  # [H]
+            logits = h @ W.T  # [E]
             ranking = torch.argsort(logits, descending=True).tolist()
             return ranking, logits
 
@@ -87,9 +91,7 @@ class ZSSRPredictor:
         import torch.nn.functional as F
 
         with torch.no_grad():
-            if h_prev.dim() == 1:
-                h_prev = h_prev.unsqueeze(0)
-            h = h_prev.float()
+            h = h_prev.detach().float().reshape(-1, list(self.gate_w[layer].values())[0].shape[1])[-1:]  # [1, H]
             plan = {}
             for exp in spec_ranking[: self.num_col_experts]:
                 Wg = self.gate_w[layer][exp]

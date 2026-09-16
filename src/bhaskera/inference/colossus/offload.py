@@ -136,7 +136,14 @@ class ExpertOffloadManager:
             if experts is None:
                 continue
 
-            hot_set = set(hot_experts)
+            # Defensive: flatten any nested lists (e.g. [[0,1,2]] → [0,1,2])
+            flat = []
+            for item in hot_experts:
+                if isinstance(item, (list, tuple)):
+                    flat.extend(item)
+                else:
+                    flat.append(item)
+            hot_set = set(flat)
             self._offloaded[layer_idx] = set()
 
             for e_idx, expert in enumerate(experts):
