@@ -5,8 +5,8 @@
 #SBATCH -c 4
 #SBATCH --cpus-per-task=4
 #SBATCH -t 00:05:00
-#SBATCH -J infer_col
-#SBATCH -o /home/bapic_iiitd/2_group/infer_colossus_c32_l4.out
+#SBATCH -J bench_adetr
+#SBATCH -o /home/bapic_iiitd/2_group/bench_adetr_stage4.out
 
 source /home/bapic_iiitd/2_group/bhaskera-venv/bin/activate
 cd /home/bapic_iiitd/2_group/Bhaskera_col
@@ -20,12 +20,4 @@ echo "=== GPU LINK TOPOLOGY ==="
 nvidia-smi --query-gpu=name,pcie.link.gen.current,pcie.link.gen.max,pcie.link.width.current,memory.total --format=csv || lspci -v | grep -i nvidia
 echo "========================="
 
-MODEL_DIR=/home/bapic_iiitd/.cache/huggingface/hub/models--bharatgenai--Param2-17B-A2.4B-Thinking/snapshots/1d5b7897cf1eec5ad5159f216e757e71b751c979
-
-python -m bhaskera.launcher.infer \
-  --config configs/inference_colossus.yaml \
-  --model "$MODEL_DIR" \
-  --prompt-file rudra/prompts.txt \
-  --max-new-tokens 64 \
-  --no-sample \
-  --output-file /home/bapic_iiitd/2_group/outputs_c32_l4.txt
+python rudra/bench_adetr_stage4.py

@@ -53,7 +53,8 @@ inference:
     offload_enabled: true
     # Keep top-8 experts per layer on GPU (Param2 uses top-6 routing,
     # 8 gives headroom for near-miss experts).
-    hot_expert_topk: 16
+    hot_expert_topk: 32
+    missing_col_ratio: 0.50
 
   torch_compile: false
 

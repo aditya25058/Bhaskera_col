@@ -5,8 +5,10 @@
 #SBATCH -c 4
 #SBATCH --cpus-per-task=4
 #SBATCH -t 00:05:00
-#SBATCH -J infer_col
-#SBATCH -o /home/bapic_iiitd/2_group/infer_colossus_c32_l4.out
+#SBATCH -J col_ablation
+
+MISSING_RATIO=${1:-0.50}
+OUT_SUFFIX=${2:-m50}
 
 source /home/bapic_iiitd/2_group/bhaskera-venv/bin/activate
 cd /home/bapic_iiitd/2_group/Bhaskera_col
@@ -19,6 +21,7 @@ export HF_DATASETS_OFFLINE=1
 echo "=== GPU LINK TOPOLOGY ==="
 nvidia-smi --query-gpu=name,pcie.link.gen.current,pcie.link.gen.max,pcie.link.width.current,memory.total --format=csv || lspci -v | grep -i nvidia
 echo "========================="
+echo "Starting COLOSSUS Run with C=32, L+4, Gating, missing_col_ratio=${MISSING_RATIO}"
 
 MODEL_DIR=/home/bapic_iiitd/.cache/huggingface/hub/models--bharatgenai--Param2-17B-A2.4B-Thinking/snapshots/1d5b7897cf1eec5ad5159f216e757e71b751c979
 
@@ -28,4 +31,5 @@ python -m bhaskera.launcher.infer \
   --prompt-file rudra/prompts.txt \
   --max-new-tokens 64 \
   --no-sample \
-  --output-file /home/bapic_iiitd/2_group/outputs_c32_l4.txt
+  --missing-col-ratio "${MISSING_RATIO}" \
+  --output-file "/home/bapic_iiitd/2_group/outputs_c32_l4_${OUT_SUFFIX}.txt"

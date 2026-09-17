@@ -10,6 +10,7 @@ Architecture:
 """
 from __future__ import annotations
 
+import contextlib
 import logging
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -23,20 +24,56 @@ logger = logging.getLogger(__name__)
 class DynamicMoELayerWrapper(nn.Module):
     """Wraps SparseMoeBlock with pre-allocated GPU slot cache and async DMA streaming."""
 
+    _shared_dummy_expert: Optional[Any] = None
+    _shared_down_cold_rx: Optional[torch.Tensor] = None
+    _pinned_staging: Dict[str, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+
+    @classmethod
+    def get_pinned_staging(
+        cls, key: str, intermediate_size: int, hidden_size: int, dtype: torch.dtype
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Allocate reusable pinned host staging buffers for direct DMA (Opt 1b).
+        One buffer is ~352 MB. We maintain one for demand ('demand') and one for prefetch ('prefetch').
+        Total host pinned RAM: ~704 MB (instantaneous 0.05s allocation vs 213s for 90GB).
+        """
+        if key not in cls._pinned_staging:
+            g = torch.empty((intermediate_size, hidden_size), dtype=dtype, device="cpu", pin_memory=True)
+            u = torch.empty((intermediate_size, hidden_size), dtype=dtype, device="cpu", pin_memory=True)
+            d = torch.empty((hidden_size, intermediate_size), dtype=dtype, device="cpu", pin_memory=True)
+            cls._pinned_staging[key] = (g, u, d)
+        return cls._pinned_staging[key]
+
+    def _exp_proj(self, expert, proj_type: str):
+        """proj_type in ['gate', 'down', 'up']"""
+        if proj_type == "gate":
+            return getattr(expert, "gate_proj", getattr(expert, "w1", None))
+        elif proj_type == "down":
+            return getattr(expert, "down_proj", getattr(expert, "w2", None))
+        elif proj_type == "up":
+            return getattr(expert, "up_proj", getattr(expert, "w3", None))
+        raise ValueError(f"Unknown proj_type {proj_type}")
+
     def __init__(
         self,
         layer_idx: int,
         moe_block: nn.Module,
         capacity: int = 16,
         device: torch.device = torch.device("cuda"),
+        missing_col_ratio: float = 1.0,
+        config: Optional[Any] = None,
+        warmup_slots: int = 0,
+        lookahead_enabled: bool = False,
     ):
         super().__init__()
         self.layer_idx = layer_idx
         self.block = moe_block
         self.capacity = capacity
+        self.warmup_slots = warmup_slots
+        self.lookahead_enabled = lookahead_enabled
         self.device = device
         self.num_experts = len(moe_block.experts)
-        self.top_k = getattr(moe_block, "num_experts_per_tok", 6)
+        self.top_k = getattr(moe_block, "num_experts_per_tok", getattr(moe_block, "top_k", 2))
+        self.is_mixtral = hasattr(moe_block, "gate") and not hasattr(moe_block, "moe_infer")
 
         # Router weight for ZSSR speculative projection
         gate = getattr(moe_block, "gate", None)
@@ -48,42 +85,105 @@ class DynamicMoELayerWrapper(nn.Module):
             self.router_weight = None
 
         sample_exp = self.block.experts[0]
-        self.config = sample_exp.config
-        self.intermediate_size = sample_exp.intermediate_size
-        self.dtype = sample_exp.gate_proj.weight.dtype
+        if config is not None:
+            self.config = config
+        else:
+            self.config = getattr(sample_exp, "config", getattr(moe_block, "config", None))
+        g_proj = self._exp_proj(sample_exp, "gate")
+        u_proj = self._exp_proj(sample_exp, "up")
+        d_proj = self._exp_proj(sample_exp, "down")
 
-        # 1. Master CPU expert copies in pinned memory
-        self.cpu_experts = []
-        for e in self.block.experts:
-            e.to("cpu")
-            for p in e.parameters():
-                p.requires_grad_(False)
-                if not p.data.is_pinned():
-                    p.data = p.data.pin_memory()
-            self.cpu_experts.append(e)
+        self.intermediate_size = getattr(sample_exp, "intermediate_size", g_proj.weight.shape[0])
+        self.hidden_size = g_proj.weight.shape[1]
+        self.dtype = g_proj.weight.dtype
+
+        self.missing_col_ratio = float(missing_col_ratio)
+        self.i_missed = int(self.intermediate_size * self.missing_col_ratio)
+        self.i_hot = self.intermediate_size - self.i_missed
+        self.missing_col_stats: List[float] = []
+
+        # Empirical DMA microbenchmark on Rudra rdgpu01 proved:
+        # Pageable transfer is 111.69 ms vs Pinned 110.67 ms (only 0.9% delta).
+        # Pinning 67-90 GB requires hundreds of mlock() syscalls taking 200+ seconds.
+        # Pageable allocation is instantaneous (0.01s), saving 3+ minutes per job.
+        pin = False
+
+        if self.missing_col_ratio < 1.0:
+            # ADETR Memory Layout:
+            # Hot columns reside permanently on GPU; cold columns in pinned host memory
+            self.gpu_gate_hot = torch.empty((self.num_experts, self.i_hot, self.hidden_size), dtype=self.dtype, device=device)
+            self.gpu_up_hot   = torch.empty((self.num_experts, self.i_hot, self.hidden_size), dtype=self.dtype, device=device)
+            self.gpu_down_hot = torch.empty((self.num_experts, self.hidden_size, self.i_hot), dtype=self.dtype, device=device)
+
+            self.cpu_gate_cold = torch.empty((self.num_experts, self.i_missed, self.hidden_size), dtype=self.dtype, pin_memory=pin)
+            self.cpu_up_cold   = torch.empty((self.num_experts, self.i_missed, self.hidden_size), dtype=self.dtype, pin_memory=pin)
+            # ADETR down_proj: stored as [I_cold, H] in pinned memory for contiguous DMA
+            self.cpu_down_cold = torch.empty((self.num_experts, self.i_missed, self.hidden_size), dtype=self.dtype, pin_memory=pin)
+            # Per-slot receive buffer to eliminate cross-slot and prefetch/demand stream race hazards
+            # Shared across all layers to save ~3.76 GB GPU HBM (layers execute sequentially in decode)
+            if (
+                DynamicMoELayerWrapper._shared_down_cold_rx is None
+                or DynamicMoELayerWrapper._shared_down_cold_rx.shape != (capacity, self.i_missed, self.hidden_size)
+                or DynamicMoELayerWrapper._shared_down_cold_rx.device != device
+            ):
+                DynamicMoELayerWrapper._shared_down_cold_rx = torch.empty(
+                    (capacity, self.i_missed, self.hidden_size), dtype=self.dtype, device=device
+                )
+            self.slot_down_cold_rx = DynamicMoELayerWrapper._shared_down_cold_rx
+
+            for i, e in enumerate(self.block.experts):
+                eg = self._exp_proj(e, "gate")
+                eu = self._exp_proj(e, "up")
+                ed = self._exp_proj(e, "down")
+                self.gpu_gate_hot[i].copy_(eg.weight.data[:self.i_hot, :], non_blocking=True)
+                self.gpu_up_hot[i].copy_(eu.weight.data[:self.i_hot, :], non_blocking=True)
+                self.gpu_down_hot[i].copy_(ed.weight.data[:, :self.i_hot], non_blocking=True)
+
+                self.cpu_gate_cold[i].copy_(eg.weight.data[self.i_hot:, :], non_blocking=True)
+                self.cpu_up_cold[i].copy_(eu.weight.data[self.i_hot:, :], non_blocking=True)
+                self.cpu_down_cold[i].copy_(ed.weight.data[:, self.i_hot:].t().contiguous(), non_blocking=True)
+        else:
+            # 1. Master CPU expert weights: reference existing CPU tensors directly (instantaneous 0.01s, 0 extra RAM)
+            self.cpu_gate_buffer = [self._exp_proj(e, "gate").weight.data.detach().cpu() for e in self.block.experts]
+            self.cpu_up_buffer = [self._exp_proj(e, "up").weight.data.detach().cpu() for e in self.block.experts]
+            self.cpu_down_buffer = [self._exp_proj(e, "down").weight.data.detach().cpu() for e in self.block.experts]
+
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
 
         # 2. Pre-allocate exactly C GPU slots (constant VRAM buffer)
-        self.slots = [
-            sample_exp.__class__(self.config, intermediate_size=self.intermediate_size).to(
-                device=device, dtype=self.dtype
-            ).requires_grad_(False)
-            for _ in range(capacity)
-        ]
+        def _make_slot_expert():
+            try:
+                with torch.device("meta"):
+                    try:
+                        mod = sample_exp.__class__(self.config, intermediate_size=self.intermediate_size)
+                    except TypeError:
+                        mod = sample_exp.__class__(self.config)
+                mod = mod.to_empty(device=device)
+            except Exception:
+                try:
+                    mod = sample_exp.__class__(self.config, intermediate_size=self.intermediate_size)
+                except TypeError:
+                    mod = sample_exp.__class__(self.config)
+                mod = mod.to(device=device)
+            return mod.to(dtype=self.dtype).requires_grad_(False)
 
-        # 3. Create a shared dummy expert on GPU for inactive experts (proper shapes)
-        self.dummy_expert = sample_exp.__class__(self.config, intermediate_size=self.intermediate_size).to(
-            device=device, dtype=self.dtype
-        ).requires_grad_(False)
-        self.dummy_expert.gate_proj.weight.data.zero_()
-        self.dummy_expert.up_proj.weight.data.zero_()
-        self.dummy_expert.down_proj.weight.data.zero_()
+        self.slots = [_make_slot_expert() for _ in range(capacity)]
+        if DynamicMoELayerWrapper._shared_dummy_expert is None or getattr(DynamicMoELayerWrapper._shared_dummy_expert, "device", None) != device:
+            DynamicMoELayerWrapper._shared_dummy_expert = _make_slot_expert()
+            self._exp_proj(DynamicMoELayerWrapper._shared_dummy_expert, "gate").weight.data.zero_()
+            self._exp_proj(DynamicMoELayerWrapper._shared_dummy_expert, "up").weight.data.zero_()
+            self._exp_proj(DynamicMoELayerWrapper._shared_dummy_expert, "down").weight.data.zero_()
+        self.dummy_expert = DynamicMoELayerWrapper._shared_dummy_expert
 
-        self.block.to(device)
+        if hasattr(self.block, "gate"):
+            self.block.gate.to(device)
+
         for e in self.block.experts:
             e.requires_grad_(False)
-            e.gate_proj.weight.data = self.dummy_expert.gate_proj.weight.data
-            e.up_proj.weight.data = self.dummy_expert.up_proj.weight.data
-            e.down_proj.weight.data = self.dummy_expert.down_proj.weight.data
+            self._exp_proj(e, "gate").weight.data = self._exp_proj(self.dummy_expert, "gate").weight.data
+            self._exp_proj(e, "up").weight.data = self._exp_proj(self.dummy_expert, "up").weight.data
+            self._exp_proj(e, "down").weight.data = self._exp_proj(self.dummy_expert, "down").weight.data
 
         # Ensure wrapper is in eval mode
         self.eval()
@@ -95,9 +195,9 @@ class DynamicMoELayerWrapper(nn.Module):
         self.slot_lru: List[int] = []  # most recently used at end
 
         # 5. Dedicated prefetch CUDA stream
-        self.prefetch_stream = torch.cuda.Stream(device=device)
+        self.prefetch_stream = torch.cuda.Stream(device=device) if device.type == "cuda" else None
 
-        # 6. Performance metrics
+        # 6. Performance & stall metrics
         self.hits = 0
         self.misses = 0
         self.prefetch_bytes = 0
@@ -106,8 +206,16 @@ class DynamicMoELayerWrapper(nn.Module):
         self.total_routing_decisions = 0
         self.total_tokens_processed = 0
 
-        # Warmup cache with first C experts
-        self.warmup(list(range(min(self.capacity, self.num_experts))))
+        self.demand_stall_s = 0.0
+        self.prefetch_stall_s = 0.0
+        self.pcie_time_s = 0.0
+        self.pending_prefetch_events: List[Tuple[torch.cuda.Event, torch.cuda.Event]] = []
+        self.pending_demand_events: List[Tuple[torch.cuda.Event, torch.cuda.Event]] = []
+        self.last_predicted_topk: Optional[List[int]] = None
+
+        # Warmup cache with initial experts if requested
+        if self.warmup_slots > 0:
+            self.warmup(list(range(min(self.warmup_slots, self.capacity, self.num_experts))))
 
     def warmup(self, initial_ids: List[int]):
         """Warm up slots with initial experts."""
@@ -115,6 +223,68 @@ class DynamicMoELayerWrapper(nn.Module):
             self._load_to_slot(e_id, non_blocking=False)
         self.prefetch_bytes = 0
         self.demand_bytes = 0
+        self.demand_stall_s = 0.0
+        self.prefetch_stall_s = 0.0
+        self.pcie_time_s = 0.0
+        self.pending_prefetch_events.clear()
+        self.pending_demand_events.clear()
+
+    def warmup_from_prefill(self, hidden_states: torch.Tensor) -> List[int]:
+        """Opt 6: Analyze prefill routing decisions to seed cache with most-activated experts.
+
+        Runs the router on all prefill token hidden states, counts expert activations,
+        and pre-loads the top-C most frequently routed experts into GPU slots.
+        This eliminates cold-start misses for the first few autoregressive tokens.
+        """
+        if self.router_weight is None:
+            return []
+        with torch.no_grad():
+            h2d = hidden_states.view(-1, hidden_states.shape[-1]).to(
+                dtype=self.router_weight.dtype, device=self.router_weight.device
+            )
+            logits = torch.matmul(h2d, self.router_weight.t())  # [seq_len, num_experts]
+            top_k_indices = torch.topk(logits, k=self.top_k, dim=-1).indices  # [seq_len, top_k]
+            counts = torch.bincount(top_k_indices.view(-1), minlength=self.num_experts)
+            top_c = counts.topk(min(self.capacity, self.num_experts)).indices.tolist()
+        logger.info(f"[Colossus] Layer {self.layer_idx}: prefill warmup → top-{len(top_c)} experts {top_c}")
+        self.warmup(top_c)
+        return top_c
+
+    def reset_state(self):
+        """Reset slot bindings and speculative state without clearing cumulative benchmark metrics."""
+        self.last_predicted_topk = None
+        self.expert_to_slot.clear()
+        self.slot_to_expert.clear()
+        self.free_slots = list(range(self.capacity))
+        self.slot_lru.clear()
+        for e in self.block.experts:
+            self._exp_proj(e, "gate").weight.data = self._exp_proj(self.dummy_expert, "gate").weight.data
+            self._exp_proj(e, "up").weight.data = self._exp_proj(self.dummy_expert, "up").weight.data
+            self._exp_proj(e, "down").weight.data = self._exp_proj(self.dummy_expert, "down").weight.data
+        if getattr(self, "warmup_slots", 0) > 0:
+            for e_id in range(min(self.warmup_slots, self.capacity, self.num_experts)):
+                self._load_to_slot(e_id, non_blocking=False)
+        self.pending_prefetch_events.clear()
+        self.pending_demand_events.clear()
+
+    def _drain_demand_events(self, sync_first: bool = False):
+        """Drain completed demand CUDA timing events without CPU stall."""
+        if not self.pending_demand_events:
+            return
+        if self.device.type != "cuda":
+            self.pending_demand_events.clear()
+            return
+        if sync_first:
+            torch.cuda.synchronize(self.device)
+        remaining = []
+        for ev_start, ev_end in self.pending_demand_events:
+            if sync_first or ev_end.query():
+                dma_s = ev_start.elapsed_time(ev_end) / 1000.0
+                self.demand_stall_s += dma_s
+                self.pcie_time_s += dma_s
+            else:
+                remaining.append((ev_start, ev_end))
+        self.pending_demand_events = remaining
 
     def _load_to_slot(self, expert_id: int, non_blocking: bool = True, stream=None,
                       locked_slots: Optional[Set[int]] = None) -> int:
@@ -138,9 +308,9 @@ class DynamicMoELayerWrapper(nn.Module):
             del self.expert_to_slot[old_expert]
             # Unbind old expert weights back to dummy
             old_mod = self.block.experts[old_expert]
-            old_mod.gate_proj.weight.data = self.dummy_expert.gate_proj.weight.data
-            old_mod.up_proj.weight.data = self.dummy_expert.up_proj.weight.data
-            old_mod.down_proj.weight.data = self.dummy_expert.down_proj.weight.data
+            self._exp_proj(old_mod, "gate").weight.data = self._exp_proj(self.dummy_expert, "gate").weight.data
+            self._exp_proj(old_mod, "up").weight.data = self._exp_proj(self.dummy_expert, "up").weight.data
+            self._exp_proj(old_mod, "down").weight.data = self._exp_proj(self.dummy_expert, "down").weight.data
 
         self.expert_to_slot[expert_id] = slot_idx
         self.slot_to_expert[slot_idx] = expert_id
@@ -148,56 +318,206 @@ class DynamicMoELayerWrapper(nn.Module):
 
         # DMA transfer into target slot
         slot = self.slots[slot_idx]
-        src = self.cpu_experts[expert_id]
+        slot_g = self._exp_proj(slot, "gate")
+        slot_u = self._exp_proj(slot, "up")
+        slot_d = self._exp_proj(slot, "down")
 
-        stream_ctx = torch.cuda.stream(stream) if stream else torch.cuda.stream(torch.cuda.current_stream())
-        with stream_ctx:
-            slot.gate_proj.weight.data.copy_(src.gate_proj.weight.data, non_blocking=non_blocking)
-            slot.up_proj.weight.data.copy_(src.up_proj.weight.data, non_blocking=non_blocking)
-            slot.down_proj.weight.data.copy_(src.down_proj.weight.data, non_blocking=non_blocking)
-            b = (
-                src.gate_proj.weight.numel() * src.gate_proj.weight.element_size() +
-                src.up_proj.weight.numel() * src.up_proj.weight.element_size() +
-                src.down_proj.weight.numel() * src.down_proj.weight.element_size()
-            )
+        if self.device.type == "cuda":
+            stream_ctx = stream if stream else torch.cuda.current_stream(self.device)
+            stream_scope = torch.cuda.stream(stream_ctx)
+        else:
+            stream_scope = contextlib.nullcontext()
+
+        ev_start = None
+        ev_end = None
+        if self.device.type == "cuda":
+            ev_start = torch.cuda.Event(enable_timing=True)
+            ev_end = torch.cuda.Event(enable_timing=True)
+            ev_start.record(stream_ctx)
+
+        dev_scope = torch.cuda.device(self.device) if self.device.type == "cuda" else contextlib.nullcontext()
+        with dev_scope, stream_scope:
+            if self.missing_col_ratio < 1.0:
+                # 1. Hot columns: instantaneous intra-GPU copy from resident table
+                slot_g.weight.data[:self.i_hot].copy_(self.gpu_gate_hot[expert_id], non_blocking=True)
+                slot_u.weight.data[:self.i_hot].copy_(self.gpu_up_hot[expert_id], non_blocking=True)
+                slot_d.weight.data[:, :self.i_hot].copy_(self.gpu_down_hot[expert_id], non_blocking=True)
+
+                # 2. Cold columns: contiguous PCIe DMA transfer
+                slot_g.weight.data[self.i_hot:].copy_(self.cpu_gate_cold[expert_id], non_blocking=non_blocking)
+                slot_u.weight.data[self.i_hot:].copy_(self.cpu_up_cold[expert_id], non_blocking=non_blocking)
+                # ADETR: DMA into contiguous per-slot buffer, then transpose in GPU HBM (1.5 TB/s)
+                rx_buf = self.slot_down_cold_rx[slot_idx]
+                rx_buf.copy_(self.cpu_down_cold[expert_id], non_blocking=non_blocking)
+                slot_d.weight.data[:, self.i_hot:].copy_(rx_buf.t(), non_blocking=True)
+
+                b = (
+                    self.cpu_gate_cold[expert_id].numel() * self.cpu_gate_cold[expert_id].element_size() * 3
+                )
+                self.missing_col_stats.append(self.missing_col_ratio * 100.0)
+            else:
+                if self.device.type == "cuda" and torch.cuda.is_available():
+                    st_key = "prefetch" if stream is not None else "demand"
+                    st_g, st_u, st_d = self.get_pinned_staging(
+                        st_key, self.intermediate_size, self.hidden_size, self.dtype
+                    )
+                    # 1. Fast CPU-to-CPU memcpy into pinned staging buffer (~5ms)
+                    st_g.copy_(self.cpu_gate_buffer[expert_id])
+                    st_u.copy_(self.cpu_up_buffer[expert_id])
+                    st_d.copy_(self.cpu_down_buffer[expert_id])
+                    # 2. Direct hardware DMA from pinned memory to GPU slot at 25.6 GB/s (~14ms)
+                    slot_g.weight.data.copy_(st_g, non_blocking=non_blocking)
+                    slot_u.weight.data.copy_(st_u, non_blocking=non_blocking)
+                    slot_d.weight.data.copy_(st_d, non_blocking=non_blocking)
+                else:
+                    slot_g.weight.data.copy_(self.cpu_gate_buffer[expert_id], non_blocking=non_blocking)
+                    slot_u.weight.data.copy_(self.cpu_up_buffer[expert_id], non_blocking=non_blocking)
+                    slot_d.weight.data.copy_(self.cpu_down_buffer[expert_id], non_blocking=non_blocking)
+
+                b = (
+                    self.cpu_gate_buffer[expert_id].numel() * self.cpu_gate_buffer[expert_id].element_size() * 3
+                )
+                self.missing_col_stats.append(100.0)
+
             if stream is not None:
                 self.prefetch_bytes += b
             else:
                 self.demand_bytes += b
 
+            if self.device.type == "cuda" and ev_end is not None:
+                ev_end.record(stream_ctx)
+                if stream is not None:
+                    self.pending_prefetch_events.append((ev_start, ev_end))
+                else:
+                    self.pending_demand_events.append((ev_start, ev_end))
+
         # Bind active expert to this slot's tensors
         exp_mod = self.block.experts[expert_id]
-        exp_mod.gate_proj.weight.data = slot.gate_proj.weight.data
-        exp_mod.up_proj.weight.data = slot.up_proj.weight.data
-        exp_mod.down_proj.weight.data = slot.down_proj.weight.data
+        self._exp_proj(exp_mod, "gate").weight.data = slot_g.weight.data
+        self._exp_proj(exp_mod, "up").weight.data = slot_u.weight.data
+        self._exp_proj(exp_mod, "down").weight.data = slot_d.weight.data
 
         return slot_idx
 
     def async_prefetch(self, expert_ids: List[int], locked_slots: Optional[Set[int]] = None) -> None:
         """Stream predicted experts to GPU via dedicated non-blocking CUDA stream."""
-        for e_id in expert_ids:
-            if e_id not in self.expert_to_slot:
-                self._load_to_slot(e_id, non_blocking=True, stream=self.prefetch_stream, locked_slots=locked_slots)
+        miss_pref = [e_id for e_id in expert_ids if e_id not in self.expert_to_slot]
+        if not miss_pref:
+            return
+        if self.device.type != "cuda":
+            for e_id in miss_pref:
+                self._load_to_slot(e_id, non_blocking=False, locked_slots=locked_slots)
+            return
+        with torch.cuda.device(self.device):
+            ev_start = torch.cuda.Event(enable_timing=True)
+            ev_end = torch.cuda.Event(enable_timing=True)
+            with torch.cuda.stream(self.prefetch_stream):
+                ev_start.record(self.prefetch_stream)
+                for e_id in miss_pref:
+                    self._load_to_slot(e_id, non_blocking=True, stream=self.prefetch_stream, locked_slots=locked_slots)
+                ev_end.record(self.prefetch_stream)
+            self.pending_prefetch_events.append((ev_start, ev_end))
 
     def synchronize_prefetch(self) -> None:
-        """Synchronize prefetch stream before expert execution."""
-        torch.cuda.current_stream().wait_stream(self.prefetch_stream)
+        """Synchronize prefetch stream before expert execution, recording stall & transfer time."""
+        if not self.pending_prefetch_events:
+            return
+        if self.device.type != "cuda":
+            self.pending_prefetch_events.clear()
+            return
+        t0 = time.perf_counter()
+        with torch.cuda.device(self.device):
+            torch.cuda.current_stream(self.device).wait_stream(self.prefetch_stream)
+            self.prefetch_stream.synchronize()
+        wait_s = time.perf_counter() - t0
+        self.prefetch_stall_s += wait_s
+
+        for ev_start, ev_end in self.pending_prefetch_events:
+            dma_s = ev_start.elapsed_time(ev_end) / 1000.0
+            self.pcie_time_s += dma_s
+        self.pending_prefetch_events.clear()
+
+    def pre_attention_prefetch(self, hidden_states: torch.Tensor, confidence_threshold: float = 0.0) -> List[int]:
+        """Trigger speculative prefetch at layer entrance (before MHA) so DMA overlaps attention computation."""
+        predicted_topk: List[int] = []
+        if self.router_weight is not None:
+            with torch.no_grad():
+                h_rep = hidden_states[:, -1, :].to(dtype=self.router_weight.dtype, device=self.router_weight.device)
+                projected_logits = torch.matmul(h_rep, self.router_weight.t())
+                if confidence_threshold > 0.0:
+                    probs = torch.softmax(projected_logits, dim=-1)
+                    top_probs, top_idx = torch.topk(probs, k=self.top_k, dim=-1)
+                    mask = top_probs >= confidence_threshold
+                    filtered_idx = top_idx[mask].view(-1).tolist()
+                    predicted_topk = list(dict.fromkeys(filtered_idx))
+                else:
+                    predicted_topk = torch.topk(projected_logits, k=self.top_k, dim=-1).indices.view(-1).tolist()
+
+                if predicted_topk:
+                    self.async_prefetch(predicted_topk)
+        self.last_predicted_topk = predicted_topk
+        return predicted_topk
 
     def forward(self, hidden_states: torch.Tensor, *args, **kwargs):
         identity = hidden_states
         bsz, seq_len, h = hidden_states.shape
         self.total_tokens_processed += (bsz * seq_len)
 
-        # ── 1. Speculative Prefetch for Next Step ────────────────────────────
-        predicted_topk: List[int] = []
-        if self.router_weight is not None:
-            with torch.no_grad():
-                h_rep = hidden_states[:, -1, :].to(dtype=self.router_weight.dtype)
-                projected_logits = torch.matmul(h_rep, self.router_weight.t())
-                predicted_topk = torch.topk(projected_logits, k=self.top_k, dim=-1).indices.view(-1).tolist()
-                self.async_prefetch(predicted_topk)
+        # ── 1. Speculative Prefetch (Pre-Attention or Fallback) ─────────────
+        if self.last_predicted_topk is not None:
+            predicted_topk = self.last_predicted_topk
+            self.last_predicted_topk = None
+        elif self.lookahead_enabled and seq_len == 1:
+            predicted_topk = self.pre_attention_prefetch(hidden_states)
+        else:
+            predicted_topk = []
 
         # ── 2. Native Model Router (UNTOUCHED - Exact Execution) ─────────────
+        if self.is_mixtral:
+            hidden_states_2d = hidden_states.view(-1, h)
+            router_logits = self.block.gate(hidden_states_2d)
+
+            routing_weights = torch.nn.functional.softmax(router_logits, dim=1, dtype=torch.float)
+            routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
+            routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+            routing_weights = routing_weights.to(hidden_states.dtype)
+
+            actual_flat = selected_experts.unique().tolist()
+            pred_set = set(predicted_topk)
+            actual_set = set(actual_flat)
+            self.prediction_matches += len(pred_set.intersection(actual_set))
+            self.total_routing_decisions += len(actual_set)
+
+            self.synchronize_prefetch()
+
+            final_hidden_states = torch.zeros(
+                (bsz * seq_len, h), dtype=hidden_states.dtype, device=hidden_states.device
+            )
+            expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
+            expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+
+            expert_list = [ei.item() for ei in expert_hit]
+            for e_idx in expert_list:
+                if e_idx in self.expert_to_slot:
+                    self.hits += 1
+                    self.missing_col_stats.append(0.0)
+                    slot_idx = self.expert_to_slot[e_idx]
+                    self.slot_lru.remove(slot_idx)
+                    self.slot_lru.append(slot_idx)
+                else:
+                    self.misses += 1
+                    slot_idx = self._load_to_slot(e_idx, non_blocking=False)
+
+                slot_mod = self.slots[slot_idx]
+                idx, top_x = torch.where(expert_mask[e_idx])
+                current_state = hidden_states_2d[top_x]
+                current_hidden_states = slot_mod(current_state) * routing_weights[top_x, idx, None]
+                final_hidden_states.index_add_(0, top_x, current_hidden_states.to(hidden_states.dtype))
+
+            self._drain_demand_events(sync_first=False)
+            final_hidden_states = final_hidden_states.reshape(bsz, seq_len, h)
+            return final_hidden_states, router_logits
+
         topk_idx, topk_weight, router_logits = self.block.gate(hidden_states)
 
         actual_flat = topk_idx.unique().tolist()
@@ -211,21 +531,41 @@ class DynamicMoELayerWrapper(nn.Module):
 
         if len(actual_flat) <= self.capacity:
             # Standard generation step: all required experts fit in GPU slots simultaneously
+            self.synchronize_prefetch()
+
             locked_slots: Set[int] = set()
             for e_id in actual_flat:
                 if e_id in self.expert_to_slot:
                     self.hits += 1
+                    self.missing_col_stats.append(0.0)
                     slot_idx = self.expert_to_slot[e_id]
                     self.slot_lru.remove(slot_idx)
                     self.slot_lru.append(slot_idx)
                     locked_slots.add(slot_idx)
-                else:
-                    self.misses += 1
-                    slot_idx = self._load_to_slot(e_id, non_blocking=False, locked_slots=locked_slots)
-                    locked_slots.add(slot_idx)
 
-            self.synchronize_prefetch()
+            miss_ids = [e_id for e_id in actual_flat if e_id not in self.expert_to_slot]
+            if miss_ids:
+                if self.device.type == "cuda":
+                    with torch.cuda.device(self.device):
+                        ev_d_start = torch.cuda.Event(enable_timing=True)
+                        ev_d_end = torch.cuda.Event(enable_timing=True)
+                        cur_stream = torch.cuda.current_stream(self.device)
+                        ev_d_start.record(cur_stream)
+                        for e_id in miss_ids:
+                            self.misses += 1
+                            slot_idx = self._load_to_slot(e_id, non_blocking=True, locked_slots=locked_slots)
+                            locked_slots.add(slot_idx)
+                        ev_d_end.record(cur_stream)
+                        self.pending_demand_events.append((ev_d_start, ev_d_end))
+                else:
+                    for e_id in miss_ids:
+                        self.misses += 1
+                        slot_idx = self._load_to_slot(e_id, non_blocking=False, locked_slots=locked_slots)
+                        locked_slots.add(slot_idx)
+
             y = self.block.moe_infer(hidden_states_2d, topk_idx, topk_weight).view(bsz, seq_len, h)
+            if len(self.pending_demand_events) >= 32:
+                self._drain_demand_events()
         else:
             # Prefill step with many tokens: unique experts exceed slot capacity
             # Execute sequentially per expert so slots can be reused without memory errors
@@ -242,12 +582,15 @@ class DynamicMoELayerWrapper(nn.Module):
                     continue
                 if i in self.expert_to_slot:
                     self.hits += 1
+                    self.missing_col_stats.append(0.0)
                     slot_idx = self.expert_to_slot[i]
                     self.slot_lru.remove(slot_idx)
                     self.slot_lru.append(slot_idx)
                 else:
                     self.misses += 1
                     self._load_to_slot(i, non_blocking=False)
+                    if self.device.type == "cuda":
+                        torch.cuda.synchronize(self.device)
                 expert = self.block.experts[i]
                 tokens_for_this_expert = sorted_tokens[start_idx:end_idx]
                 expert_out = expert(tokens_for_this_expert)
@@ -272,9 +615,24 @@ class DynamicMoELayerWrapper(nn.Module):
 
     def get_stats(self) -> Dict[str, Any]:
         """Return layer cache metrics."""
+        self._drain_demand_events(sync_first=True)
         total_accesses = self.hits + self.misses
         hit_rate = (self.hits / total_accesses * 100.0) if total_accesses > 0 else 0.0
         recall = (self.prediction_matches / self.total_routing_decisions * 100.0) if self.total_routing_decisions > 0 else 0.0
+
+        if self.missing_col_stats:
+            arr = sorted(self.missing_col_stats)
+            n = len(arr)
+            mean_m = sum(arr) / n
+            p50_m = arr[int(n * 0.50)]
+            p90_m = arr[min(n - 1, int(n * 0.90))]
+            p95_m = arr[min(n - 1, int(n * 0.95))]
+            max_m = arr[-1]
+        else:
+            mean_m = p50_m = p90_m = p95_m = max_m = 0.0
+
+        dma_b_tok = (self.prefetch_bytes + self.demand_bytes) / max(1, self.total_tokens_processed)
+
         return {
             "layer_idx": self.layer_idx,
             "capacity": self.capacity,
@@ -284,4 +642,13 @@ class DynamicMoELayerWrapper(nn.Module):
             "recall_pct": recall,
             "prefetch_mb": self.prefetch_bytes / (1024 * 1024),
             "demand_mb": self.demand_bytes / (1024 * 1024),
+            "demand_stall_s": self.demand_stall_s,
+            "prefetch_stall_s": self.prefetch_stall_s,
+            "pcie_time_s": self.pcie_time_s,
+            "missing_col_mean": mean_m,
+            "missing_col_p50": p50_m,
+            "missing_col_p90": p90_m,
+            "missing_col_p95": p95_m,
+            "missing_col_max": max_m,
+            "dma_bytes_per_tok": dma_b_tok,
         }

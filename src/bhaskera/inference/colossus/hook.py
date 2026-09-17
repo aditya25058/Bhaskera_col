@@ -76,11 +76,11 @@ class ColossusMoEHook:
         if model_layers is not None:
             num_layers = max(num_layers, len(model_layers))
 
-        for idx in range(1, max(num_layers, 1)):
+        for idx in range(0, max(num_layers, 1)):
             if model_layers is None or idx >= len(model_layers):
                 continue
             layer = model_layers[idx]
-            mlp = getattr(layer, "mlp", None)
+            mlp = getattr(layer, "block_sparse_moe", getattr(layer, "mlp", None))
             gate = getattr(mlp, "gate", None) if mlp is not None else None
             if gate is None or not hasattr(gate, "weight"):
                 continue
@@ -96,13 +96,15 @@ class ColossusMoEHook:
                 pred.gate_w[idx] = {}
                 pred.up_w[idx] = {}
                 for e, exp_mod in enumerate(experts):
-                    if hasattr(exp_mod, "gate_proj") and hasattr(exp_mod, "up_proj"):
-                        pred.gate_w[idx][e] = exp_mod.gate_proj.weight.detach().float().cpu()
-                        pred.up_w[idx][e] = exp_mod.up_proj.weight.detach().float().cpu()
+                    gw = getattr(exp_mod, "gate_proj", getattr(exp_mod, "w1", None))
+                    uw = getattr(exp_mod, "up_proj", getattr(exp_mod, "w3", None))
+                    if gw is not None and uw is not None and hasattr(gw, "weight") and hasattr(uw, "weight"):
+                        pred.gate_w[idx][e] = gw.weight.detach().cpu()
+                        pred.up_w[idx][e] = uw.weight.detach().cpu()
 
         if n_registered == 0:
             raise RuntimeError(
-                "no DeepSeek/Param2-style mlp.gate routers found "
+                "no DeepSeek/Param2/Mixtral-style routers found "
                 f"(router_names={list(getattr(profile, 'router_module_names', []))[:4]}); "
                 "Qwen3-fused routers stay dense"
             )
@@ -118,39 +120,70 @@ class ColossusMoEHook:
         offload_enabled = bool(getattr(colossus_cfg, "offload_enabled", False))
         if offload_enabled:
             hot_topk = int(getattr(colossus_cfg, "hot_expert_topk", 16) or 16)
+            missing_col_ratio = float(getattr(colossus_cfg, "missing_col_ratio", 1.0) or 1.0)
             hook._dynamic_cache_enabled = True
             hook._cache_capacity = hot_topk
+            hook._missing_col_ratio = missing_col_ratio
+            hook._lookahead_enabled = bool(getattr(colossus_cfg, "lookahead_enabled", False))
+            hook._warmup_slots = int(getattr(colossus_cfg, "warmup_slots", 0))
             logger.info(
-                f"[Colossus] Dynamic expert cache enabled (capacity={hot_topk} experts per layer)"
+                f"[Colossus] Dynamic expert cache enabled (capacity={hot_topk} experts per layer, missing_col_ratio={missing_col_ratio:.2f}, lookahead={hook._lookahead_enabled}, warmup_slots={hook._warmup_slots})"
             )
 
         return hook
 
     # -- attach ----------------------------------------------------------
-    def attach(self, model, profile) -> int:
+    def attach(self, model, profile, device: Optional[torch.device] = None) -> int:
         """Hook decoder layers or install dynamic MoE cache wrappers."""
         if getattr(self, "_dynamic_cache_enabled", False):
             from .dynamic_cache import DynamicMoELayerWrapper
 
             layers_container = getattr(model, "model", model)
             model_layers = getattr(layers_container, "layers", None)
+            model_config = getattr(model, "config", None)
             if model_layers is not None:
-                device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-                for idx in range(1, len(model_layers)):
+                missing_ratio = getattr(self, "_missing_col_ratio", 1.0)
+                warmup_slots = getattr(self, "_warmup_slots", 0)
+                lookahead_enabled = getattr(self, "_lookahead_enabled", False)
+                for idx in range(0, len(model_layers)):
                     layer = model_layers[idx]
-                    mlp = getattr(layer, "mlp", None)
+                    is_block_sparse = hasattr(layer, "block_sparse_moe")
+                    mlp = getattr(layer, "block_sparse_moe", getattr(layer, "mlp", None))
                     if mlp is not None and hasattr(mlp, "experts") and len(mlp.experts) > 1:
+                        if device is not None:
+                            layer_device = device
+                        else:
+                            layer_device = next(layer.parameters()).device
+                            if layer_device.type == "cpu" and torch.cuda.is_available():
+                                layer_device = torch.device("cuda:0")
                         wrapper = DynamicMoELayerWrapper(
                             layer_idx=idx,
                             moe_block=mlp,
                             capacity=self._cache_capacity,
-                            device=device,
+                            device=layer_device,
+                            missing_col_ratio=missing_ratio,
+                            config=model_config,
+                            warmup_slots=warmup_slots,
+                            lookahead_enabled=lookahead_enabled,
                         )
-                        layer.mlp = wrapper
+                        if is_block_sparse:
+                            layer.block_sparse_moe = wrapper
+                        else:
+                            layer.mlp = wrapper
                         self._wrapped_layers[idx] = wrapper
+
+                        if lookahead_enabled:
+                            def _make_pre_hook(l_idx):
+                                def _pre_hook(mod, args):
+                                    if args and isinstance(args[0], torch.Tensor):
+                                        self.on_layer_pre_attention(l_idx, args[0])
+                                return _pre_hook
+
+                            handle = layer.register_forward_pre_hook(_make_pre_hook(idx))
+                            self._handles.append(handle)
             logger.info(
-                f"[Colossus] DynamicMoELayerWrapper installed on {len(self._wrapped_layers)} MoE layers"
-                f" (capacity={self._cache_capacity})"
+                f"[Colossus] DynamicMoELayerWrapper installed on "
+                f"{len(self._wrapped_layers)} MoE layers (capacity={self._cache_capacity}, missing_col_ratio={getattr(self, '_missing_col_ratio', 1.0):.2f}, lookahead={getattr(self, '_lookahead_enabled', False)})"
             )
             return len(self._wrapped_layers)
 
@@ -168,6 +201,24 @@ class ColossusMoEHook:
             self._handles.append(handle)
         logger.info(f"[Colossus] hook on {len(self._handles)} decoder layers (mode=shadow)")
         return len(self._handles)
+
+    def on_layer_pre_attention(self, layer_idx: int, hidden_states: torch.Tensor):
+        """Trigger L+4 lookahead speculative prefetching across upcoming layers (Section 5.1 & 6.1)."""
+        # 1. Immediate prefetch for current layer (MHA overlap)
+        if layer_idx in self._wrapped_layers:
+            self._wrapped_layers[layer_idx].pre_attention_prefetch(hidden_states)
+
+        # 2. Multi-Layer Lookahead (L+1 ... L+4) with confidence gating
+        if self.predictor is not None and hasattr(self.predictor, "predict_lookahead"):
+            lookahead_plan = self.predictor.predict_lookahead(
+                hidden_states,
+                current_layer=layer_idx,
+                max_depth=4,
+                confidence_threshold=0.06,
+            )
+            for target_l, expert_ids in lookahead_plan.items():
+                if target_l in self._wrapped_layers:
+                    self._wrapped_layers[target_l].async_prefetch(expert_ids)
 
     def _make_hook(self, layer_idx: int):
         def _hook(_mod, inputs, _output):
@@ -191,6 +242,36 @@ class ColossusMoEHook:
             except Exception:
                 pass
         self._handles = []
+
+    def reset_state(self) -> None:
+        """Reset dynamic cache and internal state across prompts."""
+        for w in self._wrapped_layers.values():
+            w.reset_state()
+        self._states.clear()
+
+    def warmup_from_prefill(self, model, tokenizer, prompt: str, device) -> None:
+        """Opt 6: Run prefill forward pass and use routing decisions to seed expert caches.
+
+        This should be called once per prompt BEFORE model.generate().
+        It runs the prompt through the model to get hidden states at each MoE layer,
+        then uses the routing decisions to pre-load the most popular experts.
+        """
+        import torch
+        if not self._wrapped_layers:
+            return
+        inputs = tokenizer(prompt, return_tensors="pt").to(device)
+        inputs.pop("token_type_ids", None)
+        with torch.inference_mode():
+            outputs = model(**inputs, output_hidden_states=True)
+        hidden_states = outputs.hidden_states  # tuple of [1, seq_len, H] per layer
+        warmed = 0
+        for layer_idx, wrapper in self._wrapped_layers.items():
+            # hidden_states[layer_idx] is the input to layer layer_idx
+            if layer_idx < len(hidden_states):
+                h = hidden_states[layer_idx]
+                wrapper.warmup_from_prefill(h)
+                warmed += 1
+        logger.info(f"[Colossus] Prefill warmup completed for {warmed} MoE layers")
 
     # -- active-mode offload / dynamic cache API ------------------------
     def maybe_offload(self, model, input_ids) -> Optional[dict]:
@@ -307,6 +388,27 @@ class ColossusMoEHook:
                 if layer_metrics
                 else 0.0
             )
+            total_demand_stall_s = sum(m.get("demand_stall_s", 0.0) for m in layer_metrics)
+            total_prefetch_stall_s = sum(m.get("prefetch_stall_s", 0.0) for m in layer_metrics)
+            total_pcie_time_s = sum(m.get("pcie_time_s", 0.0) for m in layer_metrics)
+
+            all_missing_pcts = []
+            for w in self._wrapped_layers.values():
+                all_missing_pcts.extend(getattr(w, "missing_col_stats", []))
+            if all_missing_pcts:
+                arr = sorted(all_missing_pcts)
+                n = len(arr)
+                mean_m = sum(arr) / n
+                p50_m = arr[int(n * 0.50)]
+                p90_m = arr[min(n - 1, int(n * 0.90))]
+                p95_m = arr[min(n - 1, int(n * 0.95))]
+                max_m = arr[-1]
+            else:
+                mean_m = p50_m = p90_m = p95_m = max_m = 0.0
+
+            tot_tokens = max(1, int(sum(getattr(w, 'total_tokens_processed', 0) for w in self._wrapped_layers.values()) / max(1, len(self._wrapped_layers))))
+            dma_b_tok = ((total_prefetch_mb + total_demand_mb) * 1024 * 1024) / tot_tokens
+
             base["dynamic_cache"] = {
                 "capacity": self._cache_capacity,
                 "layers_wrapped": len(self._wrapped_layers),
@@ -316,6 +418,15 @@ class ColossusMoEHook:
                 "prefetch_mb": total_prefetch_mb,
                 "demand_mb": total_demand_mb,
                 "recall_pct": avg_recall,
+                "demand_stall_s": total_demand_stall_s,
+                "prefetch_stall_s": total_prefetch_stall_s,
+                "pcie_time_s": total_pcie_time_s,
+                "missing_col_mean": mean_m,
+                "missing_col_p50": p50_m,
+                "missing_col_p90": p90_m,
+                "missing_col_p95": p95_m,
+                "missing_col_max": max_m,
+                "dma_bytes_per_tok": dma_b_tok,
                 "layers": layer_metrics,
             }
         elif self._offload_mgr is not None:

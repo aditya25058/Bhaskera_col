@@ -98,6 +98,9 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Include the prompt in the output")
     p.add_argument("--torch-compile",  action="store_true")
     p.add_argument("--verbose", "-v",  action="store_true")
+    # COLOSSUS SA-FFN
+    p.add_argument("--missing-col-ratio", type=float, default=None,
+                   help="Missing column fraction for SA-FFN (e.g. 0.50, 0.25, 0.10)")
 
     return p
 
@@ -143,6 +146,10 @@ def _build_config(args: argparse.Namespace):
         infer.speculative.enabled = True
     if args.num_draft_tokens is not None:
         infer.speculative.num_draft_tokens = args.num_draft_tokens
+
+    if args.missing_col_ratio is not None:
+        if hasattr(infer, "colossus"):
+            infer.colossus.missing_col_ratio = args.missing_col_ratio
 
     return cfg
 
@@ -334,11 +341,20 @@ def main(argv: List[str] = None) -> None:
             print(f"  Hit Rate     : {dc['hit_rate_pct']:.1f}% ({dc['hits']} hits / {dc['misses']} demand misses)")
             print(f"  ZSSR Recall@6: {dc['recall_pct']:.1f}%")
             print(f"  PCIe DMA     : {dc['prefetch_mb']:.1f} MB Prefetched | {dc['demand_mb']:.1f} MB Demand Fetched")
+            tot_pcie_s = dc.get("pcie_time_s", 0.0)
+            dem_stall_s = dc.get("demand_stall_s", 0.0)
+            pref_stall_s = dc.get("prefetch_stall_s", 0.0)
+            hidden_s = max(0.0, tot_pcie_s - dem_stall_s - pref_stall_s)
+            overlap_pct = (hidden_s / tot_pcie_s * 100.0) if tot_pcie_s > 0 else 0.0
+            print(f"  PCIe DMA Time: {tot_pcie_s:.2f}s total | Demand Stall: {dem_stall_s:.2f}s | Prefetch Stall: {pref_stall_s:.2f}s | Hidden: {hidden_s:.2f}s ({overlap_pct:.1f}% Overlap)")
+            if "missing_col_mean" in dc:
+                dma_mb_tok = dc.get("dma_bytes_per_tok", 0.0) / (1024 * 1024)
+                print(f"  Col Missing  : mean={dc['missing_col_mean']:.1f}% | p50={dc['missing_col_p50']:.1f}% | p90={dc['missing_col_p90']:.1f}% | p95={dc['missing_col_p95']:.1f}% | max={dc['missing_col_max']:.1f}% | DMA: {dma_mb_tok:.2f} MB/tok")
             print("-" * 80)
-            print(f"{'Layer':>6} | {'C':>3} | {'Hit Rate':>9} | {'Hits':>6} | {'Misses':>6} | {'Prefetch MB':>12} | {'Demand MB':>10} | {'Recall@6':>9}")
+            print(f"{'Layer':>6} | {'C':>3} | {'Hit Rate':>9} | {'Hits':>6} | {'Misses':>6} | {'Prefetch MB':>12} | {'Demand MB':>10} | {'Recall@6':>9} | {'DemStall':>8}")
             print("-" * 80)
             for m in dc.get("layers", []):
-                print(f"{m['layer_idx']:6d} | {m['capacity']:3d} | {m['hit_rate_pct']:8.1f}% | {m['hits']:6d} | {m['misses']:6d} | {m['prefetch_mb']:11.1f} | {m['demand_mb']:9.1f} | {m['recall_pct']:8.1f}%")
+                print(f"{m['layer_idx']:6d} | {m['capacity']:3d} | {m['hit_rate_pct']:8.1f}% | {m['hits']:6d} | {m['misses']:6d} | {m['prefetch_mb']:11.1f} | {m['demand_mb']:9.1f} | {m['recall_pct']:8.1f}% | {m.get('demand_stall_s', 0.0):7.2f}s")
             print("=" * 80)
         else:
             # Legacy offload stats

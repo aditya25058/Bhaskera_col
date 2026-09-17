@@ -76,6 +76,9 @@ class ZSSRPredictor:
 
         with torch.no_grad():
             W = self.router[layer]
+            if W.device != h_prev.device:
+                self.router[layer] = W.to(device=h_prev.device)
+                W = self.router[layer]
             # Collapse to exactly [H] — handles [1,H], [1,1,H], [B,S,H] etc.
             h = h_prev.detach().float().reshape(-1, W.shape[1])[-1]  # [H]
             logits = h @ W.T  # [E]
@@ -101,6 +104,43 @@ class ZSSRPredictor:
                 energy = (g * u).pow(2).squeeze(0)
                 plan[exp] = torch.topk(energy, k=self.top_cols).indices.tolist()
             return plan
+
+    def predict_lookahead(self, h_curr, current_layer: int, max_depth: int = 4,
+                          confidence_threshold: float = 0.0) -> dict[int, list[int]]:
+        """Multi-layer lookahead prediction (L+1 ... L+max_depth) with confidence gating.
+        
+        Section 5.1 & 6.1:
+        Predicts expert sets for future layers using entrance hidden state h_curr.
+        Applies confidence gating to suppress speculation when router entropy is high.
+        """
+        import torch
+        import torch.nn.functional as F
+
+        with torch.no_grad():
+            lookahead_plan = {}
+            for delta in range(1, max_depth + 1):
+                target_layer = current_layer + delta
+                if target_layer not in self.router:
+                    continue
+                W = self.router[target_layer]
+                if W.device != h_curr.device:
+                    self.router[target_layer] = W.to(device=h_curr.device)
+                    W = self.router[target_layer]
+                h = h_curr.detach().float().reshape(-1, W.shape[1])[-1]  # [H]
+                logits = h @ W.T  # [E]
+                
+                if confidence_threshold > 0.0:
+                    probs = F.softmax(logits, dim=-1)
+                    top_vals, top_indices = torch.topk(probs, k=self.top_k)
+                    # Average confidence across top-k predicted experts
+                    avg_conf = top_vals.mean().item()
+                    if avg_conf >= confidence_threshold:
+                        lookahead_plan[target_layer] = top_indices.tolist()
+                else:
+                    top_indices = torch.topk(logits, k=self.top_k).indices
+                    lookahead_plan[target_layer] = top_indices.tolist()
+
+            return lookahead_plan
 
     def predict(self, h_prev, layer: int):
         """Full per-layer prediction: experts + columns."""

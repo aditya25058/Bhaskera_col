@@ -20,14 +20,37 @@ from bhaskera.inference.colossus.hook import ColossusMoEHook
 class SyntheticSwiGLUExpert(nn.Module):
     """Synthetic SwiGLU expert matching Param2/DeepSeek expert architecture."""
 
-    def __init__(self, hidden_size: int = 128, intermediate_size: int = 64):
+    def __init__(self, config=None, hidden_size: int = 128, intermediate_size: int = 64):
+        if isinstance(config, int):
+            hidden_size = config
+        elif hasattr(config, "hidden_size"):
+            hidden_size = config.hidden_size
         super().__init__()
+        self.config = type("Config", (), {"num_shared_experts": None, "hidden_size": hidden_size})()
+        self.intermediate_size = intermediate_size
         self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
         self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
         self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+
+
+class SyntheticRouter(nn.Module):
+    def __init__(self, hidden_size: int, num_experts: int, top_k: int):
+        super().__init__()
+        self.top_k = top_k
+        self.linear = nn.Linear(hidden_size, num_experts, bias=False)
+        self.weight = self.linear.weight
+
+    def forward(self, x: torch.Tensor):
+        orig_shape = x.shape
+        x_2d = x.reshape(-1, orig_shape[-1])
+        logits = self.linear(x_2d.float())
+        scores = F.softmax(logits, dim=-1)
+        topk_weights, topk_indices = torch.topk(scores, self.top_k, dim=-1)
+        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+        return topk_indices, topk_weights, logits
 
 
 class SyntheticMoEBlock(nn.Module):
@@ -37,30 +60,29 @@ class SyntheticMoEBlock(nn.Module):
         super().__init__()
         self.num_experts = num_experts
         self.top_k = top_k
-        self.gate = nn.Linear(hidden_size, num_experts, bias=False)
+        self.num_experts_per_tok = top_k
+        self.config = type("Config", (), {"num_shared_experts": None})()
+        self.gate = SyntheticRouter(hidden_size, num_experts, top_k)
         self.experts = nn.ModuleList([
             SyntheticSwiGLUExpert(hidden_size, intermediate_size) for _ in range(num_experts)
         ])
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [B, H] or [H]
-        squeeze = x.dim() == 1
-        if squeeze:
-            x = x.unsqueeze(0)
-        B, H = x.shape
-        logits = self.gate(x.float())
-        scores = F.softmax(logits, dim=-1)
-        topk_weights, topk_indices = torch.topk(scores, self.top_k, dim=-1)
-        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
-
-        y = torch.zeros_like(x)
-        for b in range(B):
+    def moe_infer(self, x_2d: torch.Tensor, topk_idx: torch.Tensor, topk_weight: torch.Tensor) -> torch.Tensor:
+        B_tot, _ = x_2d.shape
+        y = torch.zeros_like(x_2d)
+        for b in range(B_tot):
             for k in range(self.top_k):
-                exp_idx = topk_indices[b, k].item()
-                weight = topk_weights[b, k]
-                y[b] += weight * self.experts[exp_idx](x[b:b+1]).squeeze(0)
+                exp_idx = topk_idx[b, k].item()
+                weight = topk_weight[b, k]
+                y[b] += weight * self.experts[exp_idx](x_2d[b:b+1]).squeeze(0)
+        return y
 
-        return y.squeeze(0) if squeeze else y
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        orig_shape = x.shape
+        x_2d = x.reshape(-1, orig_shape[-1])
+        topk_idx, topk_weights, _ = self.gate(x_2d)
+        y = self.moe_infer(x_2d, topk_idx, topk_weights)
+        return y.reshape(orig_shape)
 
 
 def test_zssr_predictor_ranking_and_columns():
@@ -160,10 +182,7 @@ def test_moe_scaffolding_dense_vs_colossus():
     y_dense = moe(x)
 
     # 2. Forward with COLOSSUS SA-FFN expert execution
-    logits = moe.gate(x.float())
-    scores = F.softmax(logits, dim=-1)
-    topk_weights, topk_indices = torch.topk(scores, K, dim=-1)
-    topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+    topk_indices, topk_weights, _ = moe.gate(x.float())
 
     y_colossus = torch.zeros_like(x)
     for b in range(x.shape[0]):
@@ -254,3 +273,91 @@ def test_hook_active_mode_stats():
     stats = hook.stats()
     assert stats["mode"] == "active"
     assert "offload" in stats
+
+
+def test_predict_lookahead_and_confidence_gating():
+    """Verify multi-layer lookahead (L+1...L+4) and confidence gating."""
+    H, E, K = 128, 16, 4
+    g = torch.Generator().manual_seed(101)
+    pred = ZSSRPredictor(top_k_experts=K, top_cols=16, num_col_experts=K)
+    for layer_idx in range(1, 6):
+        pred.router[layer_idx] = torch.randn(E, H, generator=g)
+
+    h = torch.randn(1, 1, H, generator=g)
+
+    # 1. Standard lookahead up to depth 4
+    plan = pred.predict_lookahead(h, current_layer=1, max_depth=4, confidence_threshold=0.0)
+    assert set(plan.keys()) == {2, 3, 4, 5}
+    for l_idx, experts in plan.items():
+        assert len(experts) == K
+
+    # 2. Confidence gating: very high threshold suppresses speculation
+    suppressed_plan = pred.predict_lookahead(h, current_layer=1, max_depth=4, confidence_threshold=0.99)
+    assert len(suppressed_plan) == 0
+
+    # 3. Confidence gating: threshold below uniform (1/16 = 0.0625) lets predictions through
+    gated_plan = pred.predict_lookahead(h, current_layer=1, max_depth=4, confidence_threshold=0.05)
+    assert len(gated_plan) > 0
+
+
+def test_adetr_buffer_and_saffn_expert_lossless():
+    """Verify column-level SA-FFN decomposition y = y_cached + y_missed with ADETR buffer."""
+    from bhaskera.inference.colossus.saffn import ADETRBuffer, SA_FFN_Expert
+
+    H, I = 128, 64
+    g = torch.Generator().manual_seed(202)
+    Wg = torch.randn(I, H, generator=g, dtype=torch.float32)
+    Wu = torch.randn(I, H, generator=g, dtype=torch.float32)
+    Wd = torch.randn(H, I, generator=g, dtype=torch.float32)
+
+    buf = ADETRBuffer(hidden_size=H, intermediate_size=I, hot_ratio=0.25, dtype=torch.float32, device=torch.device("cpu"))
+    buf.init_from_weights(Wg, Wu, Wd)
+    buf.load_cold_columns(non_blocking=False)
+
+    expert = SA_FFN_Expert(buf)
+    x = torch.randn(2, 4, H, generator=g, dtype=torch.float32)
+
+    y_decomposed = expert(x)
+    y_monolithic = F.linear(F.silu(F.linear(x, Wg)) * F.linear(x, Wu), Wd)
+
+    linf, l1, cos = verify_lossless(y_monolithic, y_decomposed)
+    rel = linf / (y_monolithic.abs().max().item() + 1e-12)
+    assert cos == pytest.approx(1.0, abs=1e-6)
+    assert rel < 1e-5
+
+
+def test_dynamic_moe_wrapper_column_partitioning_lossless():
+    """Verify DynamicMoELayerWrapper with column partitioning produces exact output."""
+    from bhaskera.inference.colossus.dynamic_cache import DynamicMoELayerWrapper
+
+    H, I, E, K = 128, 64, 8, 2
+    moe = SyntheticMoEBlock(num_experts=E, hidden_size=H, intermediate_size=I, top_k=K)
+    moe.eval()
+
+    x_dec = torch.randn(1, 1, H)
+    y_ref_dec = moe(x_dec)
+
+    x_pref = torch.randn(2, 4, H)
+    y_ref_pref = moe(x_pref)
+
+    wrapper = DynamicMoELayerWrapper(
+        layer_idx=1,
+        moe_block=moe,
+        capacity=4,
+        device=torch.device("cpu"),
+        missing_col_ratio=0.25,
+    )
+
+    # 1. Decoding step (seq_len=1): bitwise exact through moe_infer
+    y_wrap_dec, _ = wrapper(x_dec)
+    assert torch.equal(y_ref_dec, y_wrap_dec)
+
+    # 2. Prefill step (seq_len > 1): allclose
+    y_wrap_pref, _ = wrapper(x_pref)
+    assert torch.allclose(y_ref_pref, y_wrap_pref, atol=1e-5)
+
+    stats = wrapper.get_stats()
+    assert "missing_col_mean" in stats
+
+
+
