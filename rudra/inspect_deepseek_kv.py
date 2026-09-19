@@ -18,6 +18,9 @@ with torch.device("meta"):
 layer0 = meta_model.model.layers[0]
 attn = layer0.self_attn
 
-print("DeepseekV2Model.forward source:")
-print(inspect.getsource(meta_model.model.forward))
+for i in range(cfg.num_hidden_layers):
+    attn = meta_model.model.layers[i].self_attn
+    assert hasattr(attn, "layer_idx") and attn.layer_idx == i, f"Layer {i} layer_idx issue: {getattr(attn, 'layer_idx', None)}"
+print(f"All {cfg.num_hidden_layers} attention layers have valid layer_idx!")
+
 
