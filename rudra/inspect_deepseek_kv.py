@@ -18,9 +18,10 @@ with torch.device("meta"):
 layer0 = meta_model.model.layers[0]
 attn = layer0.self_attn
 
-for i in range(cfg.num_hidden_layers):
-    attn = meta_model.model.layers[i].self_attn
-    assert hasattr(attn, "layer_idx") and attn.layer_idx == i, f"Layer {i} layer_idx issue: {getattr(attn, 'layer_idx', None)}"
-print(f"All {cfg.num_hidden_layers} attention layers have valid layer_idx!")
+from transformers.cache_utils import DynamicCache
+print("DynamicCache.update signature:", inspect.signature(DynamicCache.update))
+print("DynamicCache.update source:")
+print(inspect.getsource(DynamicCache.update))
+
 
 
