@@ -31,17 +31,27 @@ native_layer = meta_model.model.layers[1].mlp
 # Materialize layer 1 on CPU
 native_layer = native_layer.to_empty(device="cpu").to(torch.bfloat16)
 
-# Load real weights for Layer 1 from shard 1
-shard1_path = f"{MODEL_PATH}/model-00001-of-000055.safetensors"
-print(f"Loading real weights from {shard1_path}...")
-t0 = time.time()
-shard1_weights = load_file(shard1_path)
-print(f"Shard 1 loaded in {time.time() - t0:.2f}s")
+# Load real weights for Layer 1 using index to find all required shards
+import json
+index_path = f"{MODEL_PATH}/model.safetensors.index.json"
+with open(index_path, "r") as f:
+    weight_map = json.load(f)["weight_map"]
 
-# Load state dict for layer 1 mlp
 prefix = "model.layers.1.mlp."
-layer1_sd = {k[len(prefix):]: v for k, v in shard1_weights.items() if k.startswith(prefix)}
-print(f"Extracted {len(layer1_sd)} tensors for Layer 1 MLP")
+needed_shards = sorted(list(set(v for k, v in weight_map.items() if k.startswith(prefix))))
+print(f"Layer 1 MLP spans {len(needed_shards)} shards: {needed_shards}")
+
+layer1_sd = {}
+t0 = time.time()
+for shard_file in needed_shards:
+    shard_path = f"{MODEL_PATH}/{shard_file}"
+    print(f"  Loading {shard_file}...")
+    st_dict = load_file(shard_path)
+    for k, v in st_dict.items():
+        if k.startswith(prefix):
+            layer1_sd[k[len(prefix):]] = v
+
+print(f"Loaded all {len(layer1_sd)} tensors for Layer 1 MLP in {time.time() - t0:.2f}s")
 
 native_layer.load_state_dict(layer1_sd)
 print("Loaded real weights into native DeepseekV2MoE on CPU successfully!")
