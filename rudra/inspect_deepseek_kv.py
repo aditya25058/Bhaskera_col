@@ -15,8 +15,16 @@ cfg = AutoConfig.from_pretrained(MODEL_PATH, trust_remote_code=True)
 with torch.device("meta"):
     meta_model = AutoModelForCausalLM.from_config(cfg, trust_remote_code=True)
 
-layer0 = meta_model.model.layers[0]
-attn = layer0.self_attn
+from transformers.modeling_attn_mask_utils import AttentionMaskConverter
+_orig_to_causal_4d = AttentionMaskConverter.to_causal_4d
+
+def patched_to_causal_4d(self, batch_size, query_length, key_value_length, dtype, device="cpu"):
+    mask = _orig_to_causal_4d(self, batch_size, query_length, key_value_length, dtype, device)
+    if mask is None:
+        mask = torch.zeros((batch_size, 1, query_length, key_value_length), dtype=dtype, device=device)
+    return mask
+
+AttentionMaskConverter.to_causal_4d = patched_to_causal_4d
 
 from transformers.cache_utils import DynamicCache
 
@@ -31,6 +39,7 @@ def get_usable_length(self, *args, **kwargs):
 DynamicCache.get_usable_length = get_usable_length
 
 dc = DynamicCache()
+
 inp = torch.randint(0, 1000, (1, 6), device="meta")
 out = meta_model(input_ids=inp, past_key_values=dc, use_cache=True)
 print("Prefill out logits shape:", out.logits.shape, "seq_len:", dc.get_seq_length(0))
