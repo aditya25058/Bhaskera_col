@@ -69,9 +69,27 @@ class Layer30P2PBridge(nn.Module):
 
 
 
+# Set expandable segments to avoid fragmentation
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
 # ─────────────────────────────────────────────────────────────────────────────
-# 2. COLOSSUS Dynamic Slot Wrapper for DeepSeek-V2 MoE
+# 2. COLOSSUS Fast Dynamic Expert Slot (Instant HBM Allocation)
 # ─────────────────────────────────────────────────────────────────────────────
+class FastExpertSlot(nn.Module):
+    """Direct HBM-allocated slot module for DeepSeek-V2 MoE expert."""
+    def __init__(self, cfg, device: torch.device):
+        super().__init__()
+        H = cfg.hidden_size
+        I = cfg.moe_intermediate_size
+        self.gate_proj = nn.Linear(H, I, bias=False, device=device, dtype=torch.bfloat16)
+        self.up_proj = nn.Linear(H, I, bias=False, device=device, dtype=torch.bfloat16)
+        self.down_proj = nn.Linear(I, H, bias=False, device=device, dtype=torch.bfloat16)
+        self.requires_grad_(False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+
+
 class DeepSeekColossusMoEWrapper(nn.Module):
     """
     Dynamic Slot Residency MoE Wrapper:
@@ -103,16 +121,16 @@ class DeepSeekColossusMoEWrapper(nn.Module):
         self.gate = moe_module.gate
         self.shared_experts = moe_module.shared_experts
 
-        # Dynamic slots on GPU
-        ExpertClass = type(moe_module.experts[0])
+        # Dynamic slots on GPU (allocated directly in HBM)
         self.slots: List[nn.Module] = nn.ModuleList([
-            ExpertClass(cfg, intermediate_size=cfg.moe_intermediate_size).to(device).to(torch.bfloat16).requires_grad_(False)
+            FastExpertSlot(cfg, device=device)
             for _ in range(capacity)
         ])
 
         self.slot_to_expert: Dict[int, int] = {}
         self.expert_to_slot: Dict[int, int] = {}
         self.slot_lru: List[int] = list(range(capacity))
+
 
         # Metrics
         self.hits = 0
