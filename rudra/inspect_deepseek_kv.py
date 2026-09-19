@@ -18,9 +18,11 @@ with torch.device("meta"):
 layer0 = meta_model.model.layers[0]
 attn = layer0.self_attn
 
-from transformers.cache_utils import DynamicCache, Cache
+from transformers.cache_utils import DynamicCache
 dc = DynamicCache()
-print("isinstance(dc, Cache):", isinstance(dc, Cache))
+print("get_seq_length signature:", inspect.signature(dc.get_seq_length))
+print("get_seq_length(0):", dc.get_seq_length(0))
+
 
 
 
