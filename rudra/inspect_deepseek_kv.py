@@ -18,8 +18,6 @@ with torch.device("meta"):
 layer0 = meta_model.model.layers[0]
 attn = layer0.self_attn
 
-print("DeepseekV2Attention.forward signature:")
-print(inspect.signature(attn.forward))
+print("DeepseekV2Model.forward source:")
+print(inspect.getsource(meta_model.model.forward))
 
-print("\nDeepseekV2Attention.forward source:")
-print(inspect.getsource(attn.forward))
