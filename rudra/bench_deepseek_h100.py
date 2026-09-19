@@ -111,8 +111,8 @@ class DeepSeekExpert(nn.Module):
 routed_experts = nn.ModuleList([DeepSeekExpert(H, I_routed).to(dev).to(torch.bfloat16) for _ in range(top_k)])
 shared_expert = DeepSeekExpert(H, I_shared).to(dev).to(torch.bfloat16)
 
-# Self-Attention projection simulation for H=5120, 128 heads
-q_proj = nn.Linear(H, H, bias=False).to(dev).to(torch.bfloat16)
+# DeepSeek-V2 MLA (Multi-Head Latent Attention): 128 heads, head_dim 128 -> 16384 dim
+q_proj = nn.Linear(H, 128 * 128, bias=False).to(dev).to(torch.bfloat16)
 k_proj = nn.Linear(H, 128 * 128, bias=False).to(dev).to(torch.bfloat16)
 v_proj = nn.Linear(H, 128 * 128, bias=False).to(dev).to(torch.bfloat16)
 o_proj = nn.Linear(128 * 128, H, bias=False).to(dev).to(torch.bfloat16)
