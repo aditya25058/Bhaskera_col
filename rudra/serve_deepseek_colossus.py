@@ -34,8 +34,34 @@ import torch.nn.functional as F
 from safetensors import safe_open
 from accelerate.utils import set_module_tensor_to_device
 from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM
+from transformers.cache_utils import DynamicCache
+from transformers.modeling_attn_mask_utils import AttentionMaskConverter
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Compatibility Polyfills for DeepSeek-V2 with Modern Transformers (v5.x)
+# ─────────────────────────────────────────────────────────────────────────────
+def get_usable_length(self, *args, **kwargs):
+    layer_idx = 0
+    if len(args) > 1 and isinstance(args[1], int):
+        layer_idx = args[1]
+    elif "layer_idx" in kwargs:
+        layer_idx = kwargs["layer_idx"]
+    return self.get_seq_length(layer_idx)
+
+DynamicCache.get_usable_length = get_usable_length
+
+_orig_to_causal_4d = AttentionMaskConverter.to_causal_4d
+
+def patched_to_causal_4d(self, batch_size, query_length, key_value_length, dtype, device="cpu"):
+    mask = _orig_to_causal_4d(self, batch_size, query_length, key_value_length, dtype, device)
+    if mask is None:
+        mask = torch.zeros((batch_size, 1, query_length, key_value_length), dtype=dtype, device=device)
+    return mask
+
+AttentionMaskConverter.to_causal_4d = patched_to_causal_4d
 
 MODEL_PATH = "/home/palakm/MoEServingSim/aditya/models/DeepSeek-Coder-V2-Instruct"
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 1. P2P NVLink Bridge between Layer 29 (GPU 0) and Layer 30 (GPU 1)
@@ -410,6 +436,11 @@ def serve_deepseek(args):
     print(f"\n  --- Decode Phase ({args.max_new_tokens - 1} tokens) [KV-Cache: {args.use_cache}] ---")
     sys.stdout.flush()
     decode_latencies = []
+    decode_step_details = []
+
+    last_hits = sum(w.hits for w in colossus_wrappers)
+    last_misses = sum(w.misses for w in colossus_wrappers)
+    last_dma = sum(w.dma_bytes for w in colossus_wrappers)
 
     for step in range(args.max_new_tokens - 1):
         torch.cuda.synchronize(dev0)
@@ -431,10 +462,34 @@ def serve_deepseek(args):
         t_step = time.perf_counter() - t_step_start
         decode_latencies.append(t_step)
 
+        # Per-step cache metrics
+        cur_hits = sum(w.hits for w in colossus_wrappers)
+        cur_misses = sum(w.misses for w in colossus_wrappers)
+        cur_dma = sum(w.dma_bytes for w in colossus_wrappers)
+
+        step_hits = cur_hits - last_hits
+        step_misses = cur_misses - last_misses
+        step_lookups = step_hits + step_misses
+        step_hit_rate = (step_hits / step_lookups * 100.0) if step_lookups > 0 else 0.0
+        step_dma_mb = (cur_dma - last_dma) / (1024**2)
+
+        last_hits, last_misses, last_dma = cur_hits, cur_misses, cur_dma
+
         generated_ids = torch.cat([generated_ids, next_token], dim=1)
         tok_str = tokenizer.decode(next_token[0], skip_special_tokens=False)
-        print(f"    Token {step+1:2d}/{args.max_new_tokens-1:2d} | Latency: {t_step*1000:6.1f} ms | Tok: {repr(tok_str)}")
+        print(f"    Token {step+1:2d}/{args.max_new_tokens-1:2d} | Latency: {t_step*1000:6.1f} ms | Hits: {step_hits:3d}/{step_lookups:3d} ({step_hit_rate:5.1f}%) | Misses: {step_misses:2d} | DMA: {step_dma_mb:5.1f} MB | Tok: {repr(tok_str)}")
         sys.stdout.flush()
+
+        decode_step_details.append({
+            "step": step + 1,
+            "latency_ms": t_step * 1000,
+            "step_hits": step_hits,
+            "step_misses": step_misses,
+            "step_hit_rate_pct": step_hit_rate,
+            "step_dma_mb": step_dma_mb,
+            "token": tok_str,
+        })
+
 
 
 
@@ -496,8 +551,10 @@ def serve_deepseek(args):
         "decode_avg_ms": avg_decode_lat * 1000,
         "decode_tps": decode_tps,
         "decode_latencies_ms": [l * 1000 for l in decode_latencies],
+        "decode_step_details": decode_step_details,
         "total_hits": total_hits,
         "total_misses": total_misses,
+
         "hit_rate_pct": hit_rate,
         "total_dma_mb": total_dma_mb,
         "peak_vram_gpu0_gb": peak_hbm0,
