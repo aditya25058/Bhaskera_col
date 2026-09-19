@@ -17,3 +17,13 @@ print("num_experts_per_tok:", getattr(cfg, "num_experts_per_tok", None))
 print("n_shared_experts:", getattr(cfg, "n_shared_experts", None))
 print("norm_topk_prob:", getattr(cfg, "norm_topk_prob", None))
 print("routed_scaling_factor:", getattr(cfg, "routed_scaling_factor", None))
+
+import inspect
+import importlib.util
+spec = importlib.util.spec_from_file_location("deepseek", f"{MODEL_PATH}/modeling_deepseek.py")
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+
+print("DecoderLayer.forward:", inspect.signature(mod.DeepseekV2DecoderLayer.forward))
+print("Model.forward:", inspect.signature(mod.DeepseekV2Model.forward))
+
