@@ -387,11 +387,15 @@ def serve_deepseek(args):
     torch.cuda.synchronize(dev1)
     t_prefill_start = time.perf_counter()
 
+    from transformers.cache_utils import DynamicCache
+    past_key_values = DynamicCache() if args.use_cache else None
+
     with torch.no_grad():
-        out = model(input_ids=generated_ids, use_cache=args.use_cache)
+        out = model(input_ids=generated_ids, past_key_values=past_key_values, use_cache=args.use_cache)
         logits = out.logits  # [1, prompt_len, vocab_size] on dev1
         next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True).to(dev0)
         past_key_values = getattr(out, "past_key_values", None)
+
 
     torch.cuda.synchronize(dev0)
     torch.cuda.synchronize(dev1)
