@@ -212,6 +212,14 @@ class DeepSeekColossusMoEWrapper(nn.Module):
         # 3. Dynamic Slot Management & Expert Streaming
         # Fast path for single-token decode (needed_experts <= capacity): batch-stream all missing experts
         if len(needed_experts) <= self.capacity:
+            # First, update LRU for resident hits to protect them from eviction!
+            for exp_id in needed_experts:
+                if exp_id in self.expert_to_slot:
+                    self.hits += 1
+                    slot_idx = self.expert_to_slot[exp_id]
+                    self.slot_lru.remove(slot_idx)
+                    self.slot_lru.append(slot_idx)
+
             missing_experts = [e for e in needed_experts if e not in self.expert_to_slot]
             if missing_experts:
                 for exp_id in missing_experts:
@@ -221,12 +229,6 @@ class DeepSeekColossusMoEWrapper(nn.Module):
                     self.slot_lru.append(slot_idx)
                 torch.cuda.current_stream(self.device).wait_stream(self.dma_stream)
 
-            for exp_id in needed_experts:
-                if exp_id not in missing_experts:
-                    self.hits += 1
-                    slot_idx = self.expert_to_slot[exp_id]
-                    self.slot_lru.remove(slot_idx)
-                    self.slot_lru.append(slot_idx)
 
         # 4. Compute routed experts
         cnts = topk_indices.new_zeros((topk_indices.shape[0], self.cfg.n_routed_experts))
