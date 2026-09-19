@@ -27,10 +27,10 @@ with torch.device("meta"):
 print("m.model submodules:", [k for k, _ in meta_model.model.named_children()])
 print("layer 0 submodules:", [k for k, _ in meta_model.model.layers[0].named_children()])
 print("layer 0 self_attn submodules:", [k for k, _ in meta_model.model.layers[0].self_attn.named_children()])
-attn = meta_model.model.layers[0].self_attn
-print("source of _init_rope:")
-import inspect
-print(inspect.getsource(attn._init_rope))
+gate = meta_model.model.layers[1].mlp.gate
+print("gate type:", type(gate))
+print("gate signature:", inspect.signature(gate.forward))
+
 
 
 
