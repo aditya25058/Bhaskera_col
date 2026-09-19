@@ -350,13 +350,14 @@ def serve_deepseek(args):
         layer = model.model.layers[l_idx]
         dev = dev0 if l_idx < 30 else dev1
         dma_stream = dma_stream0 if l_idx < 30 else dma_stream1
+        cap = args.capacity if dev == dev0 else min(args.capacity, args.capacity_gpu1)
 
         wrapper = DeepSeekColossusMoEWrapper(
             layer_idx=l_idx,
             moe_module=layer.mlp,
             cfg=cfg,
             device=dev,
-            capacity=args.capacity,
+            capacity=cap,
             handles=handles,
             weight_map=weight_map,
             dma_stream=dma_stream,
@@ -364,7 +365,7 @@ def serve_deepseek(args):
 
         if args.warm_slots:
             # Pre-warm slots with first C experts
-            wrapper.warm_up_slots(list(range(args.capacity)))
+            wrapper.warm_up_slots(list(range(cap)))
 
         layer.mlp = wrapper
         colossus_wrappers.append(wrapper)
@@ -373,7 +374,8 @@ def serve_deepseek(args):
     torch.cuda.synchronize(dev1)
     print(f"  Installed {len(colossus_wrappers)} COLOSSUS wrappers in {time.time() - t0:.2f}s.")
     print(f"    GPU 0 Allocated (with C={args.capacity} slots): {torch.cuda.memory_allocated(dev0) / (1024**3):.2f} GB")
-    print(f"    GPU 1 Allocated (with C={args.capacity} slots): {torch.cuda.memory_allocated(dev1) / (1024**3):.2f} GB")
+    print(f"    GPU 1 Allocated (with C={args.capacity_gpu1} slots): {torch.cuda.memory_allocated(dev1) / (1024**3):.2f} GB")
+
 
     # Install P2P Bridge on all layers 30..59 so hidden_states, position_ids, attention_mask are on dev1
     print(f"\n[6] Installing NVLink P2P Hooks on Layers 30..59...")
@@ -581,7 +583,9 @@ if __name__ == "__main__":
     parser.add_argument("--prompt", type=str, default="def quicksort(arr):")
     parser.add_argument("--max_new_tokens", type=int, default=16)
     parser.add_argument("--capacity", type=int, default=12)
+    parser.add_argument("--capacity_gpu1", type=int, default=7)
     parser.add_argument("--warm_slots", action="store_true", default=False)
+
     parser.add_argument("--use_cache", action="store_true", default=True)
     parser.add_argument("--no_cache", dest="use_cache", action="store_false")
     parser.add_argument("--output_json", type=str, default="/home/palakm/MoEServingSim/aditya/deepseek_serving_colossus.json")
