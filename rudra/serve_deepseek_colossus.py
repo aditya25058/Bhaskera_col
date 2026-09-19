@@ -287,18 +287,29 @@ class DeepSeekColossusMoEWrapper(nn.Module):
 def serve_deepseek(args):
     print("=" * 80)
     print("  COLOSSUS PRODUCTION SERVING: DeepSeek-Coder-V2 (236B MoE)")
-    print("  Hardware Target: 2x NVIDIA H100 NVL (Consolidating 8-GPU Cluster)")
+    if args.num_gpus == 1:
+        print("  Hardware Target: 1x NVIDIA H100 NVL (Consolidating 8-GPU Cluster onto 1 GPU!)")
+    else:
+        print("  Hardware Target: 2x NVIDIA H100 NVL (Consolidating 8-GPU Cluster)")
     print("=" * 80)
 
-    assert torch.cuda.is_available() and torch.cuda.device_count() >= 2, "Dual GPUs required!"
-    dev0 = torch.device("cuda:0")
-    dev1 = torch.device("cuda:1")
-
-    p0 = torch.cuda.get_device_properties(dev0)
-    p1 = torch.cuda.get_device_properties(dev1)
-    print(f"  GPU 0: {p0.name} | Total HBM3: {p0.total_memory / (1024**3):.1f} GB")
-    print(f"  GPU 1: {p1.name} | Total HBM3: {p1.total_memory / (1024**3):.1f} GB")
+    assert torch.cuda.is_available(), "CUDA GPU required!"
+    if args.num_gpus == 1:
+        dev0 = torch.device("cuda:0")
+        dev1 = dev0
+        p0 = torch.cuda.get_device_properties(dev0)
+        p1 = p0
+        print(f"  GPU 0: {p0.name} | Total HBM3: {p0.total_memory / (1024**3):.1f} GB")
+    else:
+        assert torch.cuda.device_count() >= 2, "Dual GPUs required for 2-GPU serving!"
+        dev0 = torch.device("cuda:0")
+        dev1 = torch.device("cuda:1")
+        p0 = torch.cuda.get_device_properties(dev0)
+        p1 = torch.cuda.get_device_properties(dev1)
+        print(f"  GPU 0: {p0.name} | Total HBM3: {p0.total_memory / (1024**3):.1f} GB")
+        print(f"  GPU 1: {p1.name} | Total HBM3: {p1.total_memory / (1024**3):.1f} GB")
     print(f"  Dynamic Slot Capacity C = {args.capacity} slots per MoE layer")
+
 
     # Load Tokenizer & Config
     print(f"\n[1] Loading Tokenizer & Architecture Config from {MODEL_PATH}...")
@@ -337,23 +348,25 @@ def serve_deepseek(args):
                 target_dev = dev0
             elif k.startswith("model.layers."):
                 l_idx = int(k.split(".")[2])
-                target_dev = dev0 if l_idx < 30 else dev1
+                target_dev = dev0 if (args.num_gpus == 1 or l_idx < 30) else dev1
             else:
-                target_dev = dev1
+                target_dev = dev0 if args.num_gpus == 1 else dev1
             t = handle.get_tensor(k)
             set_module_tensor_to_device(model, k, target_dev, value=t.to(torch.bfloat16))
 
     torch.cuda.synchronize(dev0)
-    torch.cuda.synchronize(dev1)
+    if args.num_gpus > 1:
+        torch.cuda.synchronize(dev1)
     print(f"  Non-routed parameters materialized in {time.time() - t0:.2f}s.")
     print(f"    GPU 0 Allocated: {torch.cuda.memory_allocated(dev0) / (1024**3):.2f} GB")
-    print(f"    GPU 1 Allocated: {torch.cuda.memory_allocated(dev1) / (1024**3):.2f} GB")
+    if args.num_gpus > 1:
+        print(f"    GPU 1 Allocated: {torch.cuda.memory_allocated(dev1) / (1024**3):.2f} GB")
 
     # Re-initialize RoPE rotary embeddings on target devices to eliminate meta buffers
     print(f"\n[4.5] Initializing RoPE Rotary Embeddings on Target GPUs...")
     for l_idx in range(cfg.num_hidden_layers):
         layer = model.model.layers[l_idx]
-        target_dev = dev0 if l_idx < 30 else dev1
+        target_dev = dev0 if (args.num_gpus == 1 or l_idx < 30) else dev1
         layer.self_attn._init_rope()
         layer.self_attn.rotary_emb.to(target_dev)
 
@@ -361,13 +374,13 @@ def serve_deepseek(args):
     print(f"\n[5] Installing COLOSSUS Dynamic Slot Wrappers (Layers 1..59)...")
     t0 = time.time()
     dma_stream0 = torch.cuda.Stream(device=dev0)
-    dma_stream1 = torch.cuda.Stream(device=dev1)
+    dma_stream1 = dma_stream0 if args.num_gpus == 1 else torch.cuda.Stream(device=dev1)
     colossus_wrappers: List[DeepSeekColossusMoEWrapper] = []
 
     for l_idx in range(1, cfg.num_hidden_layers):
         layer = model.model.layers[l_idx]
-        dev = dev0 if l_idx < 30 else dev1
-        dma_stream = dma_stream0 if l_idx < 30 else dma_stream1
+        dev = dev0 if (args.num_gpus == 1 or l_idx < 30) else dev1
+        dma_stream = dma_stream0 if (args.num_gpus == 1 or l_idx < 30) else dma_stream1
         cap = args.capacity if dev == dev0 else min(args.capacity, args.capacity_gpu1)
 
         wrapper = DeepSeekColossusMoEWrapper(
@@ -389,28 +402,33 @@ def serve_deepseek(args):
         colossus_wrappers.append(wrapper)
 
     torch.cuda.synchronize(dev0)
-    torch.cuda.synchronize(dev1)
+    if args.num_gpus > 1:
+        torch.cuda.synchronize(dev1)
     print(f"  Installed {len(colossus_wrappers)} COLOSSUS wrappers in {time.time() - t0:.2f}s.")
     print(f"    GPU 0 Allocated (with C={args.capacity} slots): {torch.cuda.memory_allocated(dev0) / (1024**3):.2f} GB")
-    print(f"    GPU 1 Allocated (with C={args.capacity_gpu1} slots): {torch.cuda.memory_allocated(dev1) / (1024**3):.2f} GB")
+    if args.num_gpus > 1:
+        print(f"    GPU 1 Allocated (with C={args.capacity_gpu1} slots): {torch.cuda.memory_allocated(dev1) / (1024**3):.2f} GB")
 
+    if args.num_gpus > 1:
+        # Install P2P Bridge on all layers 30..59 so hidden_states, position_ids, attention_mask are on dev1
+        print(f"\n[6] Installing NVLink P2P Hooks on Layers 30..59...")
+        def gpu1_pre_hook(module, args, kwargs):
+            new_args = [
+                a.to(dev1, non_blocking=True) if isinstance(a, torch.Tensor) and a.device != dev1 else a
+                for a in args
+            ]
+            new_kwargs = {
+                k: (v.to(dev1, non_blocking=True) if isinstance(v, torch.Tensor) and v.device != dev1 else v)
+                for k, v in kwargs.items()
+            }
+            return tuple(new_args), new_kwargs
 
-    # Install P2P Bridge on all layers 30..59 so hidden_states, position_ids, attention_mask are on dev1
-    print(f"\n[6] Installing NVLink P2P Hooks on Layers 30..59...")
-    def gpu1_pre_hook(module, args, kwargs):
-        new_args = [
-            a.to(dev1, non_blocking=True) if isinstance(a, torch.Tensor) and a.device != dev1 else a
-            for a in args
-        ]
-        new_kwargs = {
-            k: (v.to(dev1, non_blocking=True) if isinstance(v, torch.Tensor) and v.device != dev1 else v)
-            for k, v in kwargs.items()
-        }
-        return tuple(new_args), new_kwargs
-
-    for l_idx in range(30, cfg.num_hidden_layers):
-        model.model.layers[l_idx].register_forward_pre_hook(gpu1_pre_hook, with_kwargs=True)
+        for l_idx in range(30, cfg.num_hidden_layers):
+            model.model.layers[l_idx].register_forward_pre_hook(gpu1_pre_hook, with_kwargs=True)
+    else:
+        print(f"\n[6] Single GPU serving on {p0.name} (No cross-GPU NVLink hooks needed)")
     model.eval()
+
 
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -542,9 +560,12 @@ def serve_deepseek(args):
     print("=" * 80)
     print(f"  Model                     : DeepSeek-Coder-V2-Instruct (236B MoE)")
     print(f"  Uncompressed Weights      : 471.5 GB BF16")
-    print(f"  Hardware Footprint        : 2x NVIDIA H100 NVL (Consolidating 8-GPU Cluster)")
-    print(f"  Dynamic Slot Capacity C   : {args.capacity} slots / layer (7.5% expert residency)")
-    print(f"  Routed Expert Reduction   : 92.5% reduction in routed expert GPU memory")
+    if args.num_gpus == 1:
+        print(f"  Hardware Footprint        : 1x NVIDIA H100 NVL (Consolidating 8-GPU Cluster onto 1 GPU!)")
+    else:
+        print(f"  Hardware Footprint        : 2x NVIDIA H100 NVL (Consolidating 8-GPU Cluster)")
+    print(f"  Dynamic Slot Capacity C   : {args.capacity} slots / layer ({(args.capacity / cfg.n_routed_experts)*100:.1f}% expert residency)")
+    print(f"  Routed Expert Reduction   : {(1.0 - args.capacity / cfg.n_routed_experts)*100:.1f}% reduction in routed expert GPU memory")
     print("-" * 80)
     print(f"  Prefill Latency           : {t_prefill*1000:7.1f} ms ({prefill_tps:5.1f} tok/s for {prompt_len} tokens)")
     print(f"  Decode Latency (Avg)      : {avg_decode_lat*1000:7.1f} ms / token")
@@ -553,7 +574,8 @@ def serve_deepseek(args):
     print(f"  Cache Misses (Cold DMA)   : {total_misses:,}")
     print(f"  Total PCIe DMA Transferred: {total_dma_mb:7.1f} MB")
     print(f"  Peak VRAM GPU 0           : {peak_hbm0:7.2f} GB / 93.1 GB")
-    print(f"  Peak VRAM GPU 1           : {peak_hbm1:7.2f} GB / 93.1 GB")
+    if args.num_gpus > 1:
+        print(f"  Peak VRAM GPU 1           : {peak_hbm1:7.2f} GB / 93.1 GB")
     print("-" * 80)
     print(f"  Generated Text Output:")
     print(f"  {repr(gen_text)}")
@@ -566,7 +588,8 @@ def serve_deepseek(args):
         "routed_experts": 160,
         "active_experts": 6,
         "shared_experts": 2,
-        "gpus": [p0.name, p1.name],
+        "num_gpus": args.num_gpus,
+        "gpus": [p0.name] if args.num_gpus == 1 else [p0.name, p1.name],
         "capacity_slots": args.capacity,
         "residency_reduction_pct": (1.0 - args.capacity / cfg.n_routed_experts) * 100.0,
         "prompt": prompt,
@@ -580,11 +603,10 @@ def serve_deepseek(args):
         "decode_step_details": decode_step_details,
         "total_hits": total_hits,
         "total_misses": total_misses,
-
         "hit_rate_pct": hit_rate,
         "total_dma_mb": total_dma_mb,
         "peak_vram_gpu0_gb": peak_hbm0,
-        "peak_vram_gpu1_gb": peak_hbm1,
+        "peak_vram_gpu1_gb": peak_hbm1 if args.num_gpus > 1 else None,
         "generated_text": gen_text,
     }
 
@@ -598,11 +620,13 @@ def serve_deepseek(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
+    parser.add_argument("--num_gpus", type=int, default=1)
     parser.add_argument("--prompt", type=str, default="def quicksort(arr):")
     parser.add_argument("--max_new_tokens", type=int, default=16)
     parser.add_argument("--capacity", type=int, default=12)
     parser.add_argument("--capacity_gpu1", type=int, default=7)
     parser.add_argument("--warm_slots", action="store_true", default=False)
+
 
     parser.add_argument("--use_cache", action="store_true", default=True)
     parser.add_argument("--no_cache", dest="use_cache", action="store_false")
