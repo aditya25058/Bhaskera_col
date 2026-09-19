@@ -61,7 +61,9 @@ with torch.device("meta"):
 shards_to_load = sorted(list(set(non_routed_keys.values())))
 print(f"Non-routed tensors span {len(shards_to_load)} shards.")
 
-# 3. Load non-routed tensors directly to target GPU
+# 3. Load non-routed tensors directly to target GPU and assign to model
+from accelerate.utils import set_module_tensor_to_device
+
 t0 = time.perf_counter()
 total_loaded_bytes = 0
 
@@ -70,12 +72,14 @@ for shard_file in shards_to_load:
     handle = safe_open(shard_path, framework="pt", device="cpu")
     for k in handle.keys():
         if k in gpu0_keys:
-            tensor = handle.get_tensor(k).to(dev0, dtype=torch.bfloat16)
-            # Assign parameter
+            tensor = handle.get_tensor(k)
+            set_module_tensor_to_device(model, k, dev0, value=tensor.to(torch.bfloat16))
             total_loaded_bytes += tensor.nbytes
         elif k in gpu1_keys:
-            tensor = handle.get_tensor(k).to(dev1, dtype=torch.bfloat16)
+            tensor = handle.get_tensor(k)
+            set_module_tensor_to_device(model, k, dev1, value=tensor.to(torch.bfloat16))
             total_loaded_bytes += tensor.nbytes
+
 
 torch.cuda.synchronize(dev0)
 torch.cuda.synchronize(dev1)
