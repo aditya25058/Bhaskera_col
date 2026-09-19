@@ -325,10 +325,23 @@ def serve_deepseek(args):
     print(f"    GPU 0 Allocated (with C={args.capacity} slots): {torch.cuda.memory_allocated(dev0) / (1024**3):.2f} GB")
     print(f"    GPU 1 Allocated (with C={args.capacity} slots): {torch.cuda.memory_allocated(dev1) / (1024**3):.2f} GB")
 
-    # Install P2P Bridge on Layer 30
-    print(f"\n[6] Installing NVLink P2P Bridge between Layer 29 and Layer 30...")
-    model.model.layers[30] = Layer30P2PBridge(model.model.layers[30], target_dev=dev1)
+    # Install P2P Bridge on all layers 30..59 so hidden_states, position_ids, attention_mask are on dev1
+    print(f"\n[6] Installing NVLink P2P Hooks on Layers 30..59...")
+    def gpu1_pre_hook(module, args, kwargs):
+        new_args = [
+            a.to(dev1, non_blocking=True) if isinstance(a, torch.Tensor) and a.device != dev1 else a
+            for a in args
+        ]
+        new_kwargs = {
+            k: (v.to(dev1, non_blocking=True) if isinstance(v, torch.Tensor) and v.device != dev1 else v)
+            for k, v in kwargs.items()
+        }
+        return tuple(new_args), new_kwargs
+
+    for l_idx in range(30, cfg.num_hidden_layers):
+        model.model.layers[l_idx].register_forward_pre_hook(gpu1_pre_hook, with_kwargs=True)
     model.eval()
+
 
     # ─────────────────────────────────────────────────────────────────────────
     # Run End-to-End Generation Benchmark
@@ -476,7 +489,7 @@ if __name__ == "__main__":
     parser.add_argument("--prompt", type=str, default="def quicksort(arr):")
     parser.add_argument("--max_new_tokens", type=int, default=16)
     parser.add_argument("--capacity", type=int, default=12)
-    parser.add_argument("--warm_slots", action="store_true", default=True)
+    parser.add_argument("--warm_slots", action="store_true", default=False)
     parser.add_argument("--output_json", type=str, default="/home/palakm/MoEServingSim/aditya/deepseek_serving_colossus.json")
     args = parser.parse_args()
 
