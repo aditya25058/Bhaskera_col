@@ -162,26 +162,10 @@ class DeepSeekColossusMoEWrapper(nn.Module):
         topk_indices, topk_weights, _ = self.gate(hidden_states)
         needed_experts = topk_indices.unique().tolist()
 
-        # 2. Dynamic cache resolution
-        for exp_id in needed_experts:
-            if exp_id in self.expert_to_slot:
-                self.hits += 1
-                slot = self.expert_to_slot[exp_id]
-                self.slot_lru.remove(slot)
-                self.slot_lru.append(slot)
-            else:
-                self.misses += 1
-                evict_slot = self.slot_lru.pop(0)
-                self._load_expert_to_slot(exp_id, evict_slot)
-                self.slot_lru.append(evict_slot)
-
-        # Sync DMA stream before compute
-        torch.cuda.current_stream(self.device).wait_stream(self.dma_stream)
-
-        # 3. Compute shared experts (permanently resident)
+        # 2. Compute shared experts (permanently resident)
         shared_out = self.shared_experts(identity)
 
-        # 4. Compute routed experts via dynamic slots
+        # 3. Compute routed experts via dynamic slots
         cnts = topk_indices.new_zeros((topk_indices.shape[0], self.cfg.n_routed_experts))
         cnts.scatter_(1, topk_indices, 1)
         tokens_per_expert = cnts.sum(dim=0).cpu().numpy()
@@ -195,11 +179,25 @@ class DeepSeekColossusMoEWrapper(nn.Module):
             end_idx = start_idx + num_tokens
             if num_tokens == 0:
                 continue
-            slot_idx = self.expert_to_slot[i]
+
+            # Ensure expert i is loaded in a dynamic slot
+            if i in self.expert_to_slot:
+                self.hits += 1
+                slot_idx = self.expert_to_slot[i]
+                self.slot_lru.remove(slot_idx)
+                self.slot_lru.append(slot_idx)
+            else:
+                self.misses += 1
+                slot_idx = self.slot_lru.pop(0)
+                self._load_expert_to_slot(i, slot_idx)
+                self.slot_lru.append(slot_idx)
+                torch.cuda.current_stream(self.device).wait_stream(self.dma_stream)
+
             expert = self.slots[slot_idx]
             tokens_for_this = sorted_tokens[start_idx:end_idx]
             outputs.append(expert(tokens_for_this))
             start_idx = end_idx
+
 
         outs = torch.cat(outputs, dim=0) if len(outputs) else sorted_tokens.new_empty(0)
         new_x = torch.empty_like(outs)
@@ -368,11 +366,13 @@ def serve_deepseek(args):
     t_prefill = time.perf_counter() - t_prefill_start
     prefill_tps = prompt_len / t_prefill
     print(f"  Prefill Time : {t_prefill*1000:.2f} ms ({prefill_tps:.2f} tok/s)")
+    sys.stdout.flush()
 
     generated_ids = torch.cat([generated_ids, next_token], dim=1)
 
     # 2. Decode Phase (Token-by-Token)
     print(f"\n  --- Decode Phase ({args.max_new_tokens - 1} tokens) ---")
+    sys.stdout.flush()
     decode_latencies = []
 
     for step in range(args.max_new_tokens - 1):
@@ -393,6 +393,8 @@ def serve_deepseek(args):
         generated_ids = torch.cat([generated_ids, next_token], dim=1)
         tok_str = tokenizer.decode(next_token[0], skip_special_tokens=False)
         print(f"    Token {step+1:2d}/{args.max_new_tokens-1:2d} | Latency: {t_step*1000:6.1f} ms | Tok: {repr(tok_str)}")
+        sys.stdout.flush()
+
 
     # ─────────────────────────────────────────────────────────────────────────
     # Summary Metrics
