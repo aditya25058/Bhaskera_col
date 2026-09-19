@@ -370,9 +370,10 @@ def serve_deepseek(args):
     t_prefill_start = time.perf_counter()
 
     with torch.no_grad():
-        out = model(input_ids=generated_ids, use_cache=False)
+        out = model(input_ids=generated_ids, use_cache=args.use_cache)
         logits = out.logits  # [1, prompt_len, vocab_size] on dev1
         next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True).to(dev0)
+        past_key_values = getattr(out, "past_key_values", None)
 
     torch.cuda.synchronize(dev0)
     torch.cuda.synchronize(dev1)
@@ -384,7 +385,7 @@ def serve_deepseek(args):
     generated_ids = torch.cat([generated_ids, next_token], dim=1)
 
     # 2. Decode Phase (Token-by-Token)
-    print(f"\n  --- Decode Phase ({args.max_new_tokens - 1} tokens) ---")
+    print(f"\n  --- Decode Phase ({args.max_new_tokens - 1} tokens) [KV-Cache: {args.use_cache}] ---")
     sys.stdout.flush()
     decode_latencies = []
 
@@ -394,9 +395,14 @@ def serve_deepseek(args):
         t_step_start = time.perf_counter()
 
         with torch.no_grad():
-            out = model(input_ids=generated_ids, use_cache=False)
+            if args.use_cache and past_key_values is not None:
+                out = model(input_ids=next_token, past_key_values=past_key_values, use_cache=True)
+            else:
+                out = model(input_ids=generated_ids, use_cache=False)
             logits = out.logits
             next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True).to(dev0)
+            if args.use_cache:
+                past_key_values = getattr(out, "past_key_values", None)
 
         torch.cuda.synchronize(dev0)
         torch.cuda.synchronize(dev1)
@@ -407,6 +413,7 @@ def serve_deepseek(args):
         tok_str = tokenizer.decode(next_token[0], skip_special_tokens=False)
         print(f"    Token {step+1:2d}/{args.max_new_tokens-1:2d} | Latency: {t_step*1000:6.1f} ms | Tok: {repr(tok_str)}")
         sys.stdout.flush()
+
 
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -490,7 +497,10 @@ if __name__ == "__main__":
     parser.add_argument("--max_new_tokens", type=int, default=16)
     parser.add_argument("--capacity", type=int, default=12)
     parser.add_argument("--warm_slots", action="store_true", default=False)
+    parser.add_argument("--use_cache", action="store_true", default=True)
+    parser.add_argument("--no_cache", dest="use_cache", action="store_false")
     parser.add_argument("--output_json", type=str, default="/home/palakm/MoEServingSim/aditya/deepseek_serving_colossus.json")
     args = parser.parse_args()
+
 
     serve_deepseek(args)
