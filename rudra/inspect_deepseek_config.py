@@ -27,9 +27,10 @@ with torch.device("meta"):
 print("m.model submodules:", [k for k, _ in meta_model.model.named_children()])
 print("layer 0 submodules:", [k for k, _ in meta_model.model.layers[0].named_children()])
 print("layer 0 self_attn submodules:", [k for k, _ in meta_model.model.layers[0].self_attn.named_children()])
-gate = meta_model.model.layers[1].mlp.gate
-print("gate forward source:")
-print(inspect.getsource(type(gate).forward))
+ExpertClass = type(meta_model.model.layers[1].mlp.experts[0])
+exp = ExpertClass(cfg, intermediate_size=cfg.moe_intermediate_size)
+print("exp successfully created:", type(exp), "weight device:", exp.gate_proj.weight.device)
+
 
 
 
