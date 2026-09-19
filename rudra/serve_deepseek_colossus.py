@@ -106,7 +106,7 @@ class DeepSeekColossusMoEWrapper(nn.Module):
         # Dynamic slots on GPU
         ExpertClass = type(moe_module.experts[0])
         self.slots: List[nn.Module] = nn.ModuleList([
-            ExpertClass(cfg, intermediate_size=cfg.moe_intermediate_size).to(device).to(torch.bfloat16)
+            ExpertClass(cfg, intermediate_size=cfg.moe_intermediate_size).to(device).to(torch.bfloat16).requires_grad_(False)
             for _ in range(capacity)
         ])
 
@@ -139,10 +139,12 @@ class DeepSeekColossusMoEWrapper(nn.Module):
         t_up = self.handles[shard_up].get_tensor(k_up)
         t_down = self.handles[shard_down].get_tensor(k_down)
 
-        with torch.cuda.stream(self.dma_stream):
-            slot_mod.gate_proj.weight.copy_(t_gate, non_blocking=True)
-            slot_mod.up_proj.weight.copy_(t_up, non_blocking=True)
-            slot_mod.down_proj.weight.copy_(t_down, non_blocking=True)
+        with torch.no_grad():
+            with torch.cuda.stream(self.dma_stream):
+                slot_mod.gate_proj.weight.copy_(t_gate, non_blocking=True)
+                slot_mod.up_proj.weight.copy_(t_up, non_blocking=True)
+                slot_mod.down_proj.weight.copy_(t_down, non_blocking=True)
+
 
         if slot_idx in self.slot_to_expert:
             old_exp = self.slot_to_expert[slot_idx]
