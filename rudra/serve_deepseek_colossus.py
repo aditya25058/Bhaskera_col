@@ -79,7 +79,7 @@ class DeepSeekColossusMoEWrapper(nn.Module):
         
         # Allocate C dynamic slots on GPU
         self.slots: List[nn.Module] = [
-            type(moe_module.experts[0])(cfg).to(device).to(torch.bfloat16)
+            type(moe_module.experts[0])(cfg, intermediate_size=cfg.moe_intermediate_size).to(device).to(torch.bfloat16)
             for _ in range(capacity)
         ]
         
