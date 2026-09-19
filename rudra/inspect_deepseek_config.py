@@ -28,8 +28,10 @@ print("m.model submodules:", [k for k, _ in meta_model.model.named_children()])
 print("layer 0 submodules:", [k for k, _ in meta_model.model.layers[0].named_children()])
 print("layer 0 self_attn submodules:", [k for k, _ in meta_model.model.layers[0].self_attn.named_children()])
 attn = meta_model.model.layers[0].self_attn
-print("attn attributes related to rotary:", [k for k in dir(attn) if "rotary" in k or "rope" in k or "dim" in k])
-print("rotary_emb init signature:", inspect.signature(type(rot).__init__))
+print("source of _init_rope:")
+import inspect
+print(inspect.getsource(attn._init_rope))
+
 
 
 
