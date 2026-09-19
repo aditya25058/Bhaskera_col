@@ -18,10 +18,10 @@ with torch.device("meta"):
 layer0 = meta_model.model.layers[0]
 attn = layer0.self_attn
 
-from transformers.cache_utils import DynamicCache
-print("DynamicCache.update signature:", inspect.signature(DynamicCache.update))
-print("DynamicCache.update source:")
-print(inspect.getsource(DynamicCache.update))
+from transformers.cache_utils import DynamicCache, Cache
+dc = DynamicCache()
+print("isinstance(dc, Cache):", isinstance(dc, Cache))
+
 
 
 
