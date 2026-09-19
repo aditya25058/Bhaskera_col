@@ -19,6 +19,7 @@ print("norm_topk_prob:", getattr(cfg, "norm_topk_prob", None))
 print("routed_scaling_factor:", getattr(cfg, "routed_scaling_factor", None))
 
 import inspect
+import torch
 from transformers import AutoModelForCausalLM
 with torch.device("meta"):
     meta_model = AutoModelForCausalLM.from_config(cfg, trust_remote_code=True)
