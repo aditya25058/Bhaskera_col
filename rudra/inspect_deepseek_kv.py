@@ -46,15 +46,18 @@ from transformers.modeling_attn_mask_utils import _prepare_4d_causal_attention_m
 # 1. Prefill (6 tokens)
 hidden_states = torch.randn(1, 6, cfg.hidden_size, device="meta")
 mask = _prepare_4d_causal_attention_mask(None, (1, 6), hidden_states, 0)
-out_l0, _, _ = layer0.self_attn(hidden_states=hidden_states, attention_mask=mask, past_key_value=dc, use_cache=True)
+pos_prefill = torch.arange(0, 6, device="meta").unsqueeze(0)
+out_l0, _, _ = layer0.self_attn(hidden_states=hidden_states, attention_mask=mask, position_ids=pos_prefill, past_key_value=dc, use_cache=True)
 print("Prefill layer 0 attn done! seq_len:", dc.get_seq_length(0))
 
 # 2. Decode step (1 token)
 hidden_step = torch.randn(1, 1, cfg.hidden_size, device="meta")
 mask_step = _prepare_4d_causal_attention_mask(None, (1, 1), hidden_step, dc.get_seq_length(0))
-print("mask_step shape:", mask_step.shape)
-out_l0_step, _, _ = layer0.self_attn(hidden_states=hidden_step, attention_mask=mask_step, past_key_value=dc, use_cache=True)
+pos_step = torch.tensor([[6]], device="meta")
+out_l0_step, _, _ = layer0.self_attn(hidden_states=hidden_step, attention_mask=mask_step, position_ids=pos_step, past_key_value=dc, use_cache=True)
 print("Decode step layer 0 attn done! seq_len:", dc.get_seq_length(0))
+print("Decode step output shape:", out_l0_step.shape)
+
 
 
 
