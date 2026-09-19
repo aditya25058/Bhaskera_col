@@ -140,22 +140,38 @@ class DeepSeekColossusMoEWrapper(nn.Module):
         # 3. Compute shared experts (always resident)
         out = self.shared_experts(identity)
         
-        # 4. Compute routed experts via active slots
+        # 4. Compute routed experts via active slots (Exact DeepseekV2 moe_infer)
+        cnts = topk_indices.new_zeros((topk_indices.shape[0], cfg.n_routed_experts))
+        cnts.scatter_(1, topk_indices, 1)
+        tokens_per_expert = cnts.sum(dim=0).cpu().numpy()
+        idxs = topk_indices.view(-1).argsort()
         flat_x = hidden_states.view(-1, hidden_states.shape[-1])
-        flat_idx = topk_indices.view(-1, cfg.num_experts_per_tok)
-        flat_w = topk_weights.view(-1, cfg.num_experts_per_tok)
+        sorted_tokens = flat_x[idxs // topk_indices.shape[1]]
         
-        moe_out = torch.zeros_like(flat_x)
-        for i in range(cfg.num_experts_per_tok):
-            exp_ids = flat_idx[:, i]
-            weights = flat_w[:, i].unsqueeze(-1)
-            for e_id in exp_ids.unique().tolist():
-                mask = (exp_ids == e_id)
-                if mask.any():
-                    slot_idx = self.expert_to_slot[e_id]
-                    slot_out = self.slots[slot_idx](flat_x[mask])
-                    moe_out[mask] += slot_out * weights[mask]
+        outputs = []
+        start_idx = 0
+        for i, num_tokens in enumerate(tokens_per_expert):
+            end_idx = start_idx + num_tokens
+            if num_tokens == 0:
+                continue
+            slot_idx = self.expert_to_slot[i]
+            expert = self.slots[slot_idx]
+            tokens_for_this_expert = sorted_tokens[start_idx:end_idx]
+            expert_out = expert(tokens_for_this_expert)
+            outputs.append(expert_out)
+            start_idx = end_idx
+
+        outs = torch.cat(outputs, dim=0) if len(outputs) else sorted_tokens.new_empty(0)
+        new_x = torch.empty_like(outs)
+        new_x[idxs] = outs
+        final_out = (
+            new_x.view(*topk_indices.shape, -1)
+            .type(topk_weights.dtype)
+            .mul_(topk_weights.unsqueeze(dim=-1))
+            .sum(dim=1)
+            .type(new_x.dtype)
+        )
                     
-        return out + moe_out.view(*orig_shape)
+        return out + final_out.view(*orig_shape)
 
 print("\nCOLOSSUS DeepSeek-V2 serving module defined successfully.")
