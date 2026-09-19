@@ -209,7 +209,24 @@ class DeepSeekColossusMoEWrapper(nn.Module):
         # 2. Compute shared experts (permanently resident)
         shared_out = self.shared_experts(identity)
 
-        # 3. Compute routed experts via dynamic slots
+        # 3. Batch-stream missing routed experts via dynamic slots
+        missing_experts = [e for e in needed_experts if e not in self.expert_to_slot]
+        if missing_experts:
+            for exp_id in missing_experts:
+                self.misses += 1
+                slot_idx = self.slot_lru.pop(0)
+                self._load_expert_to_slot(exp_id, slot_idx)
+                self.slot_lru.append(slot_idx)
+            torch.cuda.current_stream(self.device).wait_stream(self.dma_stream)
+
+        for exp_id in needed_experts:
+            if exp_id not in missing_experts:
+                self.hits += 1
+                slot_idx = self.expert_to_slot[exp_id]
+                self.slot_lru.remove(slot_idx)
+                self.slot_lru.append(slot_idx)
+
+        # 4. Compute routed experts
         cnts = topk_indices.new_zeros((topk_indices.shape[0], self.cfg.n_routed_experts))
         cnts.scatter_(1, topk_indices, 1)
         tokens_per_expert = cnts.sum(dim=0).cpu().numpy()
@@ -224,23 +241,12 @@ class DeepSeekColossusMoEWrapper(nn.Module):
             if num_tokens == 0:
                 continue
 
-            # Ensure expert i is loaded in a dynamic slot
-            if i in self.expert_to_slot:
-                self.hits += 1
-                slot_idx = self.expert_to_slot[i]
-                self.slot_lru.remove(slot_idx)
-                self.slot_lru.append(slot_idx)
-            else:
-                self.misses += 1
-                slot_idx = self.slot_lru.pop(0)
-                self._load_expert_to_slot(i, slot_idx)
-                self.slot_lru.append(slot_idx)
-                torch.cuda.current_stream(self.device).wait_stream(self.dma_stream)
-
+            slot_idx = self.expert_to_slot[i]
             expert = self.slots[slot_idx]
             tokens_for_this = sorted_tokens[start_idx:end_idx]
             outputs.append(expert(tokens_for_this))
             start_idx = end_idx
+
 
 
         outs = torch.cat(outputs, dim=0) if len(outputs) else sorted_tokens.new_empty(0)
