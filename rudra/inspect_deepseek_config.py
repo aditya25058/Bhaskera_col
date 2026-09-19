@@ -27,9 +27,9 @@ with torch.device("meta"):
 print("m.model submodules:", [k for k, _ in meta_model.model.named_children()])
 print("layer 0 submodules:", [k for k, _ in meta_model.model.layers[0].named_children()])
 print("layer 0 self_attn submodules:", [k for k, _ in meta_model.model.layers[0].self_attn.named_children()])
-moe = meta_model.model.layers[1].mlp
-print("moe forward source:")
-print(inspect.getsource(type(moe).forward))
+print("moe_infer source:")
+print(inspect.getsource(type(moe).moe_infer))
+
 
 
 
