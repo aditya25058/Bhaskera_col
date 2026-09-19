@@ -112,12 +112,12 @@ class DeepSeekColossusMoEWrapper(nn.Module):
         self.dma_bytes += (host["gate"].nbytes + host["up"].nbytes + host["down"].nbytes)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        identity = hidden_states
+        orig_shape = hidden_states.shape
         self.total_tokens += hidden_states.shape[0] * hidden_states.shape[1]
         
-        # 1. Gate routing
-        # gate returns router_logits
-        router_logits = self.gate(hidden_states)
-        topk_weights, topk_indices = torch.topk(F.softmax(router_logits, dim=-1), cfg.num_experts_per_tok, dim=-1)
+        # 1. Gate routing (returns topk_idx, topk_weight, aux_loss)
+        topk_indices, topk_weights, _ = self.gate(hidden_states)
         
         needed_experts = topk_indices.unique().tolist()
         
@@ -138,7 +138,7 @@ class DeepSeekColossusMoEWrapper(nn.Module):
         torch.cuda.current_stream(self.device).wait_stream(self.dma_stream)
         
         # 3. Compute shared experts (always resident)
-        out = self.shared_experts(hidden_states)
+        out = self.shared_experts(identity)
         
         # 4. Compute routed experts via active slots
         flat_x = hidden_states.view(-1, hidden_states.shape[-1])
@@ -156,6 +156,6 @@ class DeepSeekColossusMoEWrapper(nn.Module):
                     slot_out = self.slots[slot_idx](flat_x[mask])
                     moe_out[mask] += slot_out * weights[mask]
                     
-        return out + moe_out.view_as(hidden_states)
+        return out + moe_out.view(*orig_shape)
 
 print("\nCOLOSSUS DeepSeek-V2 serving module defined successfully.")
