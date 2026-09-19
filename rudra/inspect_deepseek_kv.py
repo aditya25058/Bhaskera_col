@@ -31,14 +31,13 @@ def get_usable_length(self, *args, **kwargs):
 DynamicCache.get_usable_length = get_usable_length
 
 dc = DynamicCache()
-input_ids = torch.randint(0, 1000, (1, 6))
-# Test Layer 0 attention with DynamicCache
-out_l0 = layer0(input_ids=None, hidden_states=torch.randn(1, 6, cfg.hidden_size), past_key_value=dc, use_cache=True)
+out_l0 = layer0(hidden_states=torch.randn(1, 6, cfg.hidden_size, device="meta"), past_key_value=dc, use_cache=True)
 print("Layer 0 output with cache:", len(out_l0), "seq_len:", dc.get_seq_length(0))
 
 # Test decode step (1 token)
-out_l0_step = layer0(input_ids=None, hidden_states=torch.randn(1, 1, cfg.hidden_size), past_key_value=dc, use_cache=True)
+out_l0_step = layer0(hidden_states=torch.randn(1, 1, cfg.hidden_size, device="meta"), past_key_value=dc, use_cache=True)
 print("Layer 0 step output:", len(out_l0_step), "seq_len:", dc.get_seq_length(0))
+
 
 
 
