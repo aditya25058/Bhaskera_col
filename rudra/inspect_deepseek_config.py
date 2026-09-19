@@ -24,8 +24,11 @@ from transformers import AutoModelForCausalLM
 with torch.device("meta"):
     meta_model = AutoModelForCausalLM.from_config(cfg, trust_remote_code=True)
 
-print("DecoderLayer.forward:", inspect.signature(meta_model.model.layers[0].forward))
-print("Model.forward:", inspect.signature(meta_model.model.forward))
-print("ForCausalLM.forward:", inspect.signature(meta_model.forward))
+print("m.model submodules:", [k for k, _ in meta_model.model.named_children()])
+print("layer 0 submodules:", [k for k, _ in meta_model.model.layers[0].named_children()])
+print("layer 0 self_attn submodules:", [k for k, _ in meta_model.model.layers[0].self_attn.named_children()])
+if hasattr(meta_model.model.layers[0].self_attn, "rotary_emb"):
+    print("layer 0 self_attn has rotary_emb:", type(meta_model.model.layers[0].self_attn.rotary_emb))
+
 
 
