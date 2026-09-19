@@ -47,7 +47,7 @@ print(f"  [2] Unpinned (Pageable)   : {lat_unpinned:6.3f} ms | Bandwidth: {bw_un
 # 3. Direct from Safetensors shard
 from safetensors import safe_open
 MODEL_PATH = "/home/palakm/MoEServingSim/aditya/models/DeepSeek-Coder-V2-Instruct"
-shard_path = f"{MODEL_PATH}/model-00001-of-00055.safetensors"
+shard_path = f"{MODEL_PATH}/model-00001-of-000055.safetensors"
 handle = safe_open(shard_path, framework="pt", device="cpu")
 
 # Find an expert weight
