@@ -27,8 +27,11 @@ with torch.device("meta"):
 print("m.model submodules:", [k for k, _ in meta_model.model.named_children()])
 print("layer 0 submodules:", [k for k, _ in meta_model.model.layers[0].named_children()])
 print("layer 0 self_attn submodules:", [k for k, _ in meta_model.model.layers[0].self_attn.named_children()])
-if hasattr(meta_model.model.layers[0].self_attn, "rotary_emb"):
-    print("layer 0 self_attn has rotary_emb:", type(meta_model.model.layers[0].self_attn.rotary_emb))
+rot = meta_model.model.layers[0].self_attn.rotary_emb
+print("rotary_emb buffers:", [(k, v.device) for k, v in rot.named_buffers()])
+rot_gpu = rot.to(torch.device("cpu"))
+print("rotary_emb after to(cpu):", [(k, v.device) for k, v in rot_gpu.named_buffers()])
+
 
 
 
