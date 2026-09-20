@@ -118,10 +118,13 @@ class FastExpertSlot(nn.Module):
 
 class DeepSeekColossusMoEWrapper(nn.Module):
     """
-    Dynamic Slot Residency MoE Wrapper:
+    Dynamic Slot Residency MoE Wrapper with Heterogeneous Compute-to-Data Engine:
     - Permanently resident: Gate, Shared Experts on GPU HBM.
     - Dynamic pool: C dynamic slots allocated on GPU HBM.
-    - Cold experts: Streamed over PCIe Gen5 on demand from mmapped host handles.
+    - Cold experts with small token load (M <= cpu_token_threshold):
+      Directly evaluated on CPU via AVX-512 in native BF16 without PCIe weight DMA (saving 45 MB per miss).
+    - Heavy experts (M > cpu_token_threshold):
+      Streamed over PCIe Gen5 DMA into dynamic GPU slots.
     """
     def __init__(
         self,
@@ -133,6 +136,8 @@ class DeepSeekColossusMoEWrapper(nn.Module):
         handles: Dict[str, any],
         weight_map: Dict[str, str],
         dma_stream: torch.cuda.Stream,
+        enable_hetero: bool = True,
+        cpu_token_threshold: int = 4,
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -142,6 +147,8 @@ class DeepSeekColossusMoEWrapper(nn.Module):
         self.handles = handles
         self.weight_map = weight_map
         self.dma_stream = dma_stream
+        self.enable_hetero = enable_hetero
+        self.cpu_token_threshold = cpu_token_threshold
 
         # Resident modules on GPU
         self.gate = moe_module.gate
@@ -157,11 +164,63 @@ class DeepSeekColossusMoEWrapper(nn.Module):
         self.expert_to_slot: Dict[int, int] = {}
         self.slot_lru: List[int] = list(range(capacity))
 
+        # Heterogeneous activation streaming buffers
+        self.max_cpu_batch = 64
+        self.cpu_act_in = torch.empty((self.max_cpu_batch, cfg.hidden_size), dtype=torch.bfloat16, pin_memory=True)
+        self.cpu_act_out = torch.empty((self.max_cpu_batch, cfg.hidden_size), dtype=torch.bfloat16, pin_memory=True)
+        self.act_stream = torch.cuda.Stream(device=device)
+        self.cpu_expert_weights: Dict[int, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
 
         # Metrics
         self.hits = 0
         self.misses = 0
+        self.cpu_dispatches = 0
         self.dma_bytes = 0
+
+    def _get_cpu_expert_weights(self, expert_id: int):
+        if expert_id not in self.cpu_expert_weights:
+            pfx = f"model.layers.{self.layer_idx}.mlp.experts.{expert_id}"
+            k_gate = f"{pfx}.gate_proj.weight"
+            k_up = f"{pfx}.up_proj.weight"
+            k_down = f"{pfx}.down_proj.weight"
+
+            shard_gate = self.weight_map[k_gate]
+            shard_up = self.weight_map[k_up]
+            shard_down = self.weight_map[k_down]
+
+            t_gate = self.handles[shard_gate].get_tensor(k_gate)
+            t_up = self.handles[shard_up].get_tensor(k_up)
+            t_down = self.handles[shard_down].get_tensor(k_down)
+            self.cpu_expert_weights[expert_id] = (t_gate, t_up, t_down)
+        return self.cpu_expert_weights[expert_id]
+
+    def _cpu_expert_exec(self, expert_id: int, toks_gpu: torch.Tensor) -> torch.Tensor:
+        """Executes cold expert on CPU in native BF16, streaming activations over PCIe."""
+        M = toks_gpu.shape[0]
+        if M > self.max_cpu_batch:
+            self.max_cpu_batch = M
+            self.cpu_act_in = torch.empty((self.max_cpu_batch, self.cfg.hidden_size), dtype=torch.bfloat16, pin_memory=True)
+            self.cpu_act_out = torch.empty((self.max_cpu_batch, self.cfg.hidden_size), dtype=torch.bfloat16, pin_memory=True)
+
+        with torch.cuda.stream(self.act_stream):
+            self.cpu_act_in[:M].copy_(toks_gpu, non_blocking=True)
+        self.act_stream.synchronize()
+
+        Wg, Wu, Wd = self._get_cpu_expert_weights(expert_id)
+        toks_cpu = self.cpu_act_in[:M]
+
+        with torch.no_grad():
+            h_g = F.linear(toks_cpu, Wg)
+            h_u = F.linear(toks_cpu, Wu)
+            act = F.silu(h_g) * h_u
+            y = F.linear(act, Wd)
+            self.cpu_act_out[:M].copy_(y)
+
+        out = torch.empty_like(toks_gpu)
+        with torch.cuda.stream(self.act_stream):
+            out.copy_(self.cpu_act_out[:M], non_blocking=True)
+        torch.cuda.current_stream(self.device).wait_stream(self.act_stream)
+        return out
 
     def warm_up_slots(self, initial_experts: List[int]):
         """Pre-populates dynamic slots with initial experts."""
@@ -170,25 +229,13 @@ class DeepSeekColossusMoEWrapper(nn.Module):
 
     def _load_expert_to_slot(self, expert_id: int, slot_idx: int):
         slot_mod = self.slots[slot_idx]
-        pfx = f"model.layers.{self.layer_idx}.mlp.experts.{expert_id}"
-        k_gate = f"{pfx}.gate_proj.weight"
-        k_up = f"{pfx}.up_proj.weight"
-        k_down = f"{pfx}.down_proj.weight"
-
-        shard_gate = self.weight_map[k_gate]
-        shard_up = self.weight_map[k_up]
-        shard_down = self.weight_map[k_down]
-
-        t_gate = self.handles[shard_gate].get_tensor(k_gate)
-        t_up = self.handles[shard_up].get_tensor(k_up)
-        t_down = self.handles[shard_down].get_tensor(k_down)
+        t_gate, t_up, t_down = self._get_cpu_expert_weights(expert_id)
 
         with torch.no_grad():
             with torch.cuda.stream(self.dma_stream):
                 slot_mod.gate_proj.weight.copy_(t_gate, non_blocking=True)
                 slot_mod.up_proj.weight.copy_(t_up, non_blocking=True)
                 slot_mod.down_proj.weight.copy_(t_down, non_blocking=True)
-
 
         if slot_idx in self.slot_to_expert:
             old_exp = self.slot_to_expert[slot_idx]
@@ -205,30 +252,42 @@ class DeepSeekColossusMoEWrapper(nn.Module):
         # 1. Gate routing (returns topk_idx, topk_weight, aux_loss)
         topk_indices, topk_weights, _ = self.gate(hidden_states)
         needed_experts = topk_indices.unique().tolist()
+        flat_topk = topk_indices.view(-1)
 
         # 2. Compute shared experts (permanently resident)
         shared_out = self.shared_experts(identity)
 
         # 3. Dynamic Slot Management & Expert Streaming
-        # Fast path for single-token decode (needed_experts <= capacity): batch-stream all missing experts
-        if len(needed_experts) <= self.capacity:
-            # First, update LRU for resident hits to protect them from eviction!
-            for exp_id in needed_experts:
-                if exp_id in self.expert_to_slot:
-                    self.hits += 1
-                    slot_idx = self.expert_to_slot[exp_id]
-                    self.slot_lru.remove(slot_idx)
-                    self.slot_lru.append(slot_idx)
+        gpu_hits = set([e for e in needed_experts if e in self.expert_to_slot])
+        miss_ids = [e for e in needed_experts if e not in self.expert_to_slot]
 
-            missing_experts = [e for e in needed_experts if e not in self.expert_to_slot]
-            if missing_experts:
-                for exp_id in missing_experts:
-                    self.misses += 1
-                    slot_idx = self.slot_lru.pop(0)
-                    self._load_expert_to_slot(exp_id, slot_idx)
-                    self.slot_lru.append(slot_idx)
-                torch.cuda.current_stream(self.device).wait_stream(self.dma_stream)
+        # Protect resident hits in LRU
+        for exp_id in gpu_hits:
+            self.hits += 1
+            slot_idx = self.expert_to_slot[exp_id]
+            self.slot_lru.remove(slot_idx)
+            self.slot_lru.append(slot_idx)
 
+        cpu_ids = set()
+        gpu_misses = []
+        if self.enable_hetero:
+            for exp_id in miss_ids:
+                tok_count = (flat_topk == exp_id).sum().item()
+                if tok_count <= self.cpu_token_threshold:
+                    cpu_ids.add(exp_id)
+                else:
+                    gpu_misses.append(exp_id)
+        else:
+            gpu_misses = miss_ids
+
+        # Stream heavy misses into GPU slots
+        if gpu_misses:
+            for exp_id in gpu_misses:
+                self.misses += 1
+                slot_idx = self.slot_lru.pop(0)
+                self._load_expert_to_slot(exp_id, slot_idx)
+                self.slot_lru.append(slot_idx)
+            torch.cuda.current_stream(self.device).wait_stream(self.dma_stream)
 
         # 4. Compute routed experts
         cnts = topk_indices.new_zeros((topk_indices.shape[0], self.cfg.n_routed_experts))
@@ -245,27 +304,23 @@ class DeepSeekColossusMoEWrapper(nn.Module):
             if num_tokens == 0:
                 continue
 
-            if i in self.expert_to_slot:
-                slot_idx = self.expert_to_slot[i]
-                if len(needed_experts) > self.capacity:
-                    self.hits += 1
-                    self.slot_lru.remove(slot_idx)
-                    self.slot_lru.append(slot_idx)
-            else:
-                # On-demand load for multi-token prefill where needed_experts > capacity
-                self.misses += 1
-                slot_idx = self.slot_lru.pop(0)
-                self._load_expert_to_slot(i, slot_idx)
-                self.slot_lru.append(slot_idx)
-                torch.cuda.current_stream(self.device).wait_stream(self.dma_stream)
-
-            expert = self.slots[slot_idx]
             tokens_for_this = sorted_tokens[start_idx:end_idx]
-            outputs.append(expert(tokens_for_this))
+            if i in cpu_ids:
+                self.cpu_dispatches += 1
+                out_this = self._cpu_expert_exec(i, tokens_for_this)
+            else:
+                if i in self.expert_to_slot:
+                    slot_idx = self.expert_to_slot[i]
+                else:
+                    self.misses += 1
+                    slot_idx = self.slot_lru.pop(0)
+                    self._load_expert_to_slot(i, slot_idx)
+                    self.slot_lru.append(slot_idx)
+                    torch.cuda.current_stream(self.device).wait_stream(self.dma_stream)
+                out_this = self.slots[slot_idx](tokens_for_this)
+
+            outputs.append(out_this)
             start_idx = end_idx
-
-
-
 
         outs = torch.cat(outputs, dim=0) if len(outputs) else sorted_tokens.new_empty(0)
         new_x = torch.empty_like(outs)
@@ -392,6 +447,8 @@ def serve_deepseek(args):
             handles=handles,
             weight_map=weight_map,
             dma_stream=dma_stream,
+            enable_hetero=args.enable_hetero,
+            cpu_token_threshold=args.cpu_token_threshold,
         )
 
         if args.warm_slots:
@@ -447,6 +504,7 @@ def serve_deepseek(args):
     for w in colossus_wrappers:
         w.hits = 0
         w.misses = 0
+        w.cpu_dispatches = 0
         w.dma_bytes = 0
 
     generated_ids = input_ids.clone()
@@ -484,6 +542,7 @@ def serve_deepseek(args):
 
     last_hits = sum(w.hits for w in colossus_wrappers)
     last_misses = sum(w.misses for w in colossus_wrappers)
+    last_cpu = sum(w.cpu_dispatches for w in colossus_wrappers)
     last_dma = sum(w.dma_bytes for w in colossus_wrappers)
 
     for step in range(args.max_new_tokens - 1):
@@ -509,19 +568,22 @@ def serve_deepseek(args):
         # Per-step cache metrics
         cur_hits = sum(w.hits for w in colossus_wrappers)
         cur_misses = sum(w.misses for w in colossus_wrappers)
+        cur_cpu = sum(w.cpu_dispatches for w in colossus_wrappers)
         cur_dma = sum(w.dma_bytes for w in colossus_wrappers)
 
         step_hits = cur_hits - last_hits
         step_misses = cur_misses - last_misses
-        step_lookups = step_hits + step_misses
+        step_cpu = cur_cpu - last_cpu
+        step_lookups = step_hits + step_misses + step_cpu
         step_hit_rate = (step_hits / step_lookups * 100.0) if step_lookups > 0 else 0.0
         step_dma_mb = (cur_dma - last_dma) / (1024**2)
+        step_dma_saved_mb = step_cpu * 45.0
 
-        last_hits, last_misses, last_dma = cur_hits, cur_misses, cur_dma
+        last_hits, last_misses, last_cpu, last_dma = cur_hits, cur_misses, cur_cpu, cur_dma
 
         generated_ids = torch.cat([generated_ids, next_token], dim=1)
         tok_str = tokenizer.decode(next_token[0], skip_special_tokens=False)
-        print(f"    Token {step+1:2d}/{args.max_new_tokens-1:2d} | Latency: {t_step*1000:6.1f} ms | Hits: {step_hits:3d}/{step_lookups:3d} ({step_hit_rate:5.1f}%) | Misses: {step_misses:2d} | DMA: {step_dma_mb:5.1f} MB | Tok: {repr(tok_str)}")
+        print(f"    Token {step+1:2d}/{args.max_new_tokens-1:2d} | Latency: {t_step*1000:6.1f} ms | Hits: {step_hits:3d}/{step_lookups:3d} ({step_hit_rate:5.1f}%) | CPU Fallback: {step_cpu:2d} ({step_dma_saved_mb:5.1f}MB saved) | Misses: {step_misses:2d} | DMA: {step_dma_mb:5.1f} MB | Tok: {repr(tok_str)}")
         sys.stdout.flush()
 
         decode_step_details.append({
@@ -529,6 +591,8 @@ def serve_deepseek(args):
             "latency_ms": t_step * 1000,
             "step_hits": step_hits,
             "step_misses": step_misses,
+            "step_cpu_dispatches": step_cpu,
+            "step_dma_saved_mb": step_dma_saved_mb,
             "step_hit_rate_pct": step_hit_rate,
             "step_dma_mb": step_dma_mb,
             "token": tok_str,
@@ -546,9 +610,11 @@ def serve_deepseek(args):
 
     total_hits = sum(w.hits for w in colossus_wrappers)
     total_misses = sum(w.misses for w in colossus_wrappers)
-    total_lookups = total_hits + total_misses
+    total_cpu = sum(w.cpu_dispatches for w in colossus_wrappers)
+    total_lookups = total_hits + total_misses + total_cpu
     hit_rate = (total_hits / total_lookups * 100.0) if total_lookups > 0 else 0.0
     total_dma_mb = sum(w.dma_bytes for w in colossus_wrappers) / (1024**2)
+    total_dma_saved_mb = total_cpu * 45.0
 
     peak_hbm0 = torch.cuda.max_memory_allocated(dev0) / (1024**3)
     peak_hbm1 = torch.cuda.max_memory_allocated(dev1) / (1024**3)
@@ -566,11 +632,13 @@ def serve_deepseek(args):
         print(f"  Hardware Footprint        : 2x NVIDIA H100 NVL (Consolidating 8-GPU Cluster)")
     print(f"  Dynamic Slot Capacity C   : {args.capacity} slots / layer ({(args.capacity / cfg.n_routed_experts)*100:.1f}% expert residency)")
     print(f"  Routed Expert Reduction   : {(1.0 - args.capacity / cfg.n_routed_experts)*100:.1f}% reduction in routed expert GPU memory")
+    print(f"  Compute-to-Data Engine    : {'Enabled (Threshold <= ' + str(args.cpu_token_threshold) + ')' if args.enable_hetero else 'Disabled'}")
     print("-" * 80)
     print(f"  Prefill Latency           : {t_prefill*1000:7.1f} ms ({prefill_tps:5.1f} tok/s for {prompt_len} tokens)")
     print(f"  Decode Latency (Avg)      : {avg_decode_lat*1000:7.1f} ms / token")
     print(f"  Decode Throughput         : {decode_tps:7.2f} tokens / sec")
     print(f"  Cache Hits                : {total_hits:,} ({hit_rate:.1f}%)")
+    print(f"  CPU Cold Fallbacks        : {total_cpu:,} ({total_dma_saved_mb:,.1f} MB PCIe DMA avoided!)")
     print(f"  Cache Misses (Cold DMA)   : {total_misses:,}")
     print(f"  Total PCIe DMA Transferred: {total_dma_mb:7.1f} MB")
     print(f"  Peak VRAM GPU 0           : {peak_hbm0:7.2f} GB / 93.1 GB")
@@ -603,8 +671,12 @@ def serve_deepseek(args):
         "decode_step_details": decode_step_details,
         "total_hits": total_hits,
         "total_misses": total_misses,
+        "total_cpu_dispatches": total_cpu,
+        "total_dma_saved_mb": total_dma_saved_mb,
         "hit_rate_pct": hit_rate,
         "total_dma_mb": total_dma_mb,
+        "enable_hetero": args.enable_hetero,
+        "cpu_token_threshold": args.cpu_token_threshold,
         "peak_vram_gpu0_gb": peak_hbm0,
         "peak_vram_gpu1_gb": peak_hbm1 if args.num_gpus > 1 else None,
         "generated_text": gen_text,
@@ -626,7 +698,9 @@ if __name__ == "__main__":
     parser.add_argument("--capacity", type=int, default=12)
     parser.add_argument("--capacity_gpu1", type=int, default=7)
     parser.add_argument("--warm_slots", action="store_true", default=False)
-
+    parser.add_argument("--enable_hetero", action="store_true", default=True)
+    parser.add_argument("--no_hetero", dest="enable_hetero", action="store_false")
+    parser.add_argument("--cpu_token_threshold", type=int, default=4)
 
     parser.add_argument("--use_cache", action="store_true", default=True)
     parser.add_argument("--no_cache", dest="use_cache", action="store_false")
