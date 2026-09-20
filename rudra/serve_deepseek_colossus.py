@@ -137,7 +137,7 @@ class DeepSeekColossusMoEWrapper(nn.Module):
         weight_map: Dict[str, str],
         dma_stream: torch.cuda.Stream,
         enable_hetero: bool = True,
-        cpu_token_threshold: int = 4,
+        cpu_token_threshold: int = 1,
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -176,6 +176,9 @@ class DeepSeekColossusMoEWrapper(nn.Module):
         self.misses = 0
         self.cpu_dispatches = 0
         self.dma_bytes = 0
+        self.expert_freq: Dict[int, int] = {}
+        self.hetero_max_tokens = 8
+        self.hetero_freq_retain = 3
 
     def _get_cpu_expert_weights(self, expert_id: int):
         if expert_id not in self.cpu_expert_weights:
@@ -270,10 +273,16 @@ class DeepSeekColossusMoEWrapper(nn.Module):
 
         cpu_ids = set()
         gpu_misses = []
-        if self.enable_hetero:
+        # Job 1814 fix: freq-aware retention + prefill guard. Frequent experts (seen>=3)
+        # stay on GPU even if M small; prefill (N>8) never goes CPU (fixes 67s prefill).
+        n_tokens = flat_topk.numel() // max(1, topk_indices.shape[-1])
+        use_hetero = self.enable_hetero and n_tokens <= self.hetero_max_tokens
+        for _e in needed_experts:
+            self.expert_freq[_e] = self.expert_freq.get(_e, 0) + 1
+        if use_hetero:
             for exp_id in miss_ids:
                 tok_count = (flat_topk == exp_id).sum().item()
-                if tok_count <= self.cpu_token_threshold:
+                if tok_count <= self.cpu_token_threshold and self.expert_freq.get(exp_id, 0) < self.hetero_freq_retain:
                     cpu_ids.add(exp_id)
                 else:
                     gpu_misses.append(exp_id)
@@ -700,7 +709,7 @@ if __name__ == "__main__":
     parser.add_argument("--warm_slots", action="store_true", default=False)
     parser.add_argument("--enable_hetero", action="store_true", default=True)
     parser.add_argument("--no_hetero", dest="enable_hetero", action="store_false")
-    parser.add_argument("--cpu_token_threshold", type=int, default=4)
+    parser.add_argument("--cpu_token_threshold", type=int, default=1)
 
     parser.add_argument("--use_cache", action="store_true", default=True)
     parser.add_argument("--no_cache", dest="use_cache", action="store_false")

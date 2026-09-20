@@ -199,8 +199,14 @@ class DynamicMoELayerWrapper(nn.Module):
         self.prefetch_stream = torch.cuda.Stream(device=device) if device.type == "cuda" else None
 
         # ─── 7. Heterogeneous Compute-to-Data Engine (Fiddler + MoE-Gen) ───
+        # Job 1814 lesson: threshold=4 at B=1 starved C=12 slots (0.25% hits, 10.8s/tok)
+        # because 45MB/51GB/s=0.85ms DMA beats ~30ms CPU. Default to DMA-first (threshold=1:
+        # only single-token tail goes CPU), disable hetero for prefill (N>8), and retain
+        # frequent experts on GPU via expert_freq (freq>=3 -> GPU even if M small).
         self.hetero_enabled = bool(getattr(config, "hetero_enabled", True)) if config is not None else True
-        self.cpu_token_threshold = int(getattr(config, "cpu_token_threshold", 4)) if config is not None else 4
+        self.cpu_token_threshold = int(getattr(config, "cpu_token_threshold", 1)) if config is not None else 1
+        self.hetero_max_tokens = int(getattr(config, "hetero_max_tokens", 8)) if config is not None else 8
+        self.hetero_freq_retain = int(getattr(config, "hetero_freq_retain", 3)) if config is not None else 3
         self.max_cpu_batch = 64
         if device.type == "cuda":
             self.act_dma_stream = torch.cuda.Stream(device=device)
@@ -211,6 +217,7 @@ class DynamicMoELayerWrapper(nn.Module):
             self.cpu_act_in = None
             self.cpu_act_out = None
         self.cpu_dispatches = 0
+        self.expert_freq: Dict[int, int] = {}
 
         # 6. Performance & stall metrics
         self.hits = 0
@@ -272,6 +279,7 @@ class DynamicMoELayerWrapper(nn.Module):
         self.slot_to_expert.clear()
         self.free_slots = list(range(self.capacity))
         self.slot_lru.clear()
+        self.expert_freq.clear()
         for e in self.block.experts:
             self._exp_proj(e, "gate").weight.data = self._exp_proj(self.dummy_expert, "gate").weight.data
             self._exp_proj(e, "up").weight.data = self._exp_proj(self.dummy_expert, "up").weight.data
@@ -555,6 +563,10 @@ class DynamicMoELayerWrapper(nn.Module):
             expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
 
             expert_list = [ei.item() for ei in expert_hit]
+            # freq-aware retention: recurring experts stay on GPU even if M small
+            for _e in expert_list:
+                self.expert_freq[_e] = self.expert_freq.get(_e, 0) + 1
+            use_hetero = self.hetero_enabled and (bsz * seq_len) <= self.hetero_max_tokens
             for e_idx in expert_list:
                 idx, top_x = torch.where(expert_mask[e_idx])
                 current_state = hidden_states_2d[top_x]
@@ -566,7 +578,7 @@ class DynamicMoELayerWrapper(nn.Module):
                     self.slot_lru.append(slot_idx)
                     slot_mod = self.slots[slot_idx]
                     current_hidden_states = slot_mod(current_state) * routing_weights[top_x, idx, None]
-                elif self.hetero_enabled and current_state.shape[0] <= self.cpu_token_threshold:
+                elif use_hetero and current_state.shape[0] <= self.cpu_token_threshold and self.expert_freq.get(e_idx, 0) < self.hetero_freq_retain:
                     self.cpu_dispatches += 1
                     cpu_out = self._cpu_expert_exec(e_idx, current_state)
                     current_hidden_states = cpu_out * routing_weights[top_x, idx, None]
@@ -608,13 +620,16 @@ class DynamicMoELayerWrapper(nn.Module):
                     locked_slots.add(slot_idx)
 
             miss_ids = [e_id for e_id in actual_flat if e_id not in self.expert_to_slot]
+            for _e in actual_flat:
+                self.expert_freq[_e] = self.expert_freq.get(_e, 0) + 1
             cpu_ids = set()
             gpu_misses = []
-            if self.hetero_enabled:
+            use_hetero = self.hetero_enabled and hidden_states_2d.shape[0] <= self.hetero_max_tokens
+            if use_hetero:
                 flat_topk = topk_idx.view(-1)
                 for e_id in miss_ids:
                     tok_count = (flat_topk == e_id).sum().item()
-                    if tok_count <= self.cpu_token_threshold:
+                    if tok_count <= self.cpu_token_threshold and self.expert_freq.get(e_id, 0) < self.hetero_freq_retain:
                         cpu_ids.add(e_id)
                     else:
                         gpu_misses.append(e_id)
@@ -706,7 +721,7 @@ class DynamicMoELayerWrapper(nn.Module):
                     self.slot_lru.append(slot_idx)
                     expert = self.slots[slot_idx]
                     expert_out = expert(tokens_for_this_expert)
-                elif self.hetero_enabled and num_tokens <= self.cpu_token_threshold:
+                elif self.hetero_enabled and hidden_states_2d.shape[0] <= self.hetero_max_tokens and num_tokens <= self.cpu_token_threshold:
                     self.cpu_dispatches += 1
                     expert_out = self._cpu_expert_exec(i, tokens_for_this_expert)
                 else:
