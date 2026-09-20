@@ -118,13 +118,17 @@ class FastExpertSlot(nn.Module):
 
 class DeepSeekColossusMoEWrapper(nn.Module):
     """
-    Dynamic Slot Residency MoE Wrapper with Heterogeneous Compute-to-Data Engine:
+    Dynamic Slot Residency MoE Wrapper with Heterogeneous Compute-to-Data Engine
+    + ADETR per-slot column streaming (COLOSSUS column-level reunification):
     - Permanently resident: Gate, Shared Experts on GPU HBM.
     - Dynamic pool: C dynamic slots allocated on GPU HBM.
+    - Whole-expert (adetr_ratio=1.0): stream full 45MB expert into slot (scaffold).
+    - Column-level (adetr_ratio<1.0): split intermediate dim into hot columns
+      (CPU, zero weight movement, 10KB activation) + cold columns (DMA into slot
+      slices, GPU computes y_cold). y = y_hot + y_cold, bitwise exact SA-FFN.
+      No permanent 216GB hot table: residency lives per-slot, streaming per-miss.
     - Cold experts with small token load (M <= cpu_token_threshold):
-      Directly evaluated on CPU via AVX-512 in native BF16 without PCIe weight DMA (saving 45 MB per miss).
-    - Heavy experts (M > cpu_token_threshold):
-      Streamed over PCIe Gen5 DMA into dynamic GPU slots.
+      Directly evaluated on CPU via AVX-512 in native BF16 without PCIe weight DMA.
     """
     def __init__(
         self,
@@ -138,6 +142,7 @@ class DeepSeekColossusMoEWrapper(nn.Module):
         dma_stream: torch.cuda.Stream,
         enable_hetero: bool = True,
         cpu_token_threshold: int = 1,
+        adetr_ratio: float = 1.0,
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -149,6 +154,7 @@ class DeepSeekColossusMoEWrapper(nn.Module):
         self.dma_stream = dma_stream
         self.enable_hetero = enable_hetero
         self.cpu_token_threshold = cpu_token_threshold
+        self.adetr_ratio = float(adetr_ratio)
 
         # Resident modules on GPU
         self.gate = moe_module.gate
@@ -163,6 +169,7 @@ class DeepSeekColossusMoEWrapper(nn.Module):
         self.slot_to_expert: Dict[int, int] = {}
         self.expert_to_slot: Dict[int, int] = {}
         self.slot_lru: List[int] = list(range(capacity))
+        self.slot_col_partial: Dict[int, bool] = {}
 
         # Heterogeneous activation streaming buffers
         self.max_cpu_batch = 64
@@ -175,6 +182,7 @@ class DeepSeekColossusMoEWrapper(nn.Module):
         self.hits = 0
         self.misses = 0
         self.cpu_dispatches = 0
+        self.adetr_col_dispatches = 0
         self.dma_bytes = 0
         self.expert_freq: Dict[int, int] = {}
         self.hetero_max_tokens = 8
@@ -225,6 +233,68 @@ class DeepSeekColossusMoEWrapper(nn.Module):
         torch.cuda.current_stream(self.device).wait_stream(self.act_stream)
         return out
 
+    def _adetr_column_exec(self, expert_id: int, slot_idx: int, toks_gpu: torch.Tensor, skip_dma: bool = False) -> torch.Tensor:
+        """ADETR per-slot column split (COLOSSUS column-level, exact SA-FFN).
+
+        Splits intermediate dim I into hot columns (CPU, zero weight movement)
+        + cold columns (DMA into slot slices, GPU computes y_cold).
+        y = y_hot + y_cold == native full-expert output.
+        DMA per miss = adetr_ratio * 45MB (0.5 -> 22.5MB, 0.25 -> 11.25MB).
+        No permanent hot table: residency lives per-slot, streaming per-miss.
+        """
+        Wg_full, Wu_full, Wd_full = self._get_cpu_expert_weights(expert_id)
+        I = Wg_full.shape[0]
+        i_cold = max(1, int(I * self.adetr_ratio))
+        i_hot = I - i_cold
+        slot_mod = self.slots[slot_idx]
+        M = toks_gpu.shape[0]
+
+        # 1. DMA cold slices only into slot (gate/up rows, down cols).
+        # skip_dma=True when slot already holds this expert's cold slices (column-hit reuse).
+        if not skip_dma:
+            with torch.no_grad():
+                with torch.cuda.stream(self.dma_stream):
+                    slot_mod.gate_proj.weight[i_hot:].copy_(Wg_full[i_hot:], non_blocking=True)
+                    slot_mod.up_proj.weight[i_hot:].copy_(Wu_full[i_hot:], non_blocking=True)
+                    slot_mod.down_proj.weight[:, i_hot:].copy_(Wd_full[:, i_hot:], non_blocking=True)
+            torch.cuda.current_stream(self.device).wait_stream(self.dma_stream)
+            self.dma_bytes += int((Wg_full[i_hot:].nbytes + Wu_full[i_hot:].nbytes + Wd_full[:, i_hot:].nbytes))
+
+        # 2. GPU cold partial from slot slices
+        with torch.no_grad():
+            h_g_c = F.linear(toks_gpu, slot_mod.gate_proj.weight[i_hot:])
+            h_u_c = F.linear(toks_gpu, slot_mod.up_proj.weight[i_hot:])
+            y_cold = F.linear(F.silu(h_g_c) * h_u_c, slot_mod.down_proj.weight[:, i_hot:])
+
+        # 3. CPU hot partial (weights stay in DDR5; only 10KB activation moves)
+        if M > self.max_cpu_batch:
+            self.max_cpu_batch = M
+            self.cpu_act_in = torch.empty((self.max_cpu_batch, self.cfg.hidden_size), dtype=torch.bfloat16, pin_memory=True)
+            self.cpu_act_out = torch.empty((self.max_cpu_batch, self.cfg.hidden_size), dtype=torch.bfloat16, pin_memory=True)
+        with torch.cuda.stream(self.act_stream):
+            self.cpu_act_in[:M].copy_(toks_gpu, non_blocking=True)
+        self.act_stream.synchronize()
+        with torch.no_grad():
+            x_cpu = self.cpu_act_in[:M]
+            y_hot = F.linear(F.silu(F.linear(x_cpu, Wg_full[:i_hot])) * F.linear(x_cpu, Wu_full[:i_hot]), Wd_full[:, :i_hot])
+            self.cpu_act_out[:M].copy_(y_hot)
+        y_hot_gpu = torch.empty_like(toks_gpu)
+        with torch.cuda.stream(self.act_stream):
+            y_hot_gpu.copy_(self.cpu_act_out[:M], non_blocking=True)
+        torch.cuda.current_stream(self.device).wait_stream(self.act_stream)
+
+        # 4. Bind slot to this expert. Hot region is stale by design: record partial
+        # so future hits reuse cold slices (skip_dma) instead of full-slot forward.
+        if not skip_dma:
+            if slot_idx in self.slot_to_expert:
+                old_exp = self.slot_to_expert[slot_idx]
+                self.expert_to_slot.pop(old_exp, None)
+            self.slot_to_expert[slot_idx] = expert_id
+            self.expert_to_slot[expert_id] = slot_idx
+            self.slot_col_partial[slot_idx] = True
+        self.adetr_col_dispatches += 1
+        return (y_hot_gpu + y_cold).to(toks_gpu.dtype)
+
     def warm_up_slots(self, initial_experts: List[int]):
         """Pre-populates dynamic slots with initial experts."""
         for slot_idx, exp_id in enumerate(initial_experts[:self.capacity]):
@@ -246,6 +316,7 @@ class DeepSeekColossusMoEWrapper(nn.Module):
 
         self.slot_to_expert[slot_idx] = expert_id
         self.expert_to_slot[expert_id] = slot_idx
+        self.slot_col_partial[slot_idx] = False
         self.dma_bytes += (t_gate.nbytes + t_up.nbytes + t_down.nbytes)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -289,6 +360,14 @@ class DeepSeekColossusMoEWrapper(nn.Module):
         else:
             gpu_misses = miss_ids
 
+        # ADETR column-level: all misses go through per-slot hot/cold split
+        # (supersedes hetero full-CPU path; hot half stays in DDR5, cold half DMA'd).
+        use_adetr = self.adetr_ratio < 1.0
+        adetr_ids = set(miss_ids) if use_adetr else set()
+        if use_adetr:
+            cpu_ids.clear()
+            gpu_misses = []
+
         # Stream heavy misses into GPU slots
         if gpu_misses:
             for exp_id in gpu_misses:
@@ -317,9 +396,22 @@ class DeepSeekColossusMoEWrapper(nn.Module):
             if i in cpu_ids:
                 self.cpu_dispatches += 1
                 out_this = self._cpu_expert_exec(i, tokens_for_this)
+            elif i in adetr_ids:
+                self.misses += 1
+                slot_idx = self.slot_lru.pop(0)
+                out_this = self._adetr_column_exec(i, slot_idx, tokens_for_this)
+                self.slot_lru.append(slot_idx)
             else:
                 if i in self.expert_to_slot:
                     slot_idx = self.expert_to_slot[i]
+                    if use_adetr and self.slot_col_partial.get(slot_idx, False):
+                        # Column-hit: cold slices already resident, skip DMA
+                        self.hits += 1
+                        self.slot_lru.remove(slot_idx)
+                        self.slot_lru.append(slot_idx)
+                        out_this = self._adetr_column_exec(i, slot_idx, tokens_for_this, skip_dma=True)
+                    else:
+                        out_this = self.slots[slot_idx](tokens_for_this)
                 else:
                     self.misses += 1
                     slot_idx = self.slot_lru.pop(0)
@@ -458,6 +550,7 @@ def serve_deepseek(args):
             dma_stream=dma_stream,
             enable_hetero=args.enable_hetero,
             cpu_token_threshold=args.cpu_token_threshold,
+            adetr_ratio=args.adetr_ratio,
         )
 
         if args.warm_slots:
@@ -514,6 +607,7 @@ def serve_deepseek(args):
         w.hits = 0
         w.misses = 0
         w.cpu_dispatches = 0
+        w.adetr_col_dispatches = 0
         w.dma_bytes = 0
 
     generated_ids = input_ids.clone()
@@ -620,10 +714,11 @@ def serve_deepseek(args):
     total_hits = sum(w.hits for w in colossus_wrappers)
     total_misses = sum(w.misses for w in colossus_wrappers)
     total_cpu = sum(w.cpu_dispatches for w in colossus_wrappers)
+    total_adetr = sum(getattr(w, "adetr_col_dispatches", 0) for w in colossus_wrappers)
     total_lookups = total_hits + total_misses + total_cpu
     hit_rate = (total_hits / total_lookups * 100.0) if total_lookups > 0 else 0.0
     total_dma_mb = sum(w.dma_bytes for w in colossus_wrappers) / (1024**2)
-    total_dma_saved_mb = total_cpu * 45.0
+    total_dma_saved_mb = total_cpu * 45.0 + total_adetr * 45.0 * (1.0 - args.adetr_ratio)
 
     peak_hbm0 = torch.cuda.max_memory_allocated(dev0) / (1024**3)
     peak_hbm1 = torch.cuda.max_memory_allocated(dev1) / (1024**3)
@@ -642,6 +737,7 @@ def serve_deepseek(args):
     print(f"  Dynamic Slot Capacity C   : {args.capacity} slots / layer ({(args.capacity / cfg.n_routed_experts)*100:.1f}% expert residency)")
     print(f"  Routed Expert Reduction   : {(1.0 - args.capacity / cfg.n_routed_experts)*100:.1f}% reduction in routed expert GPU memory")
     print(f"  Compute-to-Data Engine    : {'Enabled (Threshold <= ' + str(args.cpu_token_threshold) + ')' if args.enable_hetero else 'Disabled'}")
+    print(f"  ADETR Column Split        : {'Disabled (whole-expert 45MB/miss)' if args.adetr_ratio >= 1.0 else f'Enabled ratio={args.adetr_ratio} (~{45.0*args.adetr_ratio:.1f}MB/miss, {total_adetr:,} col-dispatches)'}" )
     print("-" * 80)
     print(f"  Prefill Latency           : {t_prefill*1000:7.1f} ms ({prefill_tps:5.1f} tok/s for {prompt_len} tokens)")
     print(f"  Decode Latency (Avg)      : {avg_decode_lat*1000:7.1f} ms / token")
@@ -681,11 +777,13 @@ def serve_deepseek(args):
         "total_hits": total_hits,
         "total_misses": total_misses,
         "total_cpu_dispatches": total_cpu,
+        "total_adetr_col_dispatches": total_adetr,
         "total_dma_saved_mb": total_dma_saved_mb,
         "hit_rate_pct": hit_rate,
         "total_dma_mb": total_dma_mb,
         "enable_hetero": args.enable_hetero,
         "cpu_token_threshold": args.cpu_token_threshold,
+        "adetr_ratio": args.adetr_ratio,
         "peak_vram_gpu0_gb": peak_hbm0,
         "peak_vram_gpu1_gb": peak_hbm1 if args.num_gpus > 1 else None,
         "generated_text": gen_text,
@@ -710,6 +808,8 @@ if __name__ == "__main__":
     parser.add_argument("--enable_hetero", action="store_true", default=True)
     parser.add_argument("--no_hetero", dest="enable_hetero", action="store_false")
     parser.add_argument("--cpu_token_threshold", type=int, default=1)
+    parser.add_argument("--adetr_ratio", type=float, default=1.0,
+                        help="Cold column fraction DMA'd per miss (1.0=whole-expert, 0.5=ADETR-50%%, 0.25, 0.1)")
 
     parser.add_argument("--use_cache", action="store_true", default=True)
     parser.add_argument("--no_cache", dest="use_cache", action="store_false")
