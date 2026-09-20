@@ -806,16 +806,33 @@ def serve_deepseek(args):
 
 
     # ─────────────────────────────────────────────────────────────────────────
-    # Run End-to-End Generation Benchmark
+    # Run End-to-End Generation Benchmark (Experiment E: offline batch throughput)
+    # Batch prefill (left-padded) + lockstep fixed-step decode. Per-expert token
+    # grouping across the batch happens inside the wrappers' sorted dispatch, so
+    # each expert GEMM serves M>>1 tokens and pool blocks are shared batch-wide.
     # ─────────────────────────────────────────────────────────────────────────
-    prompt = args.prompt
+    if args.prompt_file:
+        with open(args.prompt_file) as f:
+            prompts = [l.rstrip("\n") for l in f if l.strip()]
+    else:
+        prompts = [args.prompt]
+    if args.batch_size > 1 and len(prompts) == 1:
+        prompts = prompts * args.batch_size
+    B = len(prompts)
     print(f"\n[7] Starting Generation Benchmark:")
-    print(f"  Prompt: {repr(prompt)}")
-    print(f"  Max New Tokens: {args.max_new_tokens}")
+    print(f"  Batch size: {B} | Max New Tokens: {args.max_new_tokens}")
+    for bi, p in enumerate(prompts):
+        print(f"  Prompt[{bi}]: {repr(p)}")
 
-    input_ids = tokenizer.encode(prompt, return_tensors="pt").to(dev0)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"
+    enc = tokenizer(prompts, return_tensors="pt", padding=True)
+    input_ids = enc["input_ids"].to(dev0)
+    attn_mask = enc["attention_mask"].to(dev0)
     prompt_len = input_ids.shape[1]
-    print(f"  Prompt Length: {prompt_len} tokens")
+    prompt_real_tokens = int(attn_mask.sum().item())
+    print(f"  Prompt Length: {prompt_len} tokens (padded), {prompt_real_tokens} real")
 
     # Reset cache metrics before generation
     for w in colossus_wrappers:
@@ -839,17 +856,17 @@ def serve_deepseek(args):
     past_key_values = DynamicCache() if args.use_cache else None
 
     with torch.no_grad():
-        out = model(input_ids=generated_ids, past_key_values=past_key_values, use_cache=args.use_cache)
-        logits = out.logits  # [1, prompt_len, vocab_size] on dev1
-        next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True).to(dev0)
+        out = model(input_ids=generated_ids, attention_mask=attn_mask, past_key_values=past_key_values, use_cache=args.use_cache)
+        logits = out.logits  # [B, prompt_len, vocab_size]
+        next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True).to(dev0)  # [B, 1]
         past_key_values = getattr(out, "past_key_values", None)
 
 
     torch.cuda.synchronize(dev0)
     torch.cuda.synchronize(dev1)
     t_prefill = time.perf_counter() - t_prefill_start
-    prefill_tps = prompt_len / t_prefill
-    print(f"  Prefill Time : {t_prefill*1000:.2f} ms ({prefill_tps:.2f} tok/s)")
+    prefill_tps = prompt_real_tokens / t_prefill
+    print(f"  Prefill Time : {t_prefill*1000:.2f} ms ({prefill_tps:.2f} tok/s over {prompt_real_tokens} real tokens)")
     sys.stdout.flush()
 
     if args.col_pool_gb > 0 and args.col_warm_topk > 0:
@@ -925,12 +942,14 @@ def serve_deepseek(args):
 
         generated_ids = torch.cat([generated_ids, next_token], dim=1)
         tok_str = tokenizer.decode(next_token[0], skip_special_tokens=False)
-        print(f"    Token {step+1:2d}/{args.max_new_tokens-1:2d} | Latency: {t_step*1000:6.1f} ms | Hits: {step_hits:3d}/{step_lookups:3d} ({step_hit_rate:5.1f}%) | CPU Fallback: {step_cpu:2d} ({step_dma_saved_mb:5.1f}MB saved) | Misses: {step_misses:2d} | DMA: {step_dma_mb:5.1f} MB | ColPool: {step_pool_h:4d}h/{step_pool_m:4d}m ({step_pool_rate:4.1f}%) | Tok: {repr(tok_str)}")
+        step_batch_tps = B / t_step if t_step > 0 else 0.0
+        print(f"    Token {step+1:2d}/{args.max_new_tokens-1:2d} | Latency: {t_step*1000:6.1f} ms | Batch: {B} seqs ({step_batch_tps:5.2f} tok/s agg) | Hits: {step_hits:3d}/{step_lookups:3d} ({step_hit_rate:5.1f}%) | CPU Fallback: {step_cpu:2d} ({step_dma_saved_mb:5.1f}MB saved) | Misses: {step_misses:2d} | DMA: {step_dma_mb:5.1f} MB | ColPool: {step_pool_h:4d}h/{step_pool_m:4d}m ({step_pool_rate:4.1f}%) | Tok: {repr(tok_str)}")
         sys.stdout.flush()
 
         decode_step_details.append({
             "step": step + 1,
             "latency_ms": t_step * 1000,
+            "batch_tps_agg": B / t_step if t_step > 0 else 0.0,
             "step_hits": step_hits,
             "step_misses": step_misses,
             "step_cpu_dispatches": step_cpu,
@@ -952,6 +971,8 @@ def serve_deepseek(args):
     total_decode_time = sum(decode_latencies)
     avg_decode_lat = total_decode_time / len(decode_latencies) if decode_latencies else 0.0
     decode_tps = 1.0 / avg_decode_lat if avg_decode_lat > 0 else 0.0
+    batch_decode_tokens = B * len(decode_latencies)
+    batch_decode_tps = batch_decode_tokens / total_decode_time if total_decode_time > 0 else 0.0
 
     total_hits = sum(w.hits for w in colossus_wrappers)
     total_misses = sum(w.misses for w in colossus_wrappers)
@@ -972,7 +993,8 @@ def serve_deepseek(args):
     peak_hbm0 = torch.cuda.max_memory_allocated(dev0) / (1024**3)
     peak_hbm1 = torch.cuda.max_memory_allocated(dev1) / (1024**3)
 
-    gen_text = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
+    gen_texts = [tokenizer.decode(generated_ids[bi], skip_special_tokens=True) for bi in range(B)]
+    gen_text = gen_texts[0]
 
     print("\n" + "=" * 80)
     print("  COLOSSUS SERVING BENCHMARK RESULTS")
@@ -992,8 +1014,9 @@ def serve_deepseek(args):
               f"blocks={total_pool_h + total_pool_m:,} lookups ({pool_hit_rate:.1f}% hit), resident={pool_gb:.2f}GB, "
               f"fast-whole={total_pool_fast:,}, bypassed={total_pool_bypass:,}")
     print("-" * 80)
-    print(f"  Prefill Latency           : {t_prefill*1000:7.1f} ms ({prefill_tps:5.1f} tok/s for {prompt_len} tokens)")
-    print(f"  Decode Latency (Avg)      : {avg_decode_lat*1000:7.1f} ms / token")
+    print(f"  Batch Size              : {B} seqs | Batch Decode Throughput: {batch_decode_tps:7.2f} tok/s agg ({batch_decode_tokens} toks)")
+    print(f"  Prefill Latency           : {t_prefill*1000:7.1f} ms ({prefill_tps:5.1f} tok/s for {prompt_real_tokens} real tokens)")
+    print(f"  Decode Latency (Avg)      : {avg_decode_lat*1000:7.1f} ms / step ({decode_tps:5.2f} tok/s single-stream)")
     print(f"  Decode Throughput         : {decode_tps:7.2f} tokens / sec")
     print(f"  Cache Hits                : {total_hits:,} ({hit_rate:.1f}%)")
     print(f"  CPU Cold Fallbacks        : {total_cpu:,} ({total_dma_saved_mb:,.1f} MB PCIe DMA avoided!)")
@@ -1003,8 +1026,12 @@ def serve_deepseek(args):
     if args.num_gpus > 1:
         print(f"  Peak VRAM GPU 1           : {peak_hbm1:7.2f} GB / 93.1 GB")
     print("-" * 80)
-    print(f"  Generated Text Output:")
+    print(f"  Generated Text Output[0]:")
     print(f"  {repr(gen_text)}")
+    if B > 1:
+        for bi in range(1, B):
+            print(f"  Generated Text Output[{bi}]:")
+            print(f"  {repr(gen_texts[bi])}")
     print("=" * 80)
 
     # Save to JSON
@@ -1018,9 +1045,14 @@ def serve_deepseek(args):
         "gpus": [p0.name] if args.num_gpus == 1 else [p0.name, p1.name],
         "capacity_slots": args.capacity,
         "residency_reduction_pct": (1.0 - args.capacity / cfg.n_routed_experts) * 100.0,
-        "prompt": prompt,
+        "prompt": prompts[0] if B == 1 else prompts,
+        "prompts": prompts,
+        "batch_size": B,
         "prompt_tokens": prompt_len,
+        "prompt_real_tokens": prompt_real_tokens,
         "generated_tokens": args.max_new_tokens,
+        "batch_decode_tokens": batch_decode_tokens,
+        "batch_decode_tps": batch_decode_tps,
         "prefill_ms": t_prefill * 1000,
         "prefill_tps": prefill_tps,
         "decode_avg_ms": avg_decode_lat * 1000,
@@ -1048,6 +1080,7 @@ def serve_deepseek(args):
         "peak_vram_gpu0_gb": peak_hbm0,
         "peak_vram_gpu1_gb": peak_hbm1 if args.num_gpus > 1 else None,
         "generated_text": gen_text,
+        "generated_texts": gen_texts,
     }
 
     if args.output_json:
@@ -1062,6 +1095,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--num_gpus", type=int, default=1)
     parser.add_argument("--prompt", type=str, default="def quicksort(arr):")
+    parser.add_argument("--prompt_file", type=str, default=None,
+                        help="File with one prompt per line; forms the batch (overrides --prompt)")
+    parser.add_argument("--batch_size", type=int, default=1,
+                        help="Experiment E: repeat single prompt B times for offline batch throughput")
     parser.add_argument("--max_new_tokens", type=int, default=16)
     parser.add_argument("--capacity", type=int, default=12)
     parser.add_argument("--capacity_gpu1", type=int, default=7)
