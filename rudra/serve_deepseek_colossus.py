@@ -133,6 +133,9 @@ class DeepSeekColossusMoEWrapper(nn.Module):
         handles: Dict[str, any],
         weight_map: Dict[str, str],
         dma_stream: torch.cuda.Stream,
+        zssr_prefetch: bool = False,
+        prefetch_topk: int = 8,
+        coalesced_dma: bool = False,
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -142,6 +145,13 @@ class DeepSeekColossusMoEWrapper(nn.Module):
         self.handles = handles
         self.weight_map = weight_map
         self.dma_stream = dma_stream
+        # Phase 1 (default OFF): ZSSR prefetch + coalesced DMA. Prediction moves
+        # data only — the native router keeps the mathematical decision (exactness).
+        self.zssr_enabled = bool(zssr_prefetch)
+        self.prefetch_topk = int(prefetch_topk)
+        self.coalesced = bool(coalesced_dma)
+        self.top_k = int(getattr(cfg, "num_experts_per_tok", 6))
+        self.n_routed = int(getattr(cfg, "n_routed_experts", 160))
 
         # Resident modules on GPU
         self.gate = moe_module.gate
@@ -162,13 +172,57 @@ class DeepSeekColossusMoEWrapper(nn.Module):
         self.hits = 0
         self.misses = 0
         self.dma_bytes = 0
+        # Phase 1 causal telemetry (standardized schema; demand = exposed by construction)
+        self.zssr_predictions = 0
+        self.zssr_correct = 0
+        self.prefetch_bytes_total = 0
+        self.prefetch_useful_bytes = 0
+        self.demand_bytes_m = 0      # measured (event-drained) demand payload
+        self.demand_dma_ms = 0.0     # measured (event-drained) demand transfer time
+        self.prefetch_dma_ms = 0.0   # measured (event-drained) prefetch transfer time
+        self._dma_pending = []       # (kind, ev_start, ev_end, bytes)
+        self._prefetched = {}        # expert_id -> prefetched bytes (unverified)
 
     def warm_up_slots(self, initial_experts: List[int]):
         """Pre-populates dynamic slots with initial experts."""
         for slot_idx, exp_id in enumerate(initial_experts[:self.capacity]):
             self._load_expert_to_slot(exp_id, slot_idx)
 
-    def _load_expert_to_slot(self, expert_id: int, slot_idx: int):
+    def _dma_begin(self):
+        ev_s = torch.cuda.Event(enable_timing=True)
+        ev_s.record(self.dma_stream)
+        return ev_s
+
+    def _dma_end(self, ev_s, kind: str, nbytes: int):
+        ev_e = torch.cuda.Event(enable_timing=True)
+        ev_e.record(self.dma_stream)
+        self._dma_pending.append((kind, ev_s, ev_e, int(nbytes)))
+
+    def _drain_dma(self, sync: bool = False):
+        """Non-blocking drain of completed DMA event pairs into measured ledgers."""
+        if not self._dma_pending:
+            return
+        if self.device.type != "cuda":
+            self._dma_pending.clear()
+            return
+        if sync:
+            torch.cuda.synchronize(self.device)
+        remaining = []
+        for kind, ev_s, ev_e, nbytes in self._dma_pending:
+            if sync or ev_e.query():
+                ms = ev_s.elapsed_time(ev_e) / 1000.0
+                if kind == "demand":
+                    self.demand_dma_ms += ms
+                    self.demand_bytes_m += nbytes
+                else:
+                    self.prefetch_dma_ms += ms
+                    self.prefetch_bytes_total += nbytes
+            else:
+                remaining.append((kind, ev_s, ev_e, nbytes))
+        self._dma_pending = remaining
+
+    def _load_expert_to_slot(self, expert_id: int, slot_idx: int, kind: str = "demand",
+                             record: bool = True):
         slot_mod = self.slots[slot_idx]
         pfx = f"model.layers.{self.layer_idx}.mlp.experts.{expert_id}"
         k_gate = f"{pfx}.gate_proj.weight"
@@ -182,13 +236,14 @@ class DeepSeekColossusMoEWrapper(nn.Module):
         t_gate = self.handles[shard_gate].get_tensor(k_gate)
         t_up = self.handles[shard_up].get_tensor(k_up)
         t_down = self.handles[shard_down].get_tensor(k_down)
+        nbytes = int(t_gate.nbytes + t_up.nbytes + t_down.nbytes)
 
+        ev_s = self._dma_begin() if (record and self.device.type == "cuda") else None
         with torch.no_grad():
             with torch.cuda.stream(self.dma_stream):
                 slot_mod.gate_proj.weight.copy_(t_gate, non_blocking=True)
                 slot_mod.up_proj.weight.copy_(t_up, non_blocking=True)
                 slot_mod.down_proj.weight.copy_(t_down, non_blocking=True)
-
 
         if slot_idx in self.slot_to_expert:
             old_exp = self.slot_to_expert[slot_idx]
@@ -196,15 +251,61 @@ class DeepSeekColossusMoEWrapper(nn.Module):
 
         self.slot_to_expert[slot_idx] = expert_id
         self.expert_to_slot[expert_id] = slot_idx
-        self.dma_bytes += (t_gate.nbytes + t_up.nbytes + t_down.nbytes)
+        self.dma_bytes += nbytes
+        if ev_s is not None:
+            self._dma_end(ev_s, kind, nbytes)
+        return nbytes
+
+    @torch.no_grad()
+    def zssr_prefetch(self, hidden_in: torch.Tensor):
+        """Phase 1 probe (called at layer entrance, pre-attention).
+
+        Predicts top-(K+margin) experts from the residual stream and issues one
+        grouped async DMA per layer on dma_stream. Prediction moves DATA only;
+        the native router in forward() keeps the mathematical decision (exact).
+        Returns predicted expert list (possibly empty when disabled).
+        """
+        if not self.zssr_enabled:
+            return []
+        try:
+            h = hidden_in[:, -1, :].to(dtype=torch.float32, device=self.gate.weight.device)
+            scores = torch.softmax(h @ self.gate.weight.detach().float().t(), dim=-1)
+            k = min(self.prefetch_topk, self.n_routed)
+            pred = torch.topk(scores, k=k, dim=-1).indices.view(-1).tolist()
+        except Exception:
+            return []
+        new_ids = [e for e in dict.fromkeys(pred) if e not in self.expert_to_slot and e not in self._prefetched]
+        if not new_ids:
+            return pred
+        if self.coalesced:
+            ev_s = self._dma_begin() if self.device.type == "cuda" else None
+        for exp_id in new_ids:
+            slot_idx = self.slot_lru.pop(0)
+            nbytes = self._load_expert_to_slot(exp_id, slot_idx, kind="prefetch",
+                                               record=not self.coalesced)
+            self.slot_lru.append(slot_idx)
+            self._prefetched[exp_id] = self._prefetched.get(exp_id, 0) + nbytes
+        if self.coalesced and self.device.type == "cuda":
+            self._dma_end(ev_s, "prefetch", sum(self._prefetched.get(e, 0) for e in new_ids))
+        self.zssr_predictions += len(new_ids)
+        return pred
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         identity = hidden_states
         orig_shape = hidden_states.shape
+        self._drain_dma()  # collect completed transfers only; never blocks
 
         # 1. Gate routing (returns topk_idx, topk_weight, aux_loss)
         topk_indices, topk_weights, _ = self.gate(hidden_states)
         needed_experts = topk_indices.unique().tolist()
+
+        # Phase 1 verify: reconcile ZSSR prediction against ground-truth routing.
+        if self._prefetched:
+            actual = set(needed_experts)
+            for exp_id in list(self._prefetched.keys()):
+                if exp_id in actual:
+                    self.zssr_correct += 1
+                    self.prefetch_useful_bytes += self._prefetched.pop(exp_id)
 
         # 2. Compute shared experts (permanently resident)
         shared_out = self.shared_experts(identity)
@@ -392,6 +493,9 @@ def serve_deepseek(args):
             handles=handles,
             weight_map=weight_map,
             dma_stream=dma_stream,
+            zssr_prefetch=args.zssr_prefetch,
+            prefetch_topk=args.prefetch_topk,
+            coalesced_dma=args.coalesced_dma,
         )
 
         if args.warm_slots:
@@ -427,6 +531,25 @@ def serve_deepseek(args):
             model.model.layers[l_idx].register_forward_pre_hook(gpu1_pre_hook, with_kwargs=True)
     else:
         print(f"\n[6] Single GPU serving on {p0.name} (No cross-GPU NVLink hooks needed)")
+
+    if args.zssr_prefetch:
+        # Phase 1 probes: layer-entrance (pre-attention) ZSSR prefetch hooks.
+        # Registered AFTER P2P hooks so the probe sees post-move tensors.
+        print(f"  Installing ZSSR pre-attention prefetch hooks (top-{args.prefetch_topk}, "
+              f"coalesced={args.coalesced_dma}) on layers 1..59...")
+        def _make_zssr_hook(wrapper):
+            def _hook(module, hook_args):
+                try:
+                    hidden_in = hook_args[0]
+                    if isinstance(hidden_in, torch.Tensor):
+                        wrapper.zssr_prefetch(hidden_in)
+                except Exception as e:
+                    print(f"  [warn] zssr probe L{wrapper.layer_idx}: {e}")
+                return None
+            return _hook
+        for l_idx in range(1, cfg.num_hidden_layers):
+            model.model.layers[l_idx].register_forward_pre_hook(
+                _make_zssr_hook(colossus_wrappers[l_idx - 1]))
     model.eval()
 
 
@@ -448,6 +571,15 @@ def serve_deepseek(args):
         w.hits = 0
         w.misses = 0
         w.dma_bytes = 0
+        w.zssr_predictions = 0
+        w.zssr_correct = 0
+        w.prefetch_bytes_total = 0
+        w.prefetch_useful_bytes = 0
+        w.demand_bytes_m = 0
+        w.demand_dma_ms = 0.0
+        w.prefetch_dma_ms = 0.0
+        w._dma_pending = []
+        w._prefetched = {}
 
     generated_ids = input_ids.clone()
 
@@ -485,6 +617,12 @@ def serve_deepseek(args):
     last_hits = sum(w.hits for w in colossus_wrappers)
     last_misses = sum(w.misses for w in colossus_wrappers)
     last_dma = sum(w.dma_bytes for w in colossus_wrappers)
+    last_zp = sum(w.zssr_predictions for w in colossus_wrappers)
+    last_zc = sum(w.zssr_correct for w in colossus_wrappers)
+    last_pf = sum(w.prefetch_bytes_total for w in colossus_wrappers)
+    last_pfu = sum(w.prefetch_useful_bytes for w in colossus_wrappers)
+    last_dms = sum(w.demand_dma_ms for w in colossus_wrappers)
+    last_dby = sum(w.demand_bytes_m for w in colossus_wrappers)
 
     for step in range(args.max_new_tokens - 1):
         torch.cuda.synchronize(dev0)
@@ -506,22 +644,38 @@ def serve_deepseek(args):
         t_step = time.perf_counter() - t_step_start
         decode_latencies.append(t_step)
 
-        # Per-step cache metrics
+        # Per-step cache metrics (Phase 1 causal set: DMA bytes vs exposed DMA)
         cur_hits = sum(w.hits for w in colossus_wrappers)
         cur_misses = sum(w.misses for w in colossus_wrappers)
         cur_dma = sum(w.dma_bytes for w in colossus_wrappers)
+        cur_zp = sum(w.zssr_predictions for w in colossus_wrappers)
+        cur_zc = sum(w.zssr_correct for w in colossus_wrappers)
+        cur_pf = sum(w.prefetch_bytes_total for w in colossus_wrappers)
+        cur_pfu = sum(w.prefetch_useful_bytes for w in colossus_wrappers)
+        cur_dms = sum(w.demand_dma_ms for w in colossus_wrappers)
+        cur_dby = sum(w.demand_bytes_m for w in colossus_wrappers)
 
         step_hits = cur_hits - last_hits
         step_misses = cur_misses - last_misses
         step_lookups = step_hits + step_misses
         step_hit_rate = (step_hits / step_lookups * 100.0) if step_lookups > 0 else 0.0
         step_dma_mb = (cur_dma - last_dma) / (1024**2)
+        step_zp = cur_zp - last_zp
+        step_zc = cur_zc - last_zc
+        step_recall = (step_zc / step_zp * 100.0) if step_zp else 0.0
+        step_pfu_mb = (cur_pfu - last_pfu) / (1024**2)
+        step_dby_mb = (cur_dby - last_dby) / (1024**2)
+        step_dms = (cur_dms - last_dms) * 1000.0
+        step_exposed = step_dby_mb  # demand loads issue post-verify: exposed by construction
+        step_useful = step_pfu_mb   # prefetched bytes actually consumed: overlapped by construction
+        step_overlap = (step_useful / (step_useful + step_exposed) * 100.0) if (step_useful + step_exposed) else 0.0
 
         last_hits, last_misses, last_dma = cur_hits, cur_misses, cur_dma
+        last_zp, last_zc, last_pf, last_pfu, last_dms, last_dby = cur_zp, cur_zc, cur_pf, cur_pfu, cur_dms, cur_dby
 
         generated_ids = torch.cat([generated_ids, next_token], dim=1)
         tok_str = tokenizer.decode(next_token[0], skip_special_tokens=False)
-        print(f"    Token {step+1:2d}/{args.max_new_tokens-1:2d} | Latency: {t_step*1000:6.1f} ms | Hits: {step_hits:3d}/{step_lookups:3d} ({step_hit_rate:5.1f}%) | Misses: {step_misses:2d} | DMA: {step_dma_mb:5.1f} MB | Tok: {repr(tok_str)}")
+        print(f"    Token {step+1:2d}/{args.max_new_tokens-1:2d} | Latency: {t_step*1000:6.1f} ms | Hits: {step_hits:3d}/{step_lookups:3d} ({step_hit_rate:5.1f}%) | Misses: {step_misses:2d} | DMA: {step_dma_mb:5.1f} MB (exposed {step_exposed:5.1f}) | ZSSR: {step_zc:3d}/{step_zp:3d} ({step_recall:4.1f}%) overlapped {step_useful:5.1f}MB ({step_overlap:4.1f}%) | Tok: {repr(tok_str)}")
         sys.stdout.flush()
 
         decode_step_details.append({
@@ -531,6 +685,13 @@ def serve_deepseek(args):
             "step_misses": step_misses,
             "step_hit_rate_pct": step_hit_rate,
             "step_dma_mb": step_dma_mb,
+            "step_exposed_dma_mb": step_exposed,
+            "step_zssr_predictions": step_zp,
+            "step_zssr_correct": step_zc,
+            "step_zssr_recall_pct": step_recall,
+            "step_overlapped_mb": step_useful,
+            "step_overlap_pct": step_overlap,
+            "step_demand_dma_ms": step_dms,
             "token": tok_str,
         })
 
@@ -544,11 +705,31 @@ def serve_deepseek(args):
     avg_decode_lat = total_decode_time / len(decode_latencies) if decode_latencies else 0.0
     decode_tps = 1.0 / avg_decode_lat if avg_decode_lat > 0 else 0.0
 
+    # Final sync + drain so event-measured ledgers are complete
+    torch.cuda.synchronize(dev0)
+    if args.num_gpus > 1:
+        torch.cuda.synchronize(dev1)
+    for w in colossus_wrappers:
+        w._drain_dma(sync=True)
+
     total_hits = sum(w.hits for w in colossus_wrappers)
     total_misses = sum(w.misses for w in colossus_wrappers)
     total_lookups = total_hits + total_misses
     hit_rate = (total_hits / total_lookups * 100.0) if total_lookups > 0 else 0.0
     total_dma_mb = sum(w.dma_bytes for w in colossus_wrappers) / (1024**2)
+    # Phase 1 causal set
+    total_zp = sum(w.zssr_predictions for w in colossus_wrappers)
+    total_zc = sum(w.zssr_correct for w in colossus_wrappers)
+    total_pf = sum(w.prefetch_bytes_total for w in colossus_wrappers) / (1024**2)
+    total_pfu = sum(w.prefetch_useful_bytes for w in colossus_wrappers) / (1024**2)
+    total_dby = sum(w.demand_bytes_m for w in colossus_wrappers) / (1024**2)
+    total_dms = sum(w.demand_dma_ms for w in colossus_wrappers) * 1000.0
+    total_pms = sum(w.prefetch_dma_ms for w in colossus_wrappers) * 1000.0
+    total_wasted = total_pf - total_pfu
+    recall = (total_zc / total_zp * 100.0) if total_zp else 0.0
+    overlap = (total_pfu / (total_pfu + total_dby) * 100.0) if (total_pfu + total_dby) else 0.0
+    eff_gbps = (sum(w.demand_bytes_m for w in colossus_wrappers) / (1024**3)) / (sum(w.demand_dma_ms for w in colossus_wrappers) + 1e-12)
+    ref_text = "def quicksort(arr):\n    if len(arr) <= 1:\n        return arr\n"
 
     peak_hbm0 = torch.cuda.max_memory_allocated(dev0) / (1024**3)
     peak_hbm1 = torch.cuda.max_memory_allocated(dev1) / (1024**3)
@@ -573,6 +754,10 @@ def serve_deepseek(args):
     print(f"  Cache Hits                : {total_hits:,} ({hit_rate:.1f}%)")
     print(f"  Cache Misses (Cold DMA)   : {total_misses:,}")
     print(f"  Total PCIe DMA Transferred: {total_dma_mb:7.1f} MB")
+    print(f"  ZSSR Prefetch             : {'on (top-%d%s)' % (args.prefetch_topk, ', coalesced' if args.coalesced_dma else '') if args.zssr_prefetch else 'off'} | "
+          f"pred {total_zp:,} correct {total_zc:,} (recall {recall:.1f}%) | prefetch {total_pf:,.1f}MB useful {total_pfu:,.1f}MB wasted {total_wasted:,.1f}MB")
+    print(f"  DMA Causality             : demand {total_dby:,.1f}MB in {total_dms:.2f}ms (eff {eff_gbps:.1f} GB/s, EXPOSED) | "
+          f"prefetch {total_pms:.2f}ms (OVERLAPPED) | overlap {overlap:.1f}%")
     print(f"  Peak VRAM GPU 0           : {peak_hbm0:7.2f} GB / 93.1 GB")
     if args.num_gpus > 1:
         print(f"  Peak VRAM GPU 1           : {peak_hbm1:7.2f} GB / 93.1 GB")
@@ -605,6 +790,22 @@ def serve_deepseek(args):
         "total_misses": total_misses,
         "hit_rate_pct": hit_rate,
         "total_dma_mb": total_dma_mb,
+        # Phase 1 standardized causal telemetry
+        "zssr_prefetch": bool(args.zssr_prefetch),
+        "prefetch_topk": int(args.prefetch_topk),
+        "coalesced_dma": bool(args.coalesced_dma),
+        "zssr_predictions": total_zp,
+        "zssr_correct": total_zc,
+        "zssr_recall_pct": recall,
+        "prefetch_mb": total_pf,
+        "useful_prefetch_mb": total_pfu,
+        "wasted_prefetch_mb": total_wasted,
+        "demand_mb": total_dby,
+        "demand_dma_ms": total_dms,
+        "prefetch_dma_ms": total_pms,
+        "overlap_pct": overlap,
+        "effective_gbps": eff_gbps,
+        "exact_vs_baseline": (gen_text == ref_text) if (prompt == "def quicksort(arr):" and args.max_new_tokens == 16) else None,
         "peak_vram_gpu0_gb": peak_hbm0,
         "peak_vram_gpu1_gb": peak_hbm1 if args.num_gpus > 1 else None,
         "generated_text": gen_text,
@@ -626,6 +827,13 @@ if __name__ == "__main__":
     parser.add_argument("--capacity", type=int, default=12)
     parser.add_argument("--capacity_gpu1", type=int, default=7)
     parser.add_argument("--warm_slots", action="store_true", default=False)
+    # Phase 1 (all default OFF for clean ablations: baseline vs +prefetch vs +coalescing)
+    parser.add_argument("--zssr-prefetch", dest="zssr_prefetch", action="store_true", default=False,
+                        help="Pre-attention ZSSR probe + grouped async DMA (prediction moves data only)")
+    parser.add_argument("--prefetch_topk", type=int, default=8,
+                        help="Top-K experts to prefetch per layer entrance (K=6 routing + margin)")
+    parser.add_argument("--coalesced-dma", dest="coalesced_dma", action="store_true", default=False,
+                        help="Single timing group per layer prefetch burst (few large DMAs)")
 
 
     parser.add_argument("--use_cache", action="store_true", default=True)
