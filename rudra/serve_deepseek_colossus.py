@@ -309,7 +309,7 @@ class DeepSeekColossusMoEWrapper(nn.Module):
         handles: Dict[str, any],
         weight_map: Dict[str, str],
         dma_stream: torch.cuda.Stream,
-        enable_hetero: bool = True,
+        enable_hetero: bool = False,
         cpu_token_threshold: int = 1,
         adetr_ratio: float = 1.0,
         col_pool=None,
@@ -1107,7 +1107,7 @@ if __name__ == "__main__":
     parser.add_argument("--capacity", type=int, default=12)
     parser.add_argument("--capacity_gpu1", type=int, default=7)
     parser.add_argument("--warm_slots", action="store_true", default=False)
-    parser.add_argument("--enable_hetero", action="store_true", default=True)
+    parser.add_argument("--enable_hetero", action="store_true", default=False)
     parser.add_argument("--no_hetero", dest="enable_hetero", action="store_false")
     parser.add_argument("--cpu_token_threshold", type=int, default=1)
     parser.add_argument("--adetr_ratio", type=float, default=1.0,

@@ -199,11 +199,9 @@ class DynamicMoELayerWrapper(nn.Module):
         self.prefetch_stream = torch.cuda.Stream(device=device) if device.type == "cuda" else None
 
         # ─── 7. Heterogeneous Compute-to-Data Engine (Fiddler + MoE-Gen) ───
-        # Job 1814 lesson: threshold=4 at B=1 starved C=12 slots (0.25% hits, 10.8s/tok)
-        # because 45MB/51GB/s=0.85ms DMA beats ~30ms CPU. Default to DMA-first (threshold=1:
-        # only single-token tail goes CPU), disable hetero for prefill (N>8), and retain
-        # frequent experts on GPU via expert_freq (freq>=3 -> GPU even if M small).
-        self.hetero_enabled = bool(getattr(config, "hetero_enabled", True)) if config is not None else True
+        # OPT-IN ONLY (default off): pre-experiment COLOSSUS behavior is DMA-only
+        # dynamic slots. Enable with config hetero_enabled=True for research runs.
+        self.hetero_enabled = bool(getattr(config, "hetero_enabled", False)) if config is not None else False
         self.cpu_token_threshold = int(getattr(config, "cpu_token_threshold", 1)) if config is not None else 1
         self.hetero_max_tokens = int(getattr(config, "hetero_max_tokens", 8)) if config is not None else 8
         self.hetero_freq_retain = int(getattr(config, "hetero_freq_retain", 3)) if config is not None else 3
