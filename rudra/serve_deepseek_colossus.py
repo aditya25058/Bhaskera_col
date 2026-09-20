@@ -130,7 +130,7 @@ class GlobalColumnPool:
     """
 
     def __init__(self, device: torch.device, dtype: torch.dtype, hidden: int, inter: int,
-                 block: int = 128, budget_gb: float = 8.0):
+                 block: int = 128, budget_gb: float = 8.0, evict_sample: int = 8):
         self.device = device
         self.dtype = dtype
         self.H = hidden
@@ -141,13 +141,16 @@ class GlobalColumnPool:
         self.per_block_bytes = 3 * self.B * hidden * elem
         self.budget_bytes = int(budget_gb * (1024 ** 3))
         self.cap = max(1, self.budget_bytes // self.per_block_bytes)
+        self.evict_sample = max(1, int(evict_sample))
         self.entries: Dict[tuple, List[torch.Tensor]] = {}
         self.freq: Dict[tuple, int] = {}
         self.stamp: Dict[tuple, int] = {}
+        self._keys: list = []  # parallel key list for O(1) random victim sampling
         self.tick = 0
         self.hits = 0
         self.misses = 0
         self.dma_bytes = 0
+        self.fast_path_whole = 0  # 0-hit whole-DMA assemblies (no block thrash)
 
     def reset_stats(self):
         self.hits = 0
@@ -155,45 +158,112 @@ class GlobalColumnPool:
         self.dma_bytes = 0
 
     def _evict_one(self):
-        victim = min(self.entries.keys(), key=lambda k: (self.freq.get(k, 0), self.stamp.get(k, 0)))
-        for t in self.entries.pop(victim):
+        # v2: O(1) sampled eviction (v1 scanned all ~2k entries per miss -> 70M Python ops).
+        n = len(self._keys)
+        if n == 0:
+            return
+        import random
+        k = self.evict_sample if n >= self.evict_sample else n
+        best_key = None
+        best_idx = -1
+        best_score = None
+        for idx in random.sample(range(n), k):
+            key = self._keys[idx]
+            score = (self.freq.get(key, 0), self.stamp.get(key, 0))
+            if best_score is None or score < best_score:
+                best_score = score
+                best_key = key
+                best_idx = idx
+        for t in self.entries.pop(best_key):
             del t
-        self.freq.pop(victim, None)
-        self.stamp.pop(victim, None)
+        self.freq.pop(best_key, None)
+        self.stamp.pop(best_key, None)
+        last = self._keys.pop()
+        if best_idx < len(self._keys):
+            self._keys[best_idx] = last
+
+    def _insert_block(self, key: tuple, g, u, d):
+        while len(self.entries) >= self.cap:
+            self._evict_one()
+        self.entries[key] = [g, u, d]
+        self._keys.append(key)
+        self.freq[key] = 1
+        self.stamp[key] = self.tick
 
     def _block_range(self, bi: int):
         s = bi * self.B
         return s, min(self.I, s + self.B)
 
-    def assemble(self, layer_idx: int, expert_id: int, masters, slot_mod, dma_stream) -> int:
-        """Assemble full expert weights into slot_mod from pool (hits) + DMA (misses).
-
-        masters: (Wg_full, Wu_full, Wd_full) CPU tensors. Returns DMA bytes moved.
-        Slot ends up holding the complete expert -> downstream forward is exact.
-        """
-        Wg_full, Wu_full, Wd_full = masters
-        moved = 0
+    def warm_experts(self, layer_idx: int, expert_ids, masters_fn, dma_stream):
+        """Prefill-seeded warmup: insert top recurring experts' blocks (decode-relevant)."""
         with torch.no_grad():
             with torch.cuda.stream(dma_stream):
-                for bi in range(self.nblocks):
-                    s, e = self._block_range(bi)
-                    key = (layer_idx, expert_id, bi)
-                    self.tick += 1
-                    ent = self.entries.get(key)
-                    if ent is None:
-                        while len(self.entries) >= self.cap:
-                            self._evict_one()
+                for expert_id in expert_ids:
+                    Wg_full, Wu_full, Wd_full = masters_fn(expert_id)
+                    for bi in range(self.nblocks):
+                        s, e = self._block_range(bi)
+                        key = (layer_idx, expert_id, bi)
+                        if key in self.entries:
+                            continue
+                        self.tick += 1
                         g = torch.empty((e - s, self.H), dtype=self.dtype, device=self.device)
                         u = torch.empty((e - s, self.H), dtype=self.dtype, device=self.device)
                         d = torch.empty((self.H, e - s), dtype=self.dtype, device=self.device)
                         g.copy_(Wg_full[s:e], non_blocking=True)
                         u.copy_(Wu_full[s:e], non_blocking=True)
                         d.copy_(Wd_full[:, s:e], non_blocking=True)
-                        self.entries[key] = [g, u, d]
-                        self.freq[key] = 1
-                        self.stamp[key] = self.tick
+                        self._insert_block(key, g, u, d)
                         self.misses += 1
-                        moved += int((g.nbytes + u.nbytes + d.nbytes))
+                        self.dma_bytes += int(g.nbytes + u.nbytes + d.nbytes)
+
+    def assemble(self, layer_idx: int, expert_id: int, masters, slot_mod, dma_stream) -> int:
+        """Assemble full expert weights into slot_mod from pool (hits) + DMA (misses).
+
+        v2 fast path: probe all block keys first (cheap dict lookups). Zero resident ->
+        single whole-expert DMA (3 copies) + HBM insert into pool, skipping 12x block
+        staged copies. Partial residency -> block path. Slot ends up complete -> exact.
+        """
+        Wg_full, Wu_full, Wd_full = masters
+        resident = [bi for bi in range(self.nblocks) if (layer_idx, expert_id, bi) in self.entries]
+        moved = 0
+        with torch.no_grad():
+            with torch.cuda.stream(dma_stream):
+                if not resident:
+                    # 0-hit fast path: whole DMA + HBM pool insert (no block thrash)
+                    slot_mod.gate_proj.weight.copy_(Wg_full, non_blocking=True)
+                    slot_mod.up_proj.weight.copy_(Wu_full, non_blocking=True)
+                    slot_mod.down_proj.weight.copy_(Wd_full, non_blocking=True)
+                    moved += int(Wg_full.nbytes + Wu_full.nbytes + Wd_full.nbytes)
+                    self.misses += self.nblocks
+                    self.fast_path_whole += 1
+                    for bi in range(self.nblocks):
+                        s, e = self._block_range(bi)
+                        self.tick += 1
+                        key = (layer_idx, expert_id, bi)
+                        g = torch.empty((e - s, self.H), dtype=self.dtype, device=self.device)
+                        u = torch.empty((e - s, self.H), dtype=self.dtype, device=self.device)
+                        d = torch.empty((self.H, e - s), dtype=self.dtype, device=self.device)
+                        g.copy_(slot_mod.gate_proj.weight[s:e], non_blocking=True)
+                        u.copy_(slot_mod.up_proj.weight[s:e], non_blocking=True)
+                        d.copy_(slot_mod.down_proj.weight[:, s:e], non_blocking=True)
+                        self._insert_block(key, g, u, d)
+                    self.dma_bytes += moved
+                    return moved
+                for bi in range(self.nblocks):
+                    s, e = self._block_range(bi)
+                    key = (layer_idx, expert_id, bi)
+                    self.tick += 1
+                    ent = self.entries.get(key)
+                    if ent is None:
+                        g = torch.empty((e - s, self.H), dtype=self.dtype, device=self.device)
+                        u = torch.empty((e - s, self.H), dtype=self.dtype, device=self.device)
+                        d = torch.empty((self.H, e - s), dtype=self.dtype, device=self.device)
+                        g.copy_(Wg_full[s:e], non_blocking=True)
+                        u.copy_(Wu_full[s:e], non_blocking=True)
+                        d.copy_(Wd_full[:, s:e], non_blocking=True)
+                        self._insert_block(key, g, u, d)
+                        self.misses += 1
+                        moved += int(g.nbytes + u.nbytes + d.nbytes)
                         ent = self.entries[key]
                     else:
                         self.freq[key] = self.freq.get(key, 0) + 1
@@ -392,6 +462,16 @@ class DeepSeekColossusMoEWrapper(nn.Module):
         """Pre-populates dynamic slots with initial experts."""
         for slot_idx, exp_id in enumerate(initial_experts[:self.capacity]):
             self._load_expert_to_slot(exp_id, slot_idx)
+
+    def warm_pool_from_freq(self, topk: int):
+        """Insert top recurring (prefill) experts' blocks into the column pool."""
+        if self.col_pool is None or topk <= 0 or not self.expert_freq:
+            return []
+        ranked = sorted(self.expert_freq.keys(), key=lambda e: -self.expert_freq[e])[:topk]
+        new_ids = [e for e in ranked if (self.layer_idx, e, 0) not in self.col_pool.entries]
+        if new_ids:
+            self.col_pool.warm_experts(self.layer_idx, new_ids, self._get_cpu_expert_weights, self.dma_stream)
+        return new_ids
 
     def _load_expert_to_slot(self, expert_id: int, slot_idx: int):
         slot_mod = self.slots[slot_idx]
@@ -762,6 +842,19 @@ def serve_deepseek(args):
     print(f"  Prefill Time : {t_prefill*1000:.2f} ms ({prefill_tps:.2f} tok/s)")
     sys.stdout.flush()
 
+    if args.col_pool_gb > 0 and args.col_warm_topk > 0:
+        t_warm = time.perf_counter()
+        warmed_layers = 0
+        for w in colossus_wrappers:
+            if w.warm_pool_from_freq(args.col_warm_topk):
+                warmed_layers += 1
+        torch.cuda.synchronize(dev0)
+        if args.num_gpus > 1:
+            torch.cuda.synchronize(dev1)
+        print(f"  ColPool warmup: top-{args.col_warm_topk} prefill-frequent experts/layer "
+              f"({warmed_layers} layers touched) in {(time.perf_counter() - t_warm) * 1000:.1f} ms")
+        sys.stdout.flush()
+
     generated_ids = torch.cat([generated_ids, next_token], dim=1)
 
     # 2. Decode Phase (Token-by-Token)
@@ -969,6 +1062,8 @@ if __name__ == "__main__":
                         help="Experiment C: GlobalColumnPool VRAM budget in GB (0=disabled). GPU-only column-LFU.")
     parser.add_argument("--col_block", type=int, default=128,
                         help="Column-block width (intermediate-dim cols) for pool transfers/GEMM slices")
+    parser.add_argument("--col_warm_topk", type=int, default=4,
+                        help="Prefill-seeded warmup: top recurring experts/layer into pool (0=disabled)")
 
     parser.add_argument("--use_cache", action="store_true", default=True)
     parser.add_argument("--no_cache", dest="use_cache", action="store_false")
