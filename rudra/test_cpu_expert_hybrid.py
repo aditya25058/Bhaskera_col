@@ -182,8 +182,6 @@ class HybridDeepSeekMoE(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         orig_shape = hidden_states.shape
-        flat_x = hidden_states.view(-1, H)
-        
         # 1. Router & Shared Expert
         topk_idx, topk_weight, _ = self.gate(hidden_states)
         shared_out = self.shared_experts(hidden_states)
@@ -192,49 +190,58 @@ class HybridDeepSeekMoE(nn.Module):
         flat_topk = topk_idx.view(-1)
         
         # Identify hits vs misses
-        gpu_hits = [e for e in needed if e in self.expert_to_slot]
+        gpu_hits = set([e for e in needed if e in self.expert_to_slot])
         miss_ids = [e for e in needed if e not in self.expert_to_slot]
         
         # Split misses into CPU fallback vs GPU slots
-        cpu_ids = []
-        gpu_load_ids = []
+        cpu_ids = set()
         for e in miss_ids:
             tok_count = (flat_topk == e).sum().item()
             if tok_count <= self.cpu_token_threshold:
-                cpu_ids.append(e)
+                cpu_ids.add(e)
             else:
-                gpu_load_ids.append(e)
+                self.misses += 1
+                slot_idx = self.slot_lru.pop(0)
+                self._load_expert_weights(e, slot_idx)
+                self.slot_lru.append(slot_idx)
+                gpu_hits.add(e)
 
-        # 2. Compute CPU fallback experts (No 45MB weight DMA!)
-        y_cpu = torch.zeros_like(flat_x)
-        for e in cpu_ids:
-            self.cpu_dispatches += 1
-            mask = (topk_idx == e)
-            tok_idx = mask.any(dim=-1).nonzero().view(-1)
-            if tok_idx.numel() == 0:
+        # Exact DeepSeek token sorting
+        cnts = topk_idx.new_zeros((topk_idx.shape[0], routed_experts))
+        cnts.scatter_(1, topk_idx, 1)
+        tokens_per_expert = cnts.sum(dim=0).cpu().numpy()
+        idxs = topk_idx.view(-1).argsort()
+        flat_x = hidden_states.view(-1, H)
+        sorted_tokens = flat_x[idxs // topk_idx.shape[1]]
+
+        outputs = []
+        start_idx = 0
+        for i, num_tokens in enumerate(tokens_per_expert):
+            end_idx = start_idx + num_tokens
+            if num_tokens == 0:
                 continue
-            toks_for_e = flat_x[tok_idx]
-            out_e = self._cpu_expert_exec(e, toks_for_e)
-            
-            w = (topk_weight[tok_idx] * mask[tok_idx].to(topk_weight.dtype)).sum(dim=-1, keepdim=True)
-            y_cpu.index_add_(0, tok_idx, (out_e * w).to(flat_x.dtype))
+            toks_this = sorted_tokens[start_idx:end_idx]
+            if i in cpu_ids:
+                self.cpu_dispatches += 1
+                out_this = self._cpu_expert_exec(i, toks_this)
+            else:
+                self.gpu_hits += 1
+                slot_idx = self.expert_to_slot[i]
+                out_this = self.slots[slot_idx](toks_this)
+            outputs.append(out_this)
+            start_idx = end_idx
 
-        # 3. Compute GPU resident experts
-        y_gpu = torch.zeros_like(flat_x)
-        for e in gpu_hits:
-            self.gpu_hits += 1
-            slot_idx = self.expert_to_slot[e]
-            expert = self.slots[slot_idx]
-            mask = (topk_idx == e)
-            tok_idx = mask.any(dim=-1).nonzero().view(-1)
-            if tok_idx.numel() == 0:
-                continue
-            toks_for_e = flat_x[tok_idx]
-            out_e = expert(toks_for_e)
-            w = (topk_weight[tok_idx] * mask[tok_idx].to(topk_weight.dtype)).sum(dim=-1, keepdim=True)
-            y_gpu.index_add_(0, tok_idx, (out_e * w).to(flat_x.dtype))
-
-        return shared_out + (y_gpu + y_cpu).view(*orig_shape)
+        outs = torch.cat(outputs, dim=0) if len(outputs) else sorted_tokens.new_empty(0)
+        new_x = torch.empty_like(outs)
+        new_x[idxs] = outs
+        final_out = (
+            new_x.view(*topk_idx.shape, -1)
+            .type(topk_weight.dtype)
+            .mul_(topk_weight.unsqueeze(dim=-1))
+            .sum(dim=1)
+            .type(new_x.dtype)
+        )
+        return shared_out + final_out.view(*orig_shape)
 
 print("\n[2] Initializing Hybrid MoE Engine with 50% Simulated Hits & 50% CPU Fallback...")
 hyb_moe = HybridDeepSeekMoE(native_layer, device=dev, capacity=12)
