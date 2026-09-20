@@ -122,7 +122,27 @@ class DeepSeekColossusMoEWrapper(nn.Module):
     - Permanently resident: Gate, Shared Experts on GPU HBM.
     - Dynamic pool: C dynamic slots allocated on GPU HBM.
     - Cold experts: Streamed over PCIe Gen5 on demand from mmapped host handles.
+    - Phase 1b: optional pinned staging (class-shared, ~90MB host) so DMA runs
+      pinned->HBM at full link rate instead of mmap-source staged ~6GB/s.
     """
+    # Phase 1b: class-shared pinned staging triple (~90MB host for I=1536/H=5120).
+    # mmap (pageable) source -> cudaMemcpyAsync runs driver-staged at ~6GB/s;
+    # pinned source -> true async DMA at link rate. One triple shared by all layers
+    # (layers execute sequentially in decode; prefill reuses across layers in order).
+    _pinned_staging = None
+    _pinned_staging_key = None
+
+    @classmethod
+    def _get_pinned_staging(cls, inter: int, hidden: int, dtype: torch.dtype):
+        key = (inter, hidden, str(dtype))
+        if cls._pinned_staging is None or cls._pinned_staging_key != key:
+            g = torch.empty((inter, hidden), dtype=dtype, device="cpu", pin_memory=True)
+            u = torch.empty((inter, hidden), dtype=dtype, device="cpu", pin_memory=True)
+            d = torch.empty((hidden, inter), dtype=dtype, device="cpu", pin_memory=True)
+            cls._pinned_staging = (g, u, d)
+            cls._pinned_staging_key = key
+        return cls._pinned_staging
+
     def __init__(
         self,
         layer_idx: int,
@@ -136,6 +156,7 @@ class DeepSeekColossusMoEWrapper(nn.Module):
         zssr_prefetch: bool = False,
         prefetch_topk: int = 8,
         coalesced_dma: bool = False,
+        pinned_staging: bool = True,
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -150,6 +171,7 @@ class DeepSeekColossusMoEWrapper(nn.Module):
         self.zssr_enabled = bool(zssr_prefetch)
         self.prefetch_topk = int(prefetch_topk)
         self.coalesced = bool(coalesced_dma)
+        self.pinned_staging = bool(pinned_staging)
         self.top_k = int(getattr(cfg, "num_experts_per_tok", 6))
         self.n_routed = int(getattr(cfg, "n_routed_experts", 160))
 
@@ -240,10 +262,21 @@ class DeepSeekColossusMoEWrapper(nn.Module):
 
         ev_s = self._dma_begin() if (record and self.device.type == "cuda") else None
         with torch.no_grad():
+            if self.pinned_staging and self.device.type == "cuda":
+                # Phase 1b: mmap -> pinned staging (fast CPU memcpy), then pinned
+                # -> HBM at link rate. Event covers the DMA leg only.
+                st_g, st_u, st_d = self._get_pinned_staging(
+                    t_gate.shape[0], t_gate.shape[1], t_gate.dtype)
+                st_g.copy_(t_gate)
+                st_u.copy_(t_up)
+                st_d.copy_(t_down)
+                src_g, src_u, src_d = st_g, st_u, st_d
+            else:
+                src_g, src_u, src_d = t_gate, t_up, t_down
             with torch.cuda.stream(self.dma_stream):
-                slot_mod.gate_proj.weight.copy_(t_gate, non_blocking=True)
-                slot_mod.up_proj.weight.copy_(t_up, non_blocking=True)
-                slot_mod.down_proj.weight.copy_(t_down, non_blocking=True)
+                slot_mod.gate_proj.weight.copy_(src_g, non_blocking=True)
+                slot_mod.up_proj.weight.copy_(src_u, non_blocking=True)
+                slot_mod.down_proj.weight.copy_(src_d, non_blocking=True)
 
         if slot_idx in self.slot_to_expert:
             old_exp = self.slot_to_expert[slot_idx]
@@ -496,6 +529,7 @@ def serve_deepseek(args):
             zssr_prefetch=args.zssr_prefetch,
             prefetch_topk=args.prefetch_topk,
             coalesced_dma=args.coalesced_dma,
+            pinned_staging=args.pinned_staging,
         )
 
         if args.warm_slots:
@@ -794,6 +828,7 @@ def serve_deepseek(args):
         "zssr_prefetch": bool(args.zssr_prefetch),
         "prefetch_topk": int(args.prefetch_topk),
         "coalesced_dma": bool(args.coalesced_dma),
+        "pinned_staging": bool(args.pinned_staging),
         "zssr_predictions": total_zp,
         "zssr_correct": total_zc,
         "zssr_recall_pct": recall,
@@ -834,6 +869,10 @@ if __name__ == "__main__":
                         help="Top-K experts to prefetch per layer entrance (K=6 routing + margin)")
     parser.add_argument("--coalesced-dma", dest="coalesced_dma", action="store_true", default=False,
                         help="Single timing group per layer prefetch burst (few large DMAs)")
+    parser.add_argument("--pinned_staging", action="store_true", default=True,
+                        help="Phase 1b: stage mmap weights through shared pinned host buffer")
+    parser.add_argument("--no_pinned_staging", dest="pinned_staging", action="store_false",
+                        help="Opt out: DMA directly from mmap handles (~6GB/s staged)")
 
 
     parser.add_argument("--use_cache", action="store_true", default=True)
