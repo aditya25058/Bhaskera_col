@@ -116,188 +116,12 @@ class FastExpertSlot(nn.Module):
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
-class GlobalColumnPool:
-    """GPU-only column-block cache keyed (layer, expert, block). Plain LFU + recency tiebreak.
-
-    Physical unit is a column block (default 128 cols of intermediate dim) so every
-    transfer (PCIe DMA) and every operand (GEMM slice) stays contiguous.
-    Logical granularity stays column-level; residency/execution are fine-grained:
-      hit  -> HBM entry -> slot slice (no PCIe, GPU computes)
-      miss -> DMA master slice -> pool entry -> slot slice (PCIe once), GPU computes
-    Assembly fills a full slot, so compute stays expert-granular (one GEMM, exact).
-    No CPU execution anywhere. Capacity derives from an explicit VRAM budget:
-      cap_blocks = budget_bytes / bytes_per_block.
-    """
-
-    def __init__(self, device: torch.device, dtype: torch.dtype, hidden: int, inter: int,
-                 block: int = 128, budget_gb: float = 8.0, evict_sample: int = 8):
-        self.device = device
-        self.dtype = dtype
-        self.H = hidden
-        self.I = inter
-        self.B = max(1, int(block))
-        self.nblocks = (inter + self.B - 1) // self.B
-        elem = torch.tensor([], dtype=dtype).element_size()
-        self.per_block_bytes = 3 * self.B * hidden * elem
-        self.budget_bytes = int(budget_gb * (1024 ** 3))
-        self.cap = max(1, self.budget_bytes // self.per_block_bytes)
-        self.evict_sample = max(1, int(evict_sample))
-        self.entries: Dict[tuple, List[torch.Tensor]] = {}
-        self.freq: Dict[tuple, int] = {}
-        self.stamp: Dict[tuple, int] = {}
-        self._keys: list = []  # parallel key list for O(1) random victim sampling
-        self.tick = 0
-        self.hits = 0
-        self.misses = 0
-        self.dma_bytes = 0
-        self.fast_path_whole = 0  # 0-hit whole-DMA assemblies (no block thrash)
-        self.bypassed = 0  # v3: one-touch blocks refused admission (scan resistance)
-
-    def reset_stats(self):
-        self.hits = 0
-        self.misses = 0
-        self.dma_bytes = 0
-        self.fast_path_whole = 0
-        self.bypassed = 0
-
-    def _evict_one(self):
-        # v2: O(1) sampled eviction (v1 scanned all ~2k entries per miss -> 70M Python ops).
-        n = len(self._keys)
-        if n == 0:
-            return
-        import random
-        k = self.evict_sample if n >= self.evict_sample else n
-        best_key = None
-        best_idx = -1
-        best_score = None
-        for idx in random.sample(range(n), k):
-            key = self._keys[idx]
-            score = (self.freq.get(key, 0), self.stamp.get(key, 0))
-            if best_score is None or score < best_score:
-                best_score = score
-                best_key = key
-                best_idx = idx
-        for t in self.entries.pop(best_key):
-            del t
-        self.freq.pop(best_key, None)
-        self.stamp.pop(best_key, None)
-        last = self._keys.pop()
-        if best_idx < len(self._keys):
-            self._keys[best_idx] = last
-
-    def _insert_block(self, key: tuple, g, u, d):
-        while len(self.entries) >= self.cap:
-            self._evict_one()
-        self.entries[key] = [g, u, d]
-        self._keys.append(key)
-        self.freq[key] = 1
-        self.stamp[key] = self.tick
-
-    def _block_range(self, bi: int):
-        s = bi * self.B
-        return s, min(self.I, s + self.B)
-
-    def warm_experts(self, layer_idx: int, expert_ids, masters_fn, dma_stream):
-        """Prefill-seeded warmup: insert top recurring experts' blocks (decode-relevant)."""
-        with torch.no_grad():
-            with torch.cuda.stream(dma_stream):
-                for expert_id in expert_ids:
-                    Wg_full, Wu_full, Wd_full = masters_fn(expert_id)
-                    for bi in range(self.nblocks):
-                        s, e = self._block_range(bi)
-                        key = (layer_idx, expert_id, bi)
-                        if key in self.entries:
-                            continue
-                        self.tick += 1
-                        g = torch.empty((e - s, self.H), dtype=self.dtype, device=self.device)
-                        u = torch.empty((e - s, self.H), dtype=self.dtype, device=self.device)
-                        d = torch.empty((self.H, e - s), dtype=self.dtype, device=self.device)
-                        g.copy_(Wg_full[s:e], non_blocking=True)
-                        u.copy_(Wu_full[s:e], non_blocking=True)
-                        d.copy_(Wd_full[:, s:e], non_blocking=True)
-                        self._insert_block(key, g, u, d)
-                        self.misses += 1
-                        self.dma_bytes += int(g.nbytes + u.nbytes + d.nbytes)
-
-    def assemble(self, layer_idx: int, expert_id: int, masters, slot_mod, dma_stream, admit: bool = True) -> int:
-        """Assemble full expert weights into slot_mod from pool (hits) + DMA (misses).
-
-        v2 fast path: probe all block keys first (cheap dict lookups). Zero resident ->
-        single whole-expert DMA (3 copies) + HBM pool insert, skipping 12x block
-        staged copies. Partial residency -> block path. Slot ends up complete -> exact.
-        v3 admission: one-touch experts (admit=False) get whole DMA with NO pool
-        insert, so scan traffic can't churn recurring blocks out (TinyLFU-style).
-        """
-        Wg_full, Wu_full, Wd_full = masters
-        resident = [bi for bi in range(self.nblocks) if (layer_idx, expert_id, bi) in self.entries]
-        moved = 0
-        with torch.no_grad():
-            with torch.cuda.stream(dma_stream):
-                if not resident:
-                    # 0-hit fast path: whole DMA + HBM pool insert (no block thrash)
-                    slot_mod.gate_proj.weight.copy_(Wg_full, non_blocking=True)
-                    slot_mod.up_proj.weight.copy_(Wu_full, non_blocking=True)
-                    slot_mod.down_proj.weight.copy_(Wd_full, non_blocking=True)
-                    moved += int(Wg_full.nbytes + Wu_full.nbytes + Wd_full.nbytes)
-                    self.misses += self.nblocks
-                    self.fast_path_whole += 1
-                    if admit:
-                        for bi in range(self.nblocks):
-                            s, e = self._block_range(bi)
-                            self.tick += 1
-                            key = (layer_idx, expert_id, bi)
-                            g = torch.empty((e - s, self.H), dtype=self.dtype, device=self.device)
-                            u = torch.empty((e - s, self.H), dtype=self.dtype, device=self.device)
-                            d = torch.empty((self.H, e - s), dtype=self.dtype, device=self.device)
-                            g.copy_(slot_mod.gate_proj.weight[s:e], non_blocking=True)
-                            u.copy_(slot_mod.up_proj.weight[s:e], non_blocking=True)
-                            d.copy_(slot_mod.down_proj.weight[:, s:e], non_blocking=True)
-                            self._insert_block(key, g, u, d)
-                    else:
-                        self.bypassed += self.nblocks
-                    self.dma_bytes += moved
-                    return moved
-                for bi in range(self.nblocks):
-                    s, e = self._block_range(bi)
-                    key = (layer_idx, expert_id, bi)
-                    self.tick += 1
-                    ent = self.entries.get(key)
-                    if ent is None:
-                        g = torch.empty((e - s, self.H), dtype=self.dtype, device=self.device)
-                        u = torch.empty((e - s, self.H), dtype=self.dtype, device=self.device)
-                        d = torch.empty((self.H, e - s), dtype=self.dtype, device=self.device)
-                        g.copy_(Wg_full[s:e], non_blocking=True)
-                        u.copy_(Wu_full[s:e], non_blocking=True)
-                        d.copy_(Wd_full[:, s:e], non_blocking=True)
-                        self._insert_block(key, g, u, d)
-                        self.misses += 1
-                        moved += int(g.nbytes + u.nbytes + d.nbytes)
-                        ent = self.entries[key]
-                    else:
-                        self.freq[key] = self.freq.get(key, 0) + 1
-                        self.stamp[key] = self.tick
-                        self.hits += 1
-                    g, u, d = ent
-                    slot_mod.gate_proj.weight[s:e].copy_(g, non_blocking=True)
-                    slot_mod.up_proj.weight[s:e].copy_(u, non_blocking=True)
-                    slot_mod.down_proj.weight[:, s:e].copy_(d, non_blocking=True)
-        self.dma_bytes += moved
-        return moved
-
-
 class DeepSeekColossusMoEWrapper(nn.Module):
     """
-    Dynamic Slot Residency MoE Wrapper with Heterogeneous Compute-to-Data Engine
-    + ADETR per-slot column streaming (COLOSSUS column-level reunification):
+    Dynamic Slot Residency MoE Wrapper:
     - Permanently resident: Gate, Shared Experts on GPU HBM.
     - Dynamic pool: C dynamic slots allocated on GPU HBM.
-    - Whole-expert (adetr_ratio=1.0): stream full 45MB expert into slot (scaffold).
-    - Column-level (adetr_ratio<1.0): split intermediate dim into hot columns
-      (CPU, zero weight movement, 10KB activation) + cold columns (DMA into slot
-      slices, GPU computes y_cold). y = y_hot + y_cold, bitwise exact SA-FFN.
-      No permanent 216GB hot table: residency lives per-slot, streaming per-miss.
-    - Cold experts with small token load (M <= cpu_token_threshold):
-      Directly evaluated on CPU via AVX-512 in native BF16 without PCIe weight DMA.
+    - Cold experts: Streamed over PCIe Gen5 on demand from mmapped host handles.
     """
     def __init__(
         self,
@@ -309,11 +133,6 @@ class DeepSeekColossusMoEWrapper(nn.Module):
         handles: Dict[str, any],
         weight_map: Dict[str, str],
         dma_stream: torch.cuda.Stream,
-        enable_hetero: bool = False,
-        cpu_token_threshold: int = 1,
-        adetr_ratio: float = 1.0,
-        col_pool=None,
-        col_admit_freq: int = 2,
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -323,11 +142,6 @@ class DeepSeekColossusMoEWrapper(nn.Module):
         self.handles = handles
         self.weight_map = weight_map
         self.dma_stream = dma_stream
-        self.enable_hetero = enable_hetero
-        self.cpu_token_threshold = cpu_token_threshold
-        self.adetr_ratio = float(adetr_ratio)
-        self.col_pool = col_pool
-        self.col_admit_freq = int(col_admit_freq)
 
         # Resident modules on GPU
         self.gate = moe_module.gate
@@ -342,150 +156,32 @@ class DeepSeekColossusMoEWrapper(nn.Module):
         self.slot_to_expert: Dict[int, int] = {}
         self.expert_to_slot: Dict[int, int] = {}
         self.slot_lru: List[int] = list(range(capacity))
-        self.slot_col_partial: Dict[int, bool] = {}
 
-        # Heterogeneous activation streaming buffers
-        self.max_cpu_batch = 64
-        self.cpu_act_in = torch.empty((self.max_cpu_batch, cfg.hidden_size), dtype=torch.bfloat16, pin_memory=True)
-        self.cpu_act_out = torch.empty((self.max_cpu_batch, cfg.hidden_size), dtype=torch.bfloat16, pin_memory=True)
-        self.act_stream = torch.cuda.Stream(device=device)
-        self.cpu_expert_weights: Dict[int, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
 
         # Metrics
         self.hits = 0
         self.misses = 0
-        self.cpu_dispatches = 0
-        self.adetr_col_dispatches = 0
         self.dma_bytes = 0
-        self.expert_freq: Dict[int, int] = {}
-        self.hetero_max_tokens = 8
-        self.hetero_freq_retain = 3
-
-    def _get_cpu_expert_weights(self, expert_id: int):
-        if expert_id not in self.cpu_expert_weights:
-            pfx = f"model.layers.{self.layer_idx}.mlp.experts.{expert_id}"
-            k_gate = f"{pfx}.gate_proj.weight"
-            k_up = f"{pfx}.up_proj.weight"
-            k_down = f"{pfx}.down_proj.weight"
-
-            shard_gate = self.weight_map[k_gate]
-            shard_up = self.weight_map[k_up]
-            shard_down = self.weight_map[k_down]
-
-            t_gate = self.handles[shard_gate].get_tensor(k_gate)
-            t_up = self.handles[shard_up].get_tensor(k_up)
-            t_down = self.handles[shard_down].get_tensor(k_down)
-            self.cpu_expert_weights[expert_id] = (t_gate, t_up, t_down)
-        return self.cpu_expert_weights[expert_id]
-
-    def _cpu_expert_exec(self, expert_id: int, toks_gpu: torch.Tensor) -> torch.Tensor:
-        """Executes cold expert on CPU in native BF16, streaming activations over PCIe."""
-        M = toks_gpu.shape[0]
-        if M > self.max_cpu_batch:
-            self.max_cpu_batch = M
-            self.cpu_act_in = torch.empty((self.max_cpu_batch, self.cfg.hidden_size), dtype=torch.bfloat16, pin_memory=True)
-            self.cpu_act_out = torch.empty((self.max_cpu_batch, self.cfg.hidden_size), dtype=torch.bfloat16, pin_memory=True)
-
-        with torch.cuda.stream(self.act_stream):
-            self.cpu_act_in[:M].copy_(toks_gpu, non_blocking=True)
-        self.act_stream.synchronize()
-
-        Wg, Wu, Wd = self._get_cpu_expert_weights(expert_id)
-        toks_cpu = self.cpu_act_in[:M]
-
-        with torch.no_grad():
-            h_g = F.linear(toks_cpu, Wg)
-            h_u = F.linear(toks_cpu, Wu)
-            act = F.silu(h_g) * h_u
-            y = F.linear(act, Wd)
-            self.cpu_act_out[:M].copy_(y)
-
-        out = torch.empty_like(toks_gpu)
-        with torch.cuda.stream(self.act_stream):
-            out.copy_(self.cpu_act_out[:M], non_blocking=True)
-        torch.cuda.current_stream(self.device).wait_stream(self.act_stream)
-        return out
-
-    def _adetr_column_exec(self, expert_id: int, slot_idx: int, toks_gpu: torch.Tensor, skip_dma: bool = False) -> torch.Tensor:
-        """ADETR per-slot column split (COLOSSUS column-level, exact SA-FFN).
-
-        Splits intermediate dim I into hot columns (CPU, zero weight movement)
-        + cold columns (DMA into slot slices, GPU computes y_cold).
-        y = y_hot + y_cold == native full-expert output.
-        DMA per miss = adetr_ratio * 45MB (0.5 -> 22.5MB, 0.25 -> 11.25MB).
-        No permanent hot table: residency lives per-slot, streaming per-miss.
-        """
-        Wg_full, Wu_full, Wd_full = self._get_cpu_expert_weights(expert_id)
-        I = Wg_full.shape[0]
-        i_cold = max(1, int(I * self.adetr_ratio))
-        i_hot = I - i_cold
-        slot_mod = self.slots[slot_idx]
-        M = toks_gpu.shape[0]
-
-        # 1. DMA cold slices only into slot (gate/up rows, down cols).
-        # skip_dma=True when slot already holds this expert's cold slices (column-hit reuse).
-        if not skip_dma:
-            with torch.no_grad():
-                with torch.cuda.stream(self.dma_stream):
-                    slot_mod.gate_proj.weight[i_hot:].copy_(Wg_full[i_hot:], non_blocking=True)
-                    slot_mod.up_proj.weight[i_hot:].copy_(Wu_full[i_hot:], non_blocking=True)
-                    slot_mod.down_proj.weight[:, i_hot:].copy_(Wd_full[:, i_hot:], non_blocking=True)
-            torch.cuda.current_stream(self.device).wait_stream(self.dma_stream)
-            self.dma_bytes += int((Wg_full[i_hot:].nbytes + Wu_full[i_hot:].nbytes + Wd_full[:, i_hot:].nbytes))
-
-        # 2. GPU cold partial from slot slices
-        with torch.no_grad():
-            h_g_c = F.linear(toks_gpu, slot_mod.gate_proj.weight[i_hot:])
-            h_u_c = F.linear(toks_gpu, slot_mod.up_proj.weight[i_hot:])
-            y_cold = F.linear(F.silu(h_g_c) * h_u_c, slot_mod.down_proj.weight[:, i_hot:])
-
-        # 3. CPU hot partial (weights stay in DDR5; only 10KB activation moves)
-        if M > self.max_cpu_batch:
-            self.max_cpu_batch = M
-            self.cpu_act_in = torch.empty((self.max_cpu_batch, self.cfg.hidden_size), dtype=torch.bfloat16, pin_memory=True)
-            self.cpu_act_out = torch.empty((self.max_cpu_batch, self.cfg.hidden_size), dtype=torch.bfloat16, pin_memory=True)
-        with torch.cuda.stream(self.act_stream):
-            self.cpu_act_in[:M].copy_(toks_gpu, non_blocking=True)
-        self.act_stream.synchronize()
-        with torch.no_grad():
-            x_cpu = self.cpu_act_in[:M]
-            y_hot = F.linear(F.silu(F.linear(x_cpu, Wg_full[:i_hot])) * F.linear(x_cpu, Wu_full[:i_hot]), Wd_full[:, :i_hot])
-            self.cpu_act_out[:M].copy_(y_hot)
-        y_hot_gpu = torch.empty_like(toks_gpu)
-        with torch.cuda.stream(self.act_stream):
-            y_hot_gpu.copy_(self.cpu_act_out[:M], non_blocking=True)
-        torch.cuda.current_stream(self.device).wait_stream(self.act_stream)
-
-        # 4. Bind slot to this expert. Hot region is stale by design: record partial
-        # so future hits reuse cold slices (skip_dma) instead of full-slot forward.
-        if not skip_dma:
-            if slot_idx in self.slot_to_expert:
-                old_exp = self.slot_to_expert[slot_idx]
-                self.expert_to_slot.pop(old_exp, None)
-            self.slot_to_expert[slot_idx] = expert_id
-            self.expert_to_slot[expert_id] = slot_idx
-            self.slot_col_partial[slot_idx] = True
-        self.adetr_col_dispatches += 1
-        return (y_hot_gpu + y_cold).to(toks_gpu.dtype)
 
     def warm_up_slots(self, initial_experts: List[int]):
         """Pre-populates dynamic slots with initial experts."""
         for slot_idx, exp_id in enumerate(initial_experts[:self.capacity]):
             self._load_expert_to_slot(exp_id, slot_idx)
 
-    def warm_pool_from_freq(self, topk: int):
-        """Insert top recurring (prefill) experts' blocks into the column pool."""
-        if self.col_pool is None or topk <= 0 or not self.expert_freq:
-            return []
-        ranked = sorted(self.expert_freq.keys(), key=lambda e: -self.expert_freq[e])[:topk]
-        new_ids = [e for e in ranked if (self.layer_idx, e, 0) not in self.col_pool.entries]
-        if new_ids:
-            self.col_pool.warm_experts(self.layer_idx, new_ids, self._get_cpu_expert_weights, self.dma_stream)
-        return new_ids
-
     def _load_expert_to_slot(self, expert_id: int, slot_idx: int):
         slot_mod = self.slots[slot_idx]
-        t_gate, t_up, t_down = self._get_cpu_expert_weights(expert_id)
+        pfx = f"model.layers.{self.layer_idx}.mlp.experts.{expert_id}"
+        k_gate = f"{pfx}.gate_proj.weight"
+        k_up = f"{pfx}.up_proj.weight"
+        k_down = f"{pfx}.down_proj.weight"
+
+        shard_gate = self.weight_map[k_gate]
+        shard_up = self.weight_map[k_up]
+        shard_down = self.weight_map[k_down]
+
+        t_gate = self.handles[shard_gate].get_tensor(k_gate)
+        t_up = self.handles[shard_up].get_tensor(k_up)
+        t_down = self.handles[shard_down].get_tensor(k_down)
 
         with torch.no_grad():
             with torch.cuda.stream(self.dma_stream):
@@ -493,13 +189,13 @@ class DeepSeekColossusMoEWrapper(nn.Module):
                 slot_mod.up_proj.weight.copy_(t_up, non_blocking=True)
                 slot_mod.down_proj.weight.copy_(t_down, non_blocking=True)
 
+
         if slot_idx in self.slot_to_expert:
             old_exp = self.slot_to_expert[slot_idx]
             self.expert_to_slot.pop(old_exp, None)
 
         self.slot_to_expert[slot_idx] = expert_id
         self.expert_to_slot[expert_id] = slot_idx
-        self.slot_col_partial[slot_idx] = False
         self.dma_bytes += (t_gate.nbytes + t_up.nbytes + t_down.nbytes)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -509,59 +205,30 @@ class DeepSeekColossusMoEWrapper(nn.Module):
         # 1. Gate routing (returns topk_idx, topk_weight, aux_loss)
         topk_indices, topk_weights, _ = self.gate(hidden_states)
         needed_experts = topk_indices.unique().tolist()
-        flat_topk = topk_indices.view(-1)
 
         # 2. Compute shared experts (permanently resident)
         shared_out = self.shared_experts(identity)
 
         # 3. Dynamic Slot Management & Expert Streaming
-        gpu_hits = set([e for e in needed_experts if e in self.expert_to_slot])
-        miss_ids = [e for e in needed_experts if e not in self.expert_to_slot]
+        # Fast path for single-token decode (needed_experts <= capacity): batch-stream all missing experts
+        if len(needed_experts) <= self.capacity:
+            # First, update LRU for resident hits to protect them from eviction!
+            for exp_id in needed_experts:
+                if exp_id in self.expert_to_slot:
+                    self.hits += 1
+                    slot_idx = self.expert_to_slot[exp_id]
+                    self.slot_lru.remove(slot_idx)
+                    self.slot_lru.append(slot_idx)
 
-        # Protect resident hits in LRU
-        for exp_id in gpu_hits:
-            self.hits += 1
-            slot_idx = self.expert_to_slot[exp_id]
-            self.slot_lru.remove(slot_idx)
-            self.slot_lru.append(slot_idx)
+            missing_experts = [e for e in needed_experts if e not in self.expert_to_slot]
+            if missing_experts:
+                for exp_id in missing_experts:
+                    self.misses += 1
+                    slot_idx = self.slot_lru.pop(0)
+                    self._load_expert_to_slot(exp_id, slot_idx)
+                    self.slot_lru.append(slot_idx)
+                torch.cuda.current_stream(self.device).wait_stream(self.dma_stream)
 
-        cpu_ids = set()
-        gpu_misses = []
-        # Job 1814 fix: freq-aware retention + prefill guard. Frequent experts (seen>=3)
-        # stay on GPU even if M small; prefill (N>8) never goes CPU (fixes 67s prefill).
-        n_tokens = flat_topk.numel() // max(1, topk_indices.shape[-1])
-        use_hetero = self.enable_hetero and n_tokens <= self.hetero_max_tokens
-        for _e in needed_experts:
-            self.expert_freq[_e] = self.expert_freq.get(_e, 0) + 1
-        if use_hetero:
-            for exp_id in miss_ids:
-                tok_count = (flat_topk == exp_id).sum().item()
-                if tok_count <= self.cpu_token_threshold and self.expert_freq.get(exp_id, 0) < self.hetero_freq_retain:
-                    cpu_ids.add(exp_id)
-                else:
-                    gpu_misses.append(exp_id)
-        else:
-            gpu_misses = miss_ids
-
-        # ADETR column-level: all misses go through per-slot hot/cold split
-        # (supersedes hetero full-CPU path; hot half stays in DDR5, cold half DMA'd).
-        # Global column pool (Experiment C): GPU-only, supersedes both paths above.
-        use_adetr = self.adetr_ratio < 1.0
-        use_pool = self.col_pool is not None
-        adetr_ids = set(miss_ids) if (use_adetr and not use_pool) else set()
-        pool_ids = set(miss_ids) if use_pool else set()
-        if use_pool:
-            cpu_ids.clear()
-            gpu_misses = []
-
-        # Stream heavy misses into GPU slots
-        if gpu_misses:
-            for exp_id in gpu_misses:
-                self.misses += 1
-                slot_idx = self.slot_lru.pop(0)
-                self._load_expert_to_slot(exp_id, slot_idx)
-                self.slot_lru.append(slot_idx)
-            torch.cuda.current_stream(self.device).wait_stream(self.dma_stream)
 
         # 4. Compute routed experts
         cnts = topk_indices.new_zeros((topk_indices.shape[0], self.cfg.n_routed_experts))
@@ -578,54 +245,27 @@ class DeepSeekColossusMoEWrapper(nn.Module):
             if num_tokens == 0:
                 continue
 
-            tokens_for_this = sorted_tokens[start_idx:end_idx]
-            if i in cpu_ids:
-                self.cpu_dispatches += 1
-                out_this = self._cpu_expert_exec(i, tokens_for_this)
-            elif i in pool_ids:
+            if i in self.expert_to_slot:
+                slot_idx = self.expert_to_slot[i]
+                if len(needed_experts) > self.capacity:
+                    self.hits += 1
+                    self.slot_lru.remove(slot_idx)
+                    self.slot_lru.append(slot_idx)
+            else:
+                # On-demand load for multi-token prefill where needed_experts > capacity
                 self.misses += 1
                 slot_idx = self.slot_lru.pop(0)
-                # v3/v4: admit only recurring experts (freq>=threshold); one-touch bypasses pool.
-                # Larger --col_block also coalesces: fewer, bigger transfers per miss.
-                admit = self.expert_freq.get(i, 0) >= self.col_admit_freq
-                moved = self.col_pool.assemble(
-                    self.layer_idx, i, self._get_cpu_expert_weights(i),
-                    self.slots[slot_idx], self.dma_stream, admit=admit)
-                self.dma_bytes += moved
-                if slot_idx in self.slot_to_expert:
-                    self.expert_to_slot.pop(self.slot_to_expert[slot_idx], None)
-                self.slot_to_expert[slot_idx] = i
-                self.expert_to_slot[i] = slot_idx
-                self.slot_col_partial[slot_idx] = False
+                self._load_expert_to_slot(i, slot_idx)
                 self.slot_lru.append(slot_idx)
                 torch.cuda.current_stream(self.device).wait_stream(self.dma_stream)
-                out_this = self.slots[slot_idx](tokens_for_this)
-            elif i in adetr_ids:
-                self.misses += 1
-                slot_idx = self.slot_lru.pop(0)
-                out_this = self._adetr_column_exec(i, slot_idx, tokens_for_this)
-                self.slot_lru.append(slot_idx)
-            else:
-                if i in self.expert_to_slot:
-                    slot_idx = self.expert_to_slot[i]
-                    if use_adetr and self.slot_col_partial.get(slot_idx, False):
-                        # Column-hit: cold slices already resident, skip DMA
-                        self.hits += 1
-                        self.slot_lru.remove(slot_idx)
-                        self.slot_lru.append(slot_idx)
-                        out_this = self._adetr_column_exec(i, slot_idx, tokens_for_this, skip_dma=True)
-                    else:
-                        out_this = self.slots[slot_idx](tokens_for_this)
-                else:
-                    self.misses += 1
-                    slot_idx = self.slot_lru.pop(0)
-                    self._load_expert_to_slot(i, slot_idx)
-                    self.slot_lru.append(slot_idx)
-                    torch.cuda.current_stream(self.device).wait_stream(self.dma_stream)
-                out_this = self.slots[slot_idx](tokens_for_this)
 
-            outputs.append(out_this)
+            expert = self.slots[slot_idx]
+            tokens_for_this = sorted_tokens[start_idx:end_idx]
+            outputs.append(expert(tokens_for_this))
             start_idx = end_idx
+
+
+
 
         outs = torch.cat(outputs, dim=0) if len(outputs) else sorted_tokens.new_empty(0)
         new_x = torch.empty_like(outs)
@@ -736,19 +376,6 @@ def serve_deepseek(args):
     dma_stream0 = torch.cuda.Stream(device=dev0)
     dma_stream1 = dma_stream0 if args.num_gpus == 1 else torch.cuda.Stream(device=dev1)
     colossus_wrappers: List[DeepSeekColossusMoEWrapper] = []
-    # Experiment C: one global column pool per GPU (shared across all layers on that device).
-    # Budget-derived capacity; 0 disables (whole-expert / hetero / adetr paths unchanged).
-    col_pools = {}
-    if args.col_pool_gb > 0:
-        for dev in ([dev0] if args.num_gpus == 1 else [dev0, dev1]):
-            col_pools[str(dev)] = GlobalColumnPool(
-                device=dev, dtype=torch.bfloat16, hidden=cfg.hidden_size,
-                inter=cfg.moe_intermediate_size, block=args.col_block,
-                budget_gb=args.col_pool_gb / (1 if args.num_gpus == 1 else 2))
-        p0pool = col_pools[str(dev0)]
-        print(f"  GlobalColumnPool: block={args.col_block} cols, budget={args.col_pool_gb}GB total, "
-              f"cap~{p0pool.cap} blocks/pool ({p0pool.cap * p0pool.per_block_bytes / (1024**3):.2f}GB), "
-              f"universe/layer={cfg.n_routed_experts * p0pool.nblocks} blocks")
 
     for l_idx in range(1, cfg.num_hidden_layers):
         layer = model.model.layers[l_idx]
@@ -765,11 +392,6 @@ def serve_deepseek(args):
             handles=handles,
             weight_map=weight_map,
             dma_stream=dma_stream,
-            enable_hetero=args.enable_hetero,
-            cpu_token_threshold=args.cpu_token_threshold,
-            adetr_ratio=args.adetr_ratio,
-            col_pool=col_pools.get(str(dev)),
-            col_admit_freq=args.col_admit_freq,
         )
 
         if args.warm_slots:
@@ -810,43 +432,22 @@ def serve_deepseek(args):
 
 
     # ─────────────────────────────────────────────────────────────────────────
-    # Run End-to-End Generation Benchmark (Experiment E: offline batch throughput)
-    # Batch prefill (left-padded) + lockstep fixed-step decode. Per-expert token
-    # grouping across the batch happens inside the wrappers' sorted dispatch, so
-    # each expert GEMM serves M>>1 tokens and pool blocks are shared batch-wide.
+    # Run End-to-End Generation Benchmark
     # ─────────────────────────────────────────────────────────────────────────
-    if args.prompt_file:
-        with open(args.prompt_file) as f:
-            prompts = [l.rstrip("\n") for l in f if l.strip()]
-    else:
-        prompts = [args.prompt]
-    if args.batch_size > 1 and len(prompts) == 1:
-        prompts = prompts * args.batch_size
-    B = len(prompts)
+    prompt = args.prompt
     print(f"\n[7] Starting Generation Benchmark:")
-    print(f"  Batch size: {B} | Max New Tokens: {args.max_new_tokens}")
-    for bi, p in enumerate(prompts):
-        print(f"  Prompt[{bi}]: {repr(p)}")
+    print(f"  Prompt: {repr(prompt)}")
+    print(f"  Max New Tokens: {args.max_new_tokens}")
 
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.padding_side = "left"
-    enc = tokenizer(prompts, return_tensors="pt", padding=True)
-    input_ids = enc["input_ids"].to(dev0)
-    attn_mask = enc["attention_mask"].to(dev0)
+    input_ids = tokenizer.encode(prompt, return_tensors="pt").to(dev0)
     prompt_len = input_ids.shape[1]
-    prompt_real_tokens = int(attn_mask.sum().item())
-    print(f"  Prompt Length: {prompt_len} tokens (padded), {prompt_real_tokens} real")
+    print(f"  Prompt Length: {prompt_len} tokens")
 
     # Reset cache metrics before generation
     for w in colossus_wrappers:
         w.hits = 0
         w.misses = 0
-        w.cpu_dispatches = 0
-        w.adetr_col_dispatches = 0
         w.dma_bytes = 0
-    for p in col_pools.values():
-        p.reset_stats()
 
     generated_ids = input_ids.clone()
 
@@ -860,31 +461,18 @@ def serve_deepseek(args):
     past_key_values = DynamicCache() if args.use_cache else None
 
     with torch.no_grad():
-        out = model(input_ids=generated_ids, attention_mask=attn_mask, past_key_values=past_key_values, use_cache=args.use_cache)
-        logits = out.logits  # [B, prompt_len, vocab_size]
-        next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True).to(dev0)  # [B, 1]
+        out = model(input_ids=generated_ids, past_key_values=past_key_values, use_cache=args.use_cache)
+        logits = out.logits  # [1, prompt_len, vocab_size] on dev1
+        next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True).to(dev0)
         past_key_values = getattr(out, "past_key_values", None)
 
 
     torch.cuda.synchronize(dev0)
     torch.cuda.synchronize(dev1)
     t_prefill = time.perf_counter() - t_prefill_start
-    prefill_tps = prompt_real_tokens / t_prefill
-    print(f"  Prefill Time : {t_prefill*1000:.2f} ms ({prefill_tps:.2f} tok/s over {prompt_real_tokens} real tokens)")
+    prefill_tps = prompt_len / t_prefill
+    print(f"  Prefill Time : {t_prefill*1000:.2f} ms ({prefill_tps:.2f} tok/s)")
     sys.stdout.flush()
-
-    if args.col_pool_gb > 0 and args.col_warm_topk > 0:
-        t_warm = time.perf_counter()
-        warmed_layers = 0
-        for w in colossus_wrappers:
-            if w.warm_pool_from_freq(args.col_warm_topk):
-                warmed_layers += 1
-        torch.cuda.synchronize(dev0)
-        if args.num_gpus > 1:
-            torch.cuda.synchronize(dev1)
-        print(f"  ColPool warmup: top-{args.col_warm_topk} prefill-frequent experts/layer "
-              f"({warmed_layers} layers touched) in {(time.perf_counter() - t_warm) * 1000:.1f} ms")
-        sys.stdout.flush()
 
     generated_ids = torch.cat([generated_ids, next_token], dim=1)
 
@@ -896,10 +484,7 @@ def serve_deepseek(args):
 
     last_hits = sum(w.hits for w in colossus_wrappers)
     last_misses = sum(w.misses for w in colossus_wrappers)
-    last_cpu = sum(w.cpu_dispatches for w in colossus_wrappers)
     last_dma = sum(w.dma_bytes for w in colossus_wrappers)
-    last_pool_hits = sum(p.hits for p in col_pools.values())
-    last_pool_miss = sum(p.misses for p in col_pools.values())
 
     for step in range(args.max_new_tokens - 1):
         torch.cuda.synchronize(dev0)
@@ -924,43 +509,26 @@ def serve_deepseek(args):
         # Per-step cache metrics
         cur_hits = sum(w.hits for w in colossus_wrappers)
         cur_misses = sum(w.misses for w in colossus_wrappers)
-        cur_cpu = sum(w.cpu_dispatches for w in colossus_wrappers)
         cur_dma = sum(w.dma_bytes for w in colossus_wrappers)
-        cur_pool_h = sum(p.hits for p in col_pools.values())
-        cur_pool_m = sum(p.misses for p in col_pools.values())
 
         step_hits = cur_hits - last_hits
         step_misses = cur_misses - last_misses
-        step_cpu = cur_cpu - last_cpu
-        step_pool_h = cur_pool_h - last_pool_hits
-        step_pool_m = cur_pool_m - last_pool_miss
-        step_pool_denom = step_pool_h + step_pool_m
-        step_pool_rate = (step_pool_h / step_pool_denom * 100.0) if step_pool_denom else 0.0
-        step_lookups = step_hits + step_misses + step_cpu
+        step_lookups = step_hits + step_misses
         step_hit_rate = (step_hits / step_lookups * 100.0) if step_lookups > 0 else 0.0
         step_dma_mb = (cur_dma - last_dma) / (1024**2)
-        step_dma_saved_mb = step_cpu * 45.0
 
-        last_hits, last_misses, last_cpu, last_dma = cur_hits, cur_misses, cur_cpu, cur_dma
-        last_pool_hits, last_pool_miss = cur_pool_h, cur_pool_m
+        last_hits, last_misses, last_dma = cur_hits, cur_misses, cur_dma
 
         generated_ids = torch.cat([generated_ids, next_token], dim=1)
         tok_str = tokenizer.decode(next_token[0], skip_special_tokens=False)
-        step_batch_tps = B / t_step if t_step > 0 else 0.0
-        print(f"    Token {step+1:2d}/{args.max_new_tokens-1:2d} | Latency: {t_step*1000:6.1f} ms | Batch: {B} seqs ({step_batch_tps:5.2f} tok/s agg) | Hits: {step_hits:3d}/{step_lookups:3d} ({step_hit_rate:5.1f}%) | CPU Fallback: {step_cpu:2d} ({step_dma_saved_mb:5.1f}MB saved) | Misses: {step_misses:2d} | DMA: {step_dma_mb:5.1f} MB | ColPool: {step_pool_h:4d}h/{step_pool_m:4d}m ({step_pool_rate:4.1f}%) | Tok: {repr(tok_str)}")
+        print(f"    Token {step+1:2d}/{args.max_new_tokens-1:2d} | Latency: {t_step*1000:6.1f} ms | Hits: {step_hits:3d}/{step_lookups:3d} ({step_hit_rate:5.1f}%) | Misses: {step_misses:2d} | DMA: {step_dma_mb:5.1f} MB | Tok: {repr(tok_str)}")
         sys.stdout.flush()
 
         decode_step_details.append({
             "step": step + 1,
             "latency_ms": t_step * 1000,
-            "batch_tps_agg": B / t_step if t_step > 0 else 0.0,
             "step_hits": step_hits,
             "step_misses": step_misses,
-            "step_cpu_dispatches": step_cpu,
-            "step_col_pool_hits": step_pool_h,
-            "step_col_pool_misses": step_pool_m,
-            "step_col_pool_hit_rate_pct": step_pool_rate,
-            "step_dma_saved_mb": step_dma_saved_mb,
             "step_hit_rate_pct": step_hit_rate,
             "step_dma_mb": step_dma_mb,
             "token": tok_str,
@@ -975,30 +543,17 @@ def serve_deepseek(args):
     total_decode_time = sum(decode_latencies)
     avg_decode_lat = total_decode_time / len(decode_latencies) if decode_latencies else 0.0
     decode_tps = 1.0 / avg_decode_lat if avg_decode_lat > 0 else 0.0
-    batch_decode_tokens = B * len(decode_latencies)
-    batch_decode_tps = batch_decode_tokens / total_decode_time if total_decode_time > 0 else 0.0
 
     total_hits = sum(w.hits for w in colossus_wrappers)
     total_misses = sum(w.misses for w in colossus_wrappers)
-    total_cpu = sum(w.cpu_dispatches for w in colossus_wrappers)
-    total_adetr = sum(getattr(w, "adetr_col_dispatches", 0) for w in colossus_wrappers)
-    total_pool_h = sum(p.hits for p in col_pools.values())
-    total_pool_m = sum(p.misses for p in col_pools.values())
-    total_pool_bypass = sum(getattr(p, "bypassed", 0) for p in col_pools.values())
-    total_pool_fast = sum(getattr(p, "fast_path_whole", 0) for p in col_pools.values())
-    total_pool_denom = total_pool_h + total_pool_m
-    pool_hit_rate = (total_pool_h / total_pool_denom * 100.0) if total_pool_denom else 0.0
-    pool_gb = sum(len(p.entries) * p.per_block_bytes for p in col_pools.values()) / (1024 ** 3)
-    total_lookups = total_hits + total_misses + total_cpu
+    total_lookups = total_hits + total_misses
     hit_rate = (total_hits / total_lookups * 100.0) if total_lookups > 0 else 0.0
     total_dma_mb = sum(w.dma_bytes for w in colossus_wrappers) / (1024**2)
-    total_dma_saved_mb = total_cpu * 45.0 + total_adetr * 45.0 * (1.0 - args.adetr_ratio)
 
     peak_hbm0 = torch.cuda.max_memory_allocated(dev0) / (1024**3)
     peak_hbm1 = torch.cuda.max_memory_allocated(dev1) / (1024**3)
 
-    gen_texts = [tokenizer.decode(generated_ids[bi], skip_special_tokens=True) for bi in range(B)]
-    gen_text = gen_texts[0]
+    gen_text = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
 
     print("\n" + "=" * 80)
     print("  COLOSSUS SERVING BENCHMARK RESULTS")
@@ -1011,31 +566,19 @@ def serve_deepseek(args):
         print(f"  Hardware Footprint        : 2x NVIDIA H100 NVL (Consolidating 8-GPU Cluster)")
     print(f"  Dynamic Slot Capacity C   : {args.capacity} slots / layer ({(args.capacity / cfg.n_routed_experts)*100:.1f}% expert residency)")
     print(f"  Routed Expert Reduction   : {(1.0 - args.capacity / cfg.n_routed_experts)*100:.1f}% reduction in routed expert GPU memory")
-    print(f"  Compute-to-Data Engine    : {'Enabled (Threshold <= ' + str(args.cpu_token_threshold) + ')' if args.enable_hetero else 'Disabled'}")
-    print(f"  ADETR Column Split        : {'Disabled (whole-expert 45MB/miss)' if args.adetr_ratio >= 1.0 else f'Enabled ratio={args.adetr_ratio} (~{45.0*args.adetr_ratio:.1f}MB/miss, {total_adetr:,} col-dispatches)'}" )
-    if args.col_pool_gb > 0:
-        print(f"  GlobalColumnPool          : block={args.col_block} cols, budget={args.col_pool_gb}GB, "
-              f"blocks={total_pool_h + total_pool_m:,} lookups ({pool_hit_rate:.1f}% hit), resident={pool_gb:.2f}GB, "
-              f"fast-whole={total_pool_fast:,}, bypassed={total_pool_bypass:,}")
     print("-" * 80)
-    print(f"  Batch Size              : {B} seqs | Batch Decode Throughput: {batch_decode_tps:7.2f} tok/s agg ({batch_decode_tokens} toks)")
-    print(f"  Prefill Latency           : {t_prefill*1000:7.1f} ms ({prefill_tps:5.1f} tok/s for {prompt_real_tokens} real tokens)")
-    print(f"  Decode Latency (Avg)      : {avg_decode_lat*1000:7.1f} ms / step ({decode_tps:5.2f} tok/s single-stream)")
+    print(f"  Prefill Latency           : {t_prefill*1000:7.1f} ms ({prefill_tps:5.1f} tok/s for {prompt_len} tokens)")
+    print(f"  Decode Latency (Avg)      : {avg_decode_lat*1000:7.1f} ms / token")
     print(f"  Decode Throughput         : {decode_tps:7.2f} tokens / sec")
     print(f"  Cache Hits                : {total_hits:,} ({hit_rate:.1f}%)")
-    print(f"  CPU Cold Fallbacks        : {total_cpu:,} ({total_dma_saved_mb:,.1f} MB PCIe DMA avoided!)")
     print(f"  Cache Misses (Cold DMA)   : {total_misses:,}")
     print(f"  Total PCIe DMA Transferred: {total_dma_mb:7.1f} MB")
     print(f"  Peak VRAM GPU 0           : {peak_hbm0:7.2f} GB / 93.1 GB")
     if args.num_gpus > 1:
         print(f"  Peak VRAM GPU 1           : {peak_hbm1:7.2f} GB / 93.1 GB")
     print("-" * 80)
-    print(f"  Generated Text Output[0]:")
+    print(f"  Generated Text Output:")
     print(f"  {repr(gen_text)}")
-    if B > 1:
-        for bi in range(1, B):
-            print(f"  Generated Text Output[{bi}]:")
-            print(f"  {repr(gen_texts[bi])}")
     print("=" * 80)
 
     # Save to JSON
@@ -1049,14 +592,9 @@ def serve_deepseek(args):
         "gpus": [p0.name] if args.num_gpus == 1 else [p0.name, p1.name],
         "capacity_slots": args.capacity,
         "residency_reduction_pct": (1.0 - args.capacity / cfg.n_routed_experts) * 100.0,
-        "prompt": prompts[0] if B == 1 else prompts,
-        "prompts": prompts,
-        "batch_size": B,
+        "prompt": prompt,
         "prompt_tokens": prompt_len,
-        "prompt_real_tokens": prompt_real_tokens,
         "generated_tokens": args.max_new_tokens,
-        "batch_decode_tokens": batch_decode_tokens,
-        "batch_decode_tps": batch_decode_tps,
         "prefill_ms": t_prefill * 1000,
         "prefill_tps": prefill_tps,
         "decode_avg_ms": avg_decode_lat * 1000,
@@ -1065,26 +603,11 @@ def serve_deepseek(args):
         "decode_step_details": decode_step_details,
         "total_hits": total_hits,
         "total_misses": total_misses,
-        "total_cpu_dispatches": total_cpu,
-        "total_adetr_col_dispatches": total_adetr,
-        "col_pool": {
-            "block_cols": args.col_block,
-            "budget_gb": args.col_pool_gb,
-            "block_hits": total_pool_h,
-            "block_misses": total_pool_m,
-            "block_hit_rate_pct": pool_hit_rate,
-            "resident_gb": pool_gb,
-        },
-        "total_dma_saved_mb": total_dma_saved_mb,
         "hit_rate_pct": hit_rate,
         "total_dma_mb": total_dma_mb,
-        "enable_hetero": args.enable_hetero,
-        "cpu_token_threshold": args.cpu_token_threshold,
-        "adetr_ratio": args.adetr_ratio,
         "peak_vram_gpu0_gb": peak_hbm0,
         "peak_vram_gpu1_gb": peak_hbm1 if args.num_gpus > 1 else None,
         "generated_text": gen_text,
-        "generated_texts": gen_texts,
     }
 
     if args.output_json:
@@ -1099,27 +622,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--num_gpus", type=int, default=1)
     parser.add_argument("--prompt", type=str, default="def quicksort(arr):")
-    parser.add_argument("--prompt_file", type=str, default=None,
-                        help="File with one prompt per line; forms the batch (overrides --prompt)")
-    parser.add_argument("--batch_size", type=int, default=1,
-                        help="Experiment E: repeat single prompt B times for offline batch throughput")
     parser.add_argument("--max_new_tokens", type=int, default=16)
     parser.add_argument("--capacity", type=int, default=12)
     parser.add_argument("--capacity_gpu1", type=int, default=7)
     parser.add_argument("--warm_slots", action="store_true", default=False)
-    parser.add_argument("--enable_hetero", action="store_true", default=False)
-    parser.add_argument("--no_hetero", dest="enable_hetero", action="store_false")
-    parser.add_argument("--cpu_token_threshold", type=int, default=1)
-    parser.add_argument("--adetr_ratio", type=float, default=1.0,
-                        help="Cold column fraction DMA'd per miss (1.0=whole-expert, 0.5=ADETR-50%%, 0.25, 0.1)")
-    parser.add_argument("--col_pool_gb", type=float, default=0.0,
-                        help="Experiment C: GlobalColumnPool VRAM budget in GB (0=disabled). GPU-only column-LFU.")
-    parser.add_argument("--col_block", type=int, default=128,
-                        help="Column-block width (intermediate-dim cols) for pool transfers/GEMM slices")
-    parser.add_argument("--col_warm_topk", type=int, default=4,
-                        help="Prefill-seeded warmup: top recurring experts/layer into pool (0=disabled)")
-    parser.add_argument("--col_admit_freq", type=int, default=2,
-                        help="v4 coalescing: pool admits only experts seen >=N times (one-touch bypasses)")
+
 
     parser.add_argument("--use_cache", action="store_true", default=True)
     parser.add_argument("--no_cache", dest="use_cache", action="store_false")
