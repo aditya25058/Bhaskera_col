@@ -143,6 +143,27 @@ class DeepSeekColossusMoEWrapper(nn.Module):
             cls._pinned_staging_key = key
         return cls._pinned_staging
 
+    # Phase 1c: cudaHostRegister zero-copy (no CPU work, full-rate async DMA).
+    # safetensors tensors are mmap-backed (pageable) -> driver-staged ~6GB/s.
+    # Registering them once pins the pages -> direct DMA at link rate.
+    # Proven viable on H100 (probe job 1836: register_err 0, unregister_err 0).
+    _cudart = None
+    _cudart_failed = False
+
+    @classmethod
+    def _get_cudart(cls):
+        if cls._cudart is None and not cls._cudart_failed:
+            try:
+                import ctypes
+                import ctypes.util
+                lib = ctypes.util.find_library("cudart")
+                cls._cudart = ctypes.CDLL(lib) if lib else None
+                if cls._cudart is None:
+                    cls._cudart_failed = True
+            except Exception:
+                cls._cudart_failed = True
+        return cls._cudart
+
     def __init__(
         self,
         layer_idx: int,
@@ -156,7 +177,8 @@ class DeepSeekColossusMoEWrapper(nn.Module):
         zssr_prefetch: bool = False,
         prefetch_topk: int = 8,
         coalesced_dma: bool = False,
-        pinned_staging: bool = True,
+        pinned_staging: bool = False,
+        host_register: bool = False,
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -172,6 +194,10 @@ class DeepSeekColossusMoEWrapper(nn.Module):
         self.prefetch_topk = int(prefetch_topk)
         self.coalesced = bool(coalesced_dma)
         self.pinned_staging = bool(pinned_staging)
+        self.host_register = bool(host_register)
+        self._hostreg_ok = {}
+        self._hostreg_failed = set()
+        self.hostreg_pinned_gb = 0.0
         self.top_k = int(getattr(cfg, "num_experts_per_tok", 6))
         self.n_routed = int(getattr(cfg, "n_routed_experts", 160))
 
@@ -243,6 +269,32 @@ class DeepSeekColossusMoEWrapper(nn.Module):
                 remaining.append((kind, ev_s, ev_e, nbytes))
         self._dma_pending = remaining
 
+    def _ensure_host_registered(self, shard: str, key: str, t: torch.Tensor) -> bool:
+        """Pin mmap-backed tensor pages once for zero-copy DMA. Returns True if direct DMA is safe."""
+        if not self.host_register:
+            return False
+        tag = (shard, key)
+        if tag in self._hostreg_ok:
+            return True
+        if tag in self._hostreg_failed:
+            return False
+        try:
+            import ctypes
+            cu = self._get_cudart()
+            if cu is None:
+                self._hostreg_failed.add(tag)
+                return False
+            cu.cudaHostRegister.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint]
+            err = cu.cudaHostRegister(ctypes.c_void_p(t.data_ptr()), ctypes.c_size_t(t.nbytes), ctypes.c_uint(0))
+            if int(err) == 0:
+                self._hostreg_ok[tag] = True
+                self.hostreg_pinned_gb += t.nbytes / (1024 ** 3)
+                return True
+            self._hostreg_failed.add(tag)
+        except Exception:
+            self._hostreg_failed.add(tag)
+        return False
+
     def _load_expert_to_slot(self, expert_id: int, slot_idx: int, kind: str = "demand",
                              record: bool = True):
         slot_mod = self.slots[slot_idx]
@@ -262,9 +314,8 @@ class DeepSeekColossusMoEWrapper(nn.Module):
 
         ev_s = self._dma_begin() if (record and self.device.type == "cuda") else None
         with torch.no_grad():
-            if self.pinned_staging and self.device.type == "cuda":
-                # Phase 1b: mmap -> pinned staging (fast CPU memcpy), then pinned
-                # -> HBM at link rate. Event covers the DMA leg only.
+            if self.pinned_staging and self.device.type == "cuda" and not self.host_register:
+                # Phase 1b (killed default): mmap -> pinned staging, then link-rate DMA.
                 st_g, st_u, st_d = self._get_pinned_staging(
                     t_gate.shape[0], t_gate.shape[1], t_gate.dtype)
                 st_g.copy_(t_gate)
@@ -272,6 +323,12 @@ class DeepSeekColossusMoEWrapper(nn.Module):
                 st_d.copy_(t_down)
                 src_g, src_u, src_d = st_g, st_u, st_d
             else:
+                # Phase 1c: zero-copy direct DMA. Fast iff pages are HostRegistered
+                # (done below); otherwise driver-staged ~6GB/s.
+                if self.host_register and self.device.type == "cuda":
+                    self._ensure_host_registered(shard_gate, k_gate, t_gate)
+                    self._ensure_host_registered(shard_up, k_up, t_up)
+                    self._ensure_host_registered(shard_down, k_down, t_down)
                 src_g, src_u, src_d = t_gate, t_up, t_down
             with torch.cuda.stream(self.dma_stream):
                 slot_mod.gate_proj.weight.copy_(src_g, non_blocking=True)
@@ -530,6 +587,7 @@ def serve_deepseek(args):
             prefetch_topk=args.prefetch_topk,
             coalesced_dma=args.coalesced_dma,
             pinned_staging=args.pinned_staging,
+            host_register=args.host_register,
         )
 
         if args.warm_slots:
@@ -829,6 +887,8 @@ def serve_deepseek(args):
         "prefetch_topk": int(args.prefetch_topk),
         "coalesced_dma": bool(args.coalesced_dma),
         "pinned_staging": bool(args.pinned_staging),
+        "host_register": bool(args.host_register),
+        "hostreg_pinned_gb": sum(w.hostreg_pinned_gb for w in colossus_wrappers),
         "zssr_predictions": total_zp,
         "zssr_correct": total_zc,
         "zssr_recall_pct": recall,
@@ -869,10 +929,12 @@ if __name__ == "__main__":
                         help="Top-K experts to prefetch per layer entrance (K=6 routing + margin)")
     parser.add_argument("--coalesced-dma", dest="coalesced_dma", action="store_true", default=False,
                         help="Single timing group per layer prefetch burst (few large DMAs)")
-    parser.add_argument("--pinned_staging", action="store_true", default=True,
-                        help="Phase 1b: stage mmap weights through shared pinned host buffer")
+    parser.add_argument("--pinned_staging", action="store_true", default=False,
+                        help="Phase 1b (killed default): stage mmap weights through shared pinned host buffer")
     parser.add_argument("--no_pinned_staging", dest="pinned_staging", action="store_false",
                         help="Opt out: DMA directly from mmap handles (~6GB/s staged)")
+    parser.add_argument("--host_register", action="store_true", default=False,
+                        help="Phase 1c: cudaHostRegister mmap tensors once for zero-copy link-rate DMA")
 
 
     parser.add_argument("--use_cache", action="store_true", default=True)
