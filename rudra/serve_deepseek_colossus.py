@@ -313,6 +313,7 @@ class DeepSeekColossusMoEWrapper(nn.Module):
         cpu_token_threshold: int = 1,
         adetr_ratio: float = 1.0,
         col_pool=None,
+        col_admit_freq: int = 2,
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -326,6 +327,7 @@ class DeepSeekColossusMoEWrapper(nn.Module):
         self.cpu_token_threshold = cpu_token_threshold
         self.adetr_ratio = float(adetr_ratio)
         self.col_pool = col_pool
+        self.col_admit_freq = int(col_admit_freq)
 
         # Resident modules on GPU
         self.gate = moe_module.gate
@@ -583,8 +585,9 @@ class DeepSeekColossusMoEWrapper(nn.Module):
             elif i in pool_ids:
                 self.misses += 1
                 slot_idx = self.slot_lru.pop(0)
-                # v3: admit only recurring experts (freq>=2); one-touch bypasses pool
-                admit = self.expert_freq.get(i, 0) >= 2
+                # v3/v4: admit only recurring experts (freq>=threshold); one-touch bypasses pool.
+                # Larger --col_block also coalesces: fewer, bigger transfers per miss.
+                admit = self.expert_freq.get(i, 0) >= self.col_admit_freq
                 moved = self.col_pool.assemble(
                     self.layer_idx, i, self._get_cpu_expert_weights(i),
                     self.slots[slot_idx], self.dma_stream, admit=admit)
@@ -766,6 +769,7 @@ def serve_deepseek(args):
             cpu_token_threshold=args.cpu_token_threshold,
             adetr_ratio=args.adetr_ratio,
             col_pool=col_pools.get(str(dev)),
+            col_admit_freq=args.col_admit_freq,
         )
 
         if args.warm_slots:
@@ -1114,6 +1118,8 @@ if __name__ == "__main__":
                         help="Column-block width (intermediate-dim cols) for pool transfers/GEMM slices")
     parser.add_argument("--col_warm_topk", type=int, default=4,
                         help="Prefill-seeded warmup: top recurring experts/layer into pool (0=disabled)")
+    parser.add_argument("--col_admit_freq", type=int, default=2,
+                        help="v4 coalescing: pool admits only experts seen >=N times (one-touch bypasses)")
 
     parser.add_argument("--use_cache", action="store_true", default=True)
     parser.add_argument("--no_cache", dest="use_cache", action="store_false")
