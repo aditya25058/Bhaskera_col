@@ -151,11 +151,14 @@ class GlobalColumnPool:
         self.misses = 0
         self.dma_bytes = 0
         self.fast_path_whole = 0  # 0-hit whole-DMA assemblies (no block thrash)
+        self.bypassed = 0  # v3: one-touch blocks refused admission (scan resistance)
 
     def reset_stats(self):
         self.hits = 0
         self.misses = 0
         self.dma_bytes = 0
+        self.fast_path_whole = 0
+        self.bypassed = 0
 
     def _evict_one(self):
         # v2: O(1) sampled eviction (v1 scanned all ~2k entries per miss -> 70M Python ops).
@@ -216,12 +219,14 @@ class GlobalColumnPool:
                         self.misses += 1
                         self.dma_bytes += int(g.nbytes + u.nbytes + d.nbytes)
 
-    def assemble(self, layer_idx: int, expert_id: int, masters, slot_mod, dma_stream) -> int:
+    def assemble(self, layer_idx: int, expert_id: int, masters, slot_mod, dma_stream, admit: bool = True) -> int:
         """Assemble full expert weights into slot_mod from pool (hits) + DMA (misses).
 
         v2 fast path: probe all block keys first (cheap dict lookups). Zero resident ->
-        single whole-expert DMA (3 copies) + HBM insert into pool, skipping 12x block
+        single whole-expert DMA (3 copies) + HBM pool insert, skipping 12x block
         staged copies. Partial residency -> block path. Slot ends up complete -> exact.
+        v3 admission: one-touch experts (admit=False) get whole DMA with NO pool
+        insert, so scan traffic can't churn recurring blocks out (TinyLFU-style).
         """
         Wg_full, Wu_full, Wd_full = masters
         resident = [bi for bi in range(self.nblocks) if (layer_idx, expert_id, bi) in self.entries]
@@ -236,17 +241,20 @@ class GlobalColumnPool:
                     moved += int(Wg_full.nbytes + Wu_full.nbytes + Wd_full.nbytes)
                     self.misses += self.nblocks
                     self.fast_path_whole += 1
-                    for bi in range(self.nblocks):
-                        s, e = self._block_range(bi)
-                        self.tick += 1
-                        key = (layer_idx, expert_id, bi)
-                        g = torch.empty((e - s, self.H), dtype=self.dtype, device=self.device)
-                        u = torch.empty((e - s, self.H), dtype=self.dtype, device=self.device)
-                        d = torch.empty((self.H, e - s), dtype=self.dtype, device=self.device)
-                        g.copy_(slot_mod.gate_proj.weight[s:e], non_blocking=True)
-                        u.copy_(slot_mod.up_proj.weight[s:e], non_blocking=True)
-                        d.copy_(slot_mod.down_proj.weight[:, s:e], non_blocking=True)
-                        self._insert_block(key, g, u, d)
+                    if admit:
+                        for bi in range(self.nblocks):
+                            s, e = self._block_range(bi)
+                            self.tick += 1
+                            key = (layer_idx, expert_id, bi)
+                            g = torch.empty((e - s, self.H), dtype=self.dtype, device=self.device)
+                            u = torch.empty((e - s, self.H), dtype=self.dtype, device=self.device)
+                            d = torch.empty((self.H, e - s), dtype=self.dtype, device=self.device)
+                            g.copy_(slot_mod.gate_proj.weight[s:e], non_blocking=True)
+                            u.copy_(slot_mod.up_proj.weight[s:e], non_blocking=True)
+                            d.copy_(slot_mod.down_proj.weight[:, s:e], non_blocking=True)
+                            self._insert_block(key, g, u, d)
+                    else:
+                        self.bypassed += self.nblocks
                     self.dma_bytes += moved
                     return moved
                 for bi in range(self.nblocks):
@@ -575,9 +583,11 @@ class DeepSeekColossusMoEWrapper(nn.Module):
             elif i in pool_ids:
                 self.misses += 1
                 slot_idx = self.slot_lru.pop(0)
+                # v3: admit only recurring experts (freq>=2); one-touch bypasses pool
+                admit = self.expert_freq.get(i, 0) >= 2
                 moved = self.col_pool.assemble(
                     self.layer_idx, i, self._get_cpu_expert_weights(i),
-                    self.slots[slot_idx], self.dma_stream)
+                    self.slots[slot_idx], self.dma_stream, admit=admit)
                 self.dma_bytes += moved
                 if slot_idx in self.slot_to_expert:
                     self.expert_to_slot.pop(self.slot_to_expert[slot_idx], None)
@@ -949,6 +959,8 @@ def serve_deepseek(args):
     total_adetr = sum(getattr(w, "adetr_col_dispatches", 0) for w in colossus_wrappers)
     total_pool_h = sum(p.hits for p in col_pools.values())
     total_pool_m = sum(p.misses for p in col_pools.values())
+    total_pool_bypass = sum(getattr(p, "bypassed", 0) for p in col_pools.values())
+    total_pool_fast = sum(getattr(p, "fast_path_whole", 0) for p in col_pools.values())
     total_pool_denom = total_pool_h + total_pool_m
     pool_hit_rate = (total_pool_h / total_pool_denom * 100.0) if total_pool_denom else 0.0
     pool_gb = sum(len(p.entries) * p.per_block_bytes for p in col_pools.values()) / (1024 ** 3)
@@ -977,7 +989,8 @@ def serve_deepseek(args):
     print(f"  ADETR Column Split        : {'Disabled (whole-expert 45MB/miss)' if args.adetr_ratio >= 1.0 else f'Enabled ratio={args.adetr_ratio} (~{45.0*args.adetr_ratio:.1f}MB/miss, {total_adetr:,} col-dispatches)'}" )
     if args.col_pool_gb > 0:
         print(f"  GlobalColumnPool          : block={args.col_block} cols, budget={args.col_pool_gb}GB, "
-              f"blocks={total_pool_h + total_pool_m:,} lookups ({pool_hit_rate:.1f}% hit), resident={pool_gb:.2f}GB")
+              f"blocks={total_pool_h + total_pool_m:,} lookups ({pool_hit_rate:.1f}% hit), resident={pool_gb:.2f}GB, "
+              f"fast-whole={total_pool_fast:,}, bypassed={total_pool_bypass:,}")
     print("-" * 80)
     print(f"  Prefill Latency           : {t_prefill*1000:7.1f} ms ({prefill_tps:5.1f} tok/s for {prompt_len} tokens)")
     print(f"  Decode Latency (Avg)      : {avg_decode_lat*1000:7.1f} ms / token")
