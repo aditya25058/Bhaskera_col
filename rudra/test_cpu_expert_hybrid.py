@@ -88,7 +88,22 @@ with torch.no_grad():
 needed_experts = topk_idx.unique().tolist()
 print(f"  Active experts selected for token: {needed_experts}")
 
-# 2. Build the Hybrid MoE Class with Compute-to-Data CPU Fallback
+# 2. COLOSSUS Fast Dynamic Expert Slot
+class FastExpertSlot(nn.Module):
+    def __init__(self, cfg, device: torch.device):
+        super().__init__()
+        H = cfg.hidden_size
+        I = cfg.moe_intermediate_size
+        self.gate_proj = nn.Linear(H, I, bias=False, device=device, dtype=torch.bfloat16)
+        self.up_proj = nn.Linear(H, I, bias=False, device=device, dtype=torch.bfloat16)
+        self.down_proj = nn.Linear(I, H, bias=False, device=device, dtype=torch.bfloat16)
+        self.requires_grad_(False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+
+
+# 3. Build the Hybrid MoE Class with Compute-to-Data CPU Fallback
 class HybridDeepSeekMoE(nn.Module):
     def __init__(self, native_moe, device, capacity=12, cpu_token_threshold=4):
         super().__init__()
@@ -98,14 +113,11 @@ class HybridDeepSeekMoE(nn.Module):
         self.gate = native_moe.gate.to(device)
         self.shared_experts = native_moe.shared_experts.to(device)
         
-        # GPU dynamic slots
+        # GPU dynamic slots with exact DeepSeek-V2 moe_intermediate_size (1536)
         self.slots = nn.ModuleList([
-            native_moe.experts[0].__class__(cfg).to(device=device, dtype=torch.bfloat16)
+            FastExpertSlot(cfg, device=device)
             for _ in range(capacity)
         ])
-        for s in self.slots:
-            s.requires_grad_(False)
-            
         self.expert_to_slot = {}
         self.slot_to_expert = {}
         self.slot_lru = list(range(capacity))
