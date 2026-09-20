@@ -25,6 +25,7 @@ import os
 import sys
 import time
 import json
+import mmap
 import argparse
 from typing import Dict, List, Tuple
 
@@ -116,6 +117,39 @@ class FastExpertSlot(nn.Module):
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
+class ShardMap:
+    """Phase 1c-R: whole-file aligned mmap + parsed safetensors header, one mapping per shard.
+
+    Tensor views are zero-copy slices of the mapping (no CPU copy). Registering the
+    whole mapping once per shard amortizes cudaHostRegister over all its tensors
+    (vs 19k per-tensor registrations that put mlock+TLB-shootdown on la critique).
+    """
+
+    _cache = {}
+
+    def __init__(self, path):
+        self.path = path
+        self.f = open(path, "rb")
+        self.header_len = int.from_bytes(self.f.read(8), "little")
+        self.header = json.loads(self.f.read(self.header_len))
+        self.data_start = 8 + self.header_len
+        # ACCESS_COPY: writeable view, no disk I/O for reads (torch needs writeable buffer)
+        self.mm = mmap.mmap(self.f.fileno(), 0, access=mmap.ACCESS_COPY)
+        self.u8 = torch.frombuffer(self.mm, dtype=torch.uint8)
+
+    @classmethod
+    def get(cls, path):
+        if path not in cls._cache:
+            cls._cache[path] = ShardMap(path)
+        return cls._cache[path]
+
+    def view_tensor(self, key):
+        info = self.header[key]
+        b, e = info["data_offsets"]
+        s = self.data_start + b
+        return self.u8[s:s + (e - b)].view(torch.bfloat16).reshape(info["shape"])
+
+
 class DeepSeekColossusMoEWrapper(nn.Module):
     """
     Dynamic Slot Residency MoE Wrapper:
@@ -149,6 +183,10 @@ class DeepSeekColossusMoEWrapper(nn.Module):
     # Proven viable on H100 (probe job 1836: register_err 0, unregister_err 0).
     _cudart = None
     _cudart_failed = False
+    # Phase 1c-R: shard-level registration ledger (class-shared: one entry per shard)
+    _shard_registered = set()
+    _shard_reg_seconds = 0.0
+    _shard_reg_gb = 0.0
 
     @classmethod
     def _get_cudart(cls):
@@ -179,6 +217,8 @@ class DeepSeekColossusMoEWrapper(nn.Module):
         coalesced_dma: bool = False,
         pinned_staging: bool = False,
         host_register: bool = False,
+        model_dir: str = None,
+        shard_register: bool = False,
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -195,6 +235,8 @@ class DeepSeekColossusMoEWrapper(nn.Module):
         self.coalesced = bool(coalesced_dma)
         self.pinned_staging = bool(pinned_staging)
         self.host_register = bool(host_register)
+        self.model_dir = model_dir
+        self.shard_register = bool(shard_register)
         self._hostreg_ok = {}
         self._hostreg_failed = set()
         self.hostreg_pinned_gb = 0.0
@@ -295,6 +337,38 @@ class DeepSeekColossusMoEWrapper(nn.Module):
             self._hostreg_failed.add(tag)
         return False
 
+    @classmethod
+    def register_shard(cls, model_dir: str, shard: str) -> float:
+        """Register one whole shard mapping once. Returns seconds spent (0 if already done)."""
+        if shard in cls._shard_registered or model_dir is None:
+            return 0.0
+        t0 = time.perf_counter()
+        sm = ShardMap.get(os.path.join(model_dir, shard))
+        cu = cls._get_cudart()
+        if cu is not None:
+            import ctypes
+            cu.cudaHostRegister.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint]
+            err = cu.cudaHostRegister(ctypes.c_void_p(sm.u8.data_ptr()),
+                                      ctypes.c_size_t(sm.u8.nbytes), ctypes.c_uint(0))
+            if int(err) != 0:
+                return 0.0
+        dt = time.perf_counter() - t0
+        cls._shard_registered.add(shard)
+        cls._shard_reg_seconds += dt
+        cls._shard_reg_gb += sm.u8.nbytes / (1024 ** 3)
+        return dt
+
+    def _shard_view(self, shard: str, key: str):
+        """Zero-copy BF16 view from registered shard mapping, or None (fallback)."""
+        if not self.shard_register or self.model_dir is None:
+            return None
+        if shard not in self._shard_registered:
+            return None
+        try:
+            return ShardMap.get(os.path.join(self.model_dir, shard)).view_tensor(key)
+        except Exception:
+            return None
+
     def _load_expert_to_slot(self, expert_id: int, slot_idx: int, kind: str = "demand",
                              record: bool = True):
         slot_mod = self.slots[slot_idx]
@@ -311,6 +385,13 @@ class DeepSeekColossusMoEWrapper(nn.Module):
         t_up = self.handles[shard_up].get_tensor(k_up)
         t_down = self.handles[shard_down].get_tensor(k_down)
         nbytes = int(t_gate.nbytes + t_up.nbytes + t_down.nbytes)
+
+        # Phase 1c-R: prefer registered whole-shard views (zero-copy, link-rate).
+        v_gate = self._shard_view(shard_gate, k_gate)
+        v_up = self._shard_view(shard_up, k_up)
+        v_down = self._shard_view(shard_down, k_down)
+        if v_gate is not None and v_up is not None and v_down is not None:
+            t_gate, t_up, t_down = v_gate, v_up, v_down
 
         ev_s = self._dma_begin() if (record and self.device.type == "cuda") else None
         with torch.no_grad():
@@ -588,6 +669,8 @@ def serve_deepseek(args):
             coalesced_dma=args.coalesced_dma,
             pinned_staging=args.pinned_staging,
             host_register=args.host_register,
+            model_dir=MODEL_PATH,
+            shard_register=args.shard_register,
         )
 
         if args.warm_slots:
@@ -623,6 +706,21 @@ def serve_deepseek(args):
             model.model.layers[l_idx].register_forward_pre_hook(gpu1_pre_hook, with_kwargs=True)
     else:
         print(f"\n[6] Single GPU serving on {p0.name} (No cross-GPU NVLink hooks needed)")
+
+    if args.shard_register:
+        # Phase 1c-R warmup (UNTIMED deployment cost): map + register every shard
+        # holding expert tensors exactly once. Steady-state decode then pays ~0
+        # registration. Reports seconds + GB pinned; decode metrics exclude this.
+        print(f"\n[6.5] Shard-level HostRegister warmup (one-time, untimed)...")
+        expert_shards = sorted({s for k, s in weight_map.items() if ".mlp.experts." in k})
+        t_w0 = time.perf_counter()
+        for sh in expert_shards:
+            DeepSeekColossusMoEWrapper.register_shard(MODEL_PATH, sh)
+        dt_w = time.perf_counter() - t_w0
+        print(f"  Registered {len(DeepSeekColossusMoEWrapper._shard_registered)} shards "
+              f"({DeepSeekColossusMoEWrapper._shard_reg_gb:.1f} GB) in {dt_w:.1f}s "
+              f"({dt_w / max(1, len(DeepSeekColossusMoEWrapper._shard_registered)):.2f}s/shard)")
+        sys.stdout.flush()
 
     if args.zssr_prefetch:
         # Phase 1 probes: layer-entrance (pre-attention) ZSSR prefetch hooks.
@@ -889,6 +987,10 @@ def serve_deepseek(args):
         "pinned_staging": bool(args.pinned_staging),
         "host_register": bool(args.host_register),
         "hostreg_pinned_gb": sum(w.hostreg_pinned_gb for w in colossus_wrappers),
+        "shard_register": bool(args.shard_register),
+        "shard_reg_shards": len(DeepSeekColossusMoEWrapper._shard_registered),
+        "shard_reg_gb": DeepSeekColossusMoEWrapper._shard_reg_gb,
+        "shard_reg_seconds": DeepSeekColossusMoEWrapper._shard_reg_seconds,
         "zssr_predictions": total_zp,
         "zssr_correct": total_zc,
         "zssr_recall_pct": recall,
@@ -935,6 +1037,8 @@ if __name__ == "__main__":
                         help="Opt out: DMA directly from mmap handles (~6GB/s staged)")
     parser.add_argument("--host_register", action="store_true", default=False,
                         help="Phase 1c: cudaHostRegister mmap tensors once for zero-copy link-rate DMA")
+    parser.add_argument("--shard_register", action="store_true", default=False,
+                        help="Phase 1c-R: one-time whole-shard HostRegister warmup (untimed), then zero-copy DMA")
 
 
     parser.add_argument("--use_cache", action="store_true", default=True)
