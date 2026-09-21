@@ -32,17 +32,24 @@ def expert_keys(cfg_n_layers, n_routed):
 
 
 def compress_shard(args):
-    model_path, shard, keys, level = args
+    # Worker writes its shard container directly; returns only metadata.
+    # (Parent gathering 28k blobs would OOM: ~126GB pickled.)
+    model_path, shard, keys, level, out_dir = args
     h = safe_open(os.path.join(model_path, shard), framework="pt")
-    out = []
-    for key in keys:
-        t = h.get_tensor(key)
-        raw = bytes(t.untyped_storage())[:t.nbytes]
-        u8 = torch.frombuffer(bytearray(raw), dtype=torch.uint8)
-        hi = u8[1::2].numpy().tobytes()
-        blob = lz4.frame.compress(hi, compression_level=level)
-        out.append((key, blob, len(hi), tuple(t.shape)))
-    return shard, out
+    fn = shard.replace(".safetensors", ".lz4h")
+    meta = []
+    with open(os.path.join(out_dir, fn), "wb") as f:
+        for key in keys:
+            t = h.get_tensor(key)
+            raw = bytes(t.untyped_storage())[:t.nbytes]
+            u8 = torch.frombuffer(bytearray(raw), dtype=torch.uint8)
+            hi = u8[1::2].numpy().tobytes()
+            blob = lz4.frame.compress(hi, compression_level=level)
+            off = f.tell()
+            f.write(blob)
+            meta.append((key, off, len(blob), len(hi), tuple(t.shape)))
+            del raw, u8, hi, blob
+    return shard, fn, meta
 
 
 def main():
@@ -68,26 +75,20 @@ def main():
 
     t0 = time.perf_counter()
     with mp.Pool(args.workers) as pool:
-        jobs = [(args.model, sh, ks, args.level) for sh, ks in sorted(by_shard.items())]
+        jobs = [(args.model, sh, ks, args.level, args.out) for sh, ks in sorted(by_shard.items())]
         shard_out = pool.map(compress_shard, jobs, chunksize=1)
     print(f"compressed in {time.perf_counter() - t0:.1f}s", flush=True)
 
-    # Pack per-shard containers + index
+    # Assemble index from worker-returned metadata (small)
     index = {}
-    files = {}
+    files = set()
     n_tensors = 0
-    for shard, items in shard_out:
-        fn = shard.replace(".safetensors", ".lz4h")
-        if fn not in files:
-            files[fn] = open(os.path.join(args.out, fn), "wb")
-        for key, blob, hi_len, shape in items:
-            off = files[fn].tell()
-            files[fn].write(blob)
-            index[key] = {"blob": fn, "offset": off, "comp_len": len(blob),
+    for shard, fn, items in shard_out:
+        files.add(fn)
+        for key, off, comp_len, hi_len, shape in items:
+            index[key] = {"blob": fn, "offset": off, "comp_len": comp_len,
                           "hi_len": hi_len, "shape": list(shape)}
             n_tensors += 1
-    for f in files.values():
-        f.close()
     with open(os.path.join(args.out, "index.json"), "w") as f:
         json.dump(index, f)
     raw_hi = sum(v["hi_len"] for v in index.values())
