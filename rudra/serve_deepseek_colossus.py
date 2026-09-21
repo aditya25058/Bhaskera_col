@@ -291,6 +291,7 @@ class DeepSeekColossusMoEWrapper(nn.Module):
         zssr_prefetch: bool = False,
         prefetch_topk: int = 8,
         coalesced_dma: bool = False,
+        prefetch_conf: float = 0.0,
         pinned_staging: bool = False,
         host_register: bool = False,
         model_dir: str = None,
@@ -313,6 +314,7 @@ class DeepSeekColossusMoEWrapper(nn.Module):
         self.zssr_enabled = bool(zssr_prefetch)
         self.prefetch_topk = int(prefetch_topk)
         self.coalesced = bool(coalesced_dma)
+        self.prefetch_conf = float(prefetch_conf)
         self.pinned_staging = bool(pinned_staging)
         self.host_register = bool(host_register)
         self.model_dir = model_dir
@@ -361,6 +363,8 @@ class DeepSeekColossusMoEWrapper(nn.Module):
         # Phase 1 causal telemetry (standardized schema; demand = exposed by construction)
         self.zssr_predictions = 0
         self.zssr_correct = 0
+        self.zssr_suppressed = 0
+        self._prefmeta = {}          # expert_id -> [conf, hit(0/1)] admitted probes
         self.prefetch_bytes_total = 0
         self.prefetch_useful_bytes = 0
         self.demand_bytes_m = 0      # measured (event-drained) demand payload
@@ -757,7 +761,8 @@ class DeepSeekColossusMoEWrapper(nn.Module):
         Predicts top-(K+margin) experts from the residual stream and issues one
         grouped async DMA per layer on dma_stream. Prediction moves DATA only;
         the native router in forward() keeps the mathematical decision (exact).
-        Returns predicted expert list (possibly empty when disabled).
+        1B': confidence admission -- probes below prefetch_conf are suppressed
+        (counted) rather than speculated. Returns predicted expert list.
         """
         if not self.zssr_enabled:
             return []
@@ -765,8 +770,13 @@ class DeepSeekColossusMoEWrapper(nn.Module):
             h = hidden_in[:, -1, :].to(dtype=torch.float32, device=self.gate.weight.device)
             scores = torch.softmax(h @ self.gate.weight.detach().float().t(), dim=-1)
             k = min(self.prefetch_topk, self.n_routed)
-            pred = torch.topk(scores, k=k, dim=-1).indices.view(-1).tolist()
+            topv, topi = torch.topk(scores, k=k, dim=-1)
+            conf = topv.view(-1)[0].item()
+            pred = topi.view(-1).tolist()
         except Exception:
+            return []
+        if conf < self.prefetch_conf:
+            self.zssr_suppressed += 1
             return []
         new_ids = [e for e in dict.fromkeys(pred) if e not in self.expert_to_slot and e not in self._prefetched]
         if not new_ids:
@@ -779,6 +789,7 @@ class DeepSeekColossusMoEWrapper(nn.Module):
                                                record=not self.coalesced)
             self.slot_lru.append(slot_idx)
             self._prefetched[exp_id] = self._prefetched.get(exp_id, 0) + nbytes
+            self._prefmeta[exp_id] = [conf, 0]
         if self.coalesced and self.device.type == "cuda":
             self._dma_end(ev_s, "prefetch", sum(self._prefetched.get(e, 0) for e in new_ids))
         self.zssr_predictions += len(new_ids)
@@ -809,6 +820,8 @@ class DeepSeekColossusMoEWrapper(nn.Module):
                 if exp_id in actual:
                     self.zssr_correct += 1
                     self.prefetch_useful_bytes += self._prefetched.pop(exp_id)
+                    if exp_id in self._prefmeta:
+                        self._prefmeta[exp_id][1] = 1
 
         # 2. Compute shared experts (permanently resident)
         shared_out = self.shared_experts(identity)
@@ -1006,6 +1019,7 @@ def serve_deepseek(args):
             zssr_prefetch=args.zssr_prefetch,
             prefetch_topk=args.prefetch_topk,
             coalesced_dma=args.coalesced_dma,
+            prefetch_conf=args.prefetch_conf,
             pinned_staging=args.pinned_staging,
             host_register=args.host_register,
             model_dir=MODEL_PATH,
@@ -1116,6 +1130,8 @@ def serve_deepseek(args):
         w.dma_bytes = 0
         w.zssr_predictions = 0
         w.zssr_correct = 0
+        w.zssr_suppressed = 0
+        w._prefmeta = {}
         w.prefetch_bytes_total = 0
         w.prefetch_useful_bytes = 0
         w.demand_bytes_m = 0
@@ -1296,6 +1312,7 @@ def serve_deepseek(args):
     # Phase 1 causal set
     total_zp = sum(w.zssr_predictions for w in colossus_wrappers)
     total_zc = sum(w.zssr_correct for w in colossus_wrappers)
+    total_zs = sum(getattr(w, "zssr_suppressed", 0) for w in colossus_wrappers)
     total_pf = sum(w.prefetch_bytes_total for w in colossus_wrappers) / (1024**2)
     total_pfu = sum(w.prefetch_useful_bytes for w in colossus_wrappers) / (1024**2)
     total_dby = sum(w.demand_bytes_m for w in colossus_wrappers) / (1024**2)
@@ -1303,6 +1320,14 @@ def serve_deepseek(args):
     total_pms = sum(w.prefetch_dma_ms for w in colossus_wrappers) * 1000.0
     total_wasted = total_pf - total_pfu
     recall = (total_zc / total_zp * 100.0) if total_zp else 0.0
+    # 1B': confidence-conditioned recall + admitted metadata (mean conf hit vs miss)
+    _confs_hit, _confs_miss, _n_adm = [], [], 0
+    for w in colossus_wrappers:
+        for _exp, (_c, _h) in getattr(w, "_prefmeta", {}).items():
+            _n_adm += 1
+            (_confs_hit if _h else _confs_miss).append(_c)
+    _mch = sum(_confs_hit) / max(1, len(_confs_hit))
+    _mcm = sum(_confs_miss) / max(1, len(_confs_miss))
     overlap = (total_pfu / (total_pfu + total_dby) * 100.0) if (total_pfu + total_dby) else 0.0
     eff_gbps = (sum(w.demand_bytes_m for w in colossus_wrappers) / (1024**3)) / (sum(w.demand_dma_ms for w in colossus_wrappers) + 1e-12)
     ref_text = "def quicksort(arr):\n    if len(arr) <= 1:\n        return arr\n"
@@ -1341,8 +1366,10 @@ def serve_deepseek(args):
                   f"(pred {m['pred_cols']:,} actual {m['actual_cols']:,} cols; {col_pred_mb:,.1f}MB predicted)")
         print(f"  Probe confidence: mean top-1 prob {col_conf / max(1, col_confn):.3f}, "
               f"frac>=0.5: {col_confhi / max(1, col_confn) * 100:.1f}% ({col_confn} probes)")
-    print(f"  ZSSR Prefetch             : {'on (top-%d%s)' % (args.prefetch_topk, ', coalesced' if args.coalesced_dma else '') if args.zssr_prefetch else 'off'} | "
-          f"pred {total_zp:,} correct {total_zc:,} (recall {recall:.1f}%) | prefetch {total_pf:,.1f}MB useful {total_pfu:,.1f}MB wasted {total_wasted:,.1f}MB")
+    print(f"  ZSSR Prefetch             : {'on (top-%d%s, conf>=%.2f)' % (args.prefetch_topk, ', coalesced' if args.coalesced_dma else '', args.prefetch_conf) if args.zssr_prefetch else 'off'} | "
+          f"pred {total_zp:,} correct {total_zc:,} (recall {recall:.1f}%) suppressed {total_zs:,} | prefetch {total_pf:,.1f}MB useful {total_pfu:,.1f}MB wasted {total_wasted:,.1f}MB")
+    if args.zssr_prefetch:
+        print(f"  Conf Admission            : admitted {_n_adm:,} | mean conf hit {_mch:.3f} vs miss {_mcm:.3f}")
     print(f"  DMA Causality             : demand {total_dby:,.1f}MB in {total_dms:.2f}ms (eff {eff_gbps:.1f} GB/s, EXPOSED) | "
           f"prefetch {total_pms:.2f}ms (OVERLAPPED) | overlap {overlap:.1f}%")
     print(f"  Peak VRAM GPU 0           : {peak_hbm0:7.2f} GB / 93.1 GB")
@@ -1380,6 +1407,7 @@ def serve_deepseek(args):
         # Phase 1 standardized causal telemetry
         "zssr_prefetch": bool(args.zssr_prefetch),
         "prefetch_topk": int(args.prefetch_topk),
+        "prefetch_conf": float(args.prefetch_conf),
         "coalesced_dma": bool(args.coalesced_dma),
         "pinned_staging": bool(args.pinned_staging),
         "host_register": bool(args.host_register),
@@ -1399,6 +1427,10 @@ def serve_deepseek(args):
         "zssr_predictions": total_zp,
         "zssr_correct": total_zc,
         "zssr_recall_pct": recall,
+        "zssr_suppressed": total_zs,
+        "conf_mean_hit": _mch,
+        "conf_mean_miss": _mcm,
+        "conf_admitted": _n_adm,
         "prefetch_mb": total_pf,
         "useful_prefetch_mb": total_pfu,
         "wasted_prefetch_mb": total_wasted,
@@ -1434,6 +1466,8 @@ if __name__ == "__main__":
                         help="Pre-attention ZSSR probe + grouped async DMA (prediction moves data only)")
     parser.add_argument("--prefetch_topk", type=int, default=8,
                         help="Top-K experts to prefetch per layer entrance (K=6 routing + margin)")
+    parser.add_argument("--prefetch_conf", type=float, default=0.0,
+                        help="1B': admit probes only if top-1 confidence >= thr (0.0=admit all)")
     parser.add_argument("--coalesced-dma", dest="coalesced_dma", action="store_true", default=False,
                         help="Single timing group per layer prefetch burst (few large DMAs)")
     parser.add_argument("--pinned_staging", action="store_true", default=False,
