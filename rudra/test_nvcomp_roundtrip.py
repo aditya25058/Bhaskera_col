@@ -51,10 +51,16 @@ def main():
     assert len(ref) == meta["hi_len"], (len(ref), meta["hi_len"])
 
     nvcomp = load_nvcomp()
-    print("nvcomp API:", [x for x in dir(nvcomp) if not x.startswith("_")][:40])
+    codec = nvcomp.Codec(algorithm="lz4")
     d_in = torch.frombuffer(bytearray(comp), dtype=torch.uint8).to(dev)
-    out = nvcomp.batched_lz4_decompress(d_in, meta["hi_len"])
-    got = out.cpu().numpy().tobytes()
+    src = nvcomp.as_array(d_in)
+    res = codec.decode(src)
+    print("decode type:", type(res))
+    if isinstance(res, (bytes, bytearray, memoryview)):
+        got = bytes(res)
+    else:
+        import torch.utils.dlpack as dlpack
+        got = dlpack.from_dlpack(res).cpu().numpy().tobytes()
     print(f"decompressed {len(got)}B equal={got == ref}")
     assert got == ref, "GPU decompress mismatch!"
     print("NVCOMP ROUNDTRIP PASS")
