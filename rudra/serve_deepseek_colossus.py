@@ -1266,8 +1266,6 @@ if __name__ == "__main__":
                         help="Opt out: DMA directly from mmap handles (~6GB/s staged)")
     parser.add_argument("--host_register", action="store_true", default=False,
                         help="Phase 1c: cudaHostRegister mmap tensors once for zero-copy link-rate DMA")
-    parser.add_argument("--ans_store", type=str, default=None,
-                        help="Phase 2: ANS hi-byte store dir (1.36x wire compression, exact, GPU-decoded)")
     parser.add_argument("--shard_register", action="store_true", default=False,
                         help="Phase 1c-R: one-time whole-shard HostRegister warmup (untimed), then zero-copy DMA")
     parser.add_argument("--ans_store", type=str, default=None,
