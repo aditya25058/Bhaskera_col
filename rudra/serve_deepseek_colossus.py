@@ -278,6 +278,31 @@ class DeepSeekColossusMoEWrapper(nn.Module):
             cls._ans_blobs[store_dir] = maps
         return cls._ans_blobs[store_dir]
 
+    _lo_blobs = {}
+    _lo_index = None
+
+    @classmethod
+    def _get_lo_blobmap(cls, store_dir):
+        """Contiguous lo-byte store (.lob files + lo_index.json). Falls back to None."""
+        if store_dir not in cls._lo_blobs:
+            import mmap as _mmap
+            idx_path = os.path.join(store_dir, "lo_index.json")
+            if not os.path.exists(idx_path):
+                cls._lo_blobs[store_dir] = None
+                return None
+            if cls._lo_index is None:
+                with open(idx_path) as f:
+                    cls._lo_index = json.load(f)
+            maps = {}
+            for fn in sorted(os.listdir(store_dir)):
+                if fn.endswith(".lob"):
+                    path = os.path.join(store_dir, fn)
+                    fh = open(path, "rb")
+                    mm = _mmap.mmap(fh.fileno(), 0, access=_mmap.ACCESS_COPY)
+                    maps[fn] = (fh, mm, torch.frombuffer(mm, dtype=torch.uint8))
+            cls._lo_blobs[store_dir] = maps or None
+        return cls._lo_blobs[store_dir]
+
     def __init__(
         self,
         layer_idx: int,
@@ -479,25 +504,34 @@ class DeepSeekColossusMoEWrapper(nn.Module):
         return self._ans_codec[str(device)]
 
     def _ans_stage_expert(self, expert_id: int):
-        """DMA lo-strided + comp blob for one expert. Returns stage dict (DMAs async)."""
+        """DMA lo + comp blob for one expert. Prefers contiguous lo repack (.lob);
+        falls back to strided shard views. Returns stage dict (DMAs async)."""
         idx = self._get_ans_index(self.ans_store)
         blobs = self._get_ans_blobmap(self.ans_store)
+        lo_maps = self._get_lo_blobmap(self.ans_store)
+        lo_index = self._lo_index if lo_maps else None
         pfx = f"model.layers.{self.layer_idx}.mlp.experts.{expert_id}"
         stage = {"expert": expert_id, "lo": [], "comp": [], "hi_len": [], "nbytes": 0, "shapes": []}
         for proj, pname in (("gate", "gate_proj"), ("up", "up_proj"), ("down", "down_proj")):
             key = f"{pfx}.{pname}.weight"
             meta = idx[key]
-            # lo half: raw byte span (arbitrary file offset) -> even bytes. No dtype
-            # view: safetensors data offsets are not 2-byte aligned in general.
-            shard = self.weight_map[key]
-            sm = ShardMap.get(os.path.join(self.model_dir, shard))
-            info = sm.header[key]
-            b, e = info["data_offsets"]
-            s = sm.data_start + b
-            span = sm.u8[s:s + (e - b)]
-            I0, H0 = info["shape"][0], info["shape"][1]
-            # strided view DMA'd directly (async); .contiguous() would be a sync CPU gather.
-            lo = span[0::2].reshape(I0, H0)
+            if lo_maps is not None and lo_index is not None and key in lo_index:
+                lm = lo_index[key]
+                _fh, _mm, bu8 = lo_maps[lm["lob"]]
+                lo = bu8[lm["offset"]:lm["offset"] + lm["len"]]
+                I0, H0 = lm["shape"][0], lm["shape"][1]
+                lo = lo.reshape(I0, H0)
+                stage["lo_src"] = stage.get("lo_src", "lob")
+            else:
+                shard = self.weight_map[key]
+                sm = ShardMap.get(os.path.join(self.model_dir, shard))
+                info = sm.header[key]
+                b, e = info["data_offsets"]
+                s = sm.data_start + b
+                span = sm.u8[s:s + (e - b)]
+                I0, H0 = info["shape"][0], info["shape"][1]
+                lo = span[0::2].reshape(I0, H0)
+                stage["lo_src"] = "strided"
             lo_g = lo.to(self.device, non_blocking=True)
             # comp blob slice from blob-file mapping (contiguous)
             _fh, _mm, bu8 = blobs[meta["blob"]]
