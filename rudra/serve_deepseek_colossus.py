@@ -890,6 +890,22 @@ class DeepSeekColossusMoEWrapper(nn.Module):
         r0 = bi * self.block_pool.block
         return bu8[lm["offset"] + r0 * C:lm["offset"] + (r0 + rows) * C].reshape(rows, C)
 
+    _block_blobs = {}
+
+    @classmethod
+    def _get_block_blobmap(cls, store_dir):
+        if store_dir not in cls._block_blobs:
+            import mmap as _mmap
+            maps = {}
+            for fn in sorted(os.listdir(store_dir)):
+                if fn.endswith(".bansh"):
+                    path = os.path.join(store_dir, fn)
+                    fh = open(path, "rb")
+                    mm = _mmap.mmap(fh.fileno(), 0, access=_mmap.ACCESS_COPY)
+                    maps[fn] = (fh, mm, torch.frombuffer(mm, dtype=torch.uint8))
+            cls._block_blobs[store_dir] = maps
+        return cls._block_blobs[store_dir]
+
     def _block_decode_many(self, descs):
         """ONE nvcomp decode for every missed block across a layer's descs, then
         install (resident HBM copies + fresh assembles) into slots and pool.
@@ -897,15 +913,28 @@ class DeepSeekColossusMoEWrapper(nn.Module):
         import torch.utils.dlpack as dlpack
         pool = self.block_pool
         pool._ensure_cap(int(getattr(self.cfg, "hidden_size", 5120)))
-        self._get_lo_blobmap(self.ans_store)  # ensures _lo_index for block slicing
-        lo_maps = self._get_lo_blobmap(self.ans_store)
-        blob_maps = self._get_ans_blobmap(self.ans_store)
+        lo_maps = self._get_lo_blobmap(self.ans_store) if self.ans_store else None
+        blob_maps = self._get_block_blobmap(self.block_store)
         # 1. Stage all miss blocks: DMA lo-slice + comp blob per block.
         stage = []  # (desc, pkey, meta, lo_g, comp_g)
         for desc in descs:
             for (pkey, m) in desc["misses"]:
                 _L, _E, _bi, _pname = pkey
-                lm = self._lo_block_view(_L, _E, _bi, _pname, lo_maps)
+                if lo_maps is not None:
+                    lm = self._lo_block_view(_L, _E, _bi, _pname, lo_maps)
+                else:
+                    # strided fallback: even bytes from original shard (async DMA)
+                    tkey = f"model.layers.{_L}.mlp.experts.{_E}.{_pname}.weight"
+                    shard = self.weight_map[tkey]
+                    sm = ShardMap.get(os.path.join(self.model_dir, shard))
+                    info = sm.header[tkey]
+                    b, e = info["data_offsets"]
+                    s = sm.data_start + b
+                    span = sm.u8[s:s + (e - b)]
+                    R, C = info["shape"][0], info["shape"][1]
+                    rows = min(pool.block, R - _bi * pool.block)
+                    r0 = _bi * pool.block
+                    lm = span[r0 * C * 2:(r0 + rows) * C * 2].reshape(rows, C * 2)[:, 0::2].reshape(rows, C)
                 lo = lm.to(self.device, non_blocking=True)
                 _fh, _mm, bu8 = blob_maps[m["blob"]]
                 cb = bu8[m["offset"]:m["offset"] + m["comp_len"]]
