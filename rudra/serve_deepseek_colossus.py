@@ -696,8 +696,11 @@ class DeepSeekColossusMoEWrapper(nn.Module):
     @staticmethod
     def _col_energy_topk(h_vec, gate_w, up_w, k: int):
         import torch.nn.functional as F
+        import torch
         with torch.no_grad():
-            e = (F.silu(h_vec @ gate_w.T) * (h_vec @ up_w.T)).pow(2).squeeze(0)
+            # Energy scoring is CPU fp32 by design (matches predictor.py); move h once.
+            h = h_vec.detach().float().cpu().reshape(-1, gate_w.shape[1])[-1:]
+            e = (F.silu(h @ gate_w.T) * (h @ up_w.T)).pow(2).squeeze(0)
             return torch.topk(e, k=min(k, e.numel())).indices.tolist()
 
     @torch.no_grad()
