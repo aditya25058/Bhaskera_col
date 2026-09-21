@@ -1254,6 +1254,7 @@ def serve_deepseek(args):
     last_hits = sum(w.hits for w in colossus_wrappers)
     last_misses = sum(w.misses for w in colossus_wrappers)
     last_dma = sum(w.dma_bytes for w in colossus_wrappers)
+    last_ansd = sum(w.ans_bytes_m for w in colossus_wrappers)
     last_zp = sum(w.zssr_predictions for w in colossus_wrappers)
     last_zc = sum(w.zssr_correct for w in colossus_wrappers)
     last_pf = sum(w.prefetch_bytes_total for w in colossus_wrappers)
@@ -1302,8 +1303,10 @@ def serve_deepseek(args):
         step_recall = (step_zc / step_zp * 100.0) if step_zp else 0.0
         step_pfu_mb = (cur_pfu - last_pfu) / (1024**2)
         step_dby_mb = (cur_dby - last_dby) / (1024**2)
+        step_ansd_mb = (sum(w.ans_bytes_m for w in colossus_wrappers) - last_ansd) / (1024**2)
+        last_ansd = sum(w.ans_bytes_m for w in colossus_wrappers)
         step_dms = (cur_dms - last_dms) * 1000.0
-        step_exposed = step_dby_mb  # demand loads issue post-verify: exposed by construction
+        step_exposed = step_dby_mb + step_ansd_mb  # all demand transfers issue post-verify
         step_useful = step_pfu_mb   # prefetched bytes actually consumed: overlapped by construction
         step_overlap = (step_useful / (step_useful + step_exposed) * 100.0) if (step_useful + step_exposed) else 0.0
 
@@ -1366,7 +1369,6 @@ def serve_deepseek(args):
     total_stage_ms = sum(w.ans_stage_ms for w in colossus_wrappers)
     total_inter_ms = sum(w.ans_interleave_ms for w in colossus_wrappers)
     exposed_ans = total_ans_mb  # demand ANS transfers issue post-verify: on critical path
-    hidden_est = total_pfu  # speculative bytes consumed (whole or ANS path): overlapped by construction
     # Phase 1A column P/R aggregation (micro-averaged over all layer-steps)
     col_pr = {}
     for K in (128, 256, 512, 768, 1024):
@@ -1390,7 +1392,9 @@ def serve_deepseek(args):
     total_dms = sum(w.demand_dma_ms for w in colossus_wrappers) * 1000.0
     total_pms = sum(w.prefetch_dma_ms for w in colossus_wrappers) * 1000.0
     total_wasted = total_pf - total_pfu
+    hidden_est = total_pfu  # speculative bytes consumed (whole or ANS path): overlapped by construction
     recall = (total_zc / total_zp * 100.0) if total_zp else 0.0
+    exposed_tot = total_dby + total_ans_mb  # all demand transfers issue post-verify
     # 1B': confidence-conditioned recall + admitted metadata (mean conf hit vs miss)
     _confs_hit, _confs_miss, _n_adm = [], [], 0
     for w in colossus_wrappers:
@@ -1399,7 +1403,7 @@ def serve_deepseek(args):
             (_confs_hit if _h else _confs_miss).append(_c)
     _mch = sum(_confs_hit) / max(1, len(_confs_hit))
     _mcm = sum(_confs_miss) / max(1, len(_confs_miss))
-    overlap = (total_pfu / (total_pfu + total_dby) * 100.0) if (total_pfu + total_dby) else 0.0
+    overlap = (total_pfu / (total_pfu + exposed_tot) * 100.0) if (total_pfu + exposed_tot) else 0.0
     eff_gbps = (sum(w.demand_bytes_m for w in colossus_wrappers) / (1024**3)) / (sum(w.demand_dma_ms for w in colossus_wrappers) + 1e-12)
     ref_text = "def quicksort(arr):\n    if len(arr) <= 1:\n        return arr\n"
 
@@ -1519,6 +1523,7 @@ def serve_deepseek(args):
         "demand_dma_ms": total_dms,
         "prefetch_dma_ms": total_pms,
         "overlap_pct": overlap,
+        "exposed_mb": exposed_tot,
         "effective_gbps": eff_gbps,
         "exact_vs_baseline": (gen_text == ref_text) if (prompt == "def quicksort(arr):" and args.max_new_tokens == 16) else None,
         "peak_vram_gpu0_gb": peak_hbm0,
