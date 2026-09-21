@@ -475,7 +475,7 @@ class DeepSeekColossusMoEWrapper(nn.Module):
             info = sm.header[key]
             b, e = info["data_offsets"]
             s = sm.data_start + b
-            span = sm.u8[s:e]
+            span = sm.u8[s:s + (e - b)]
             I0, H0 = info["shape"][0], info["shape"][1]
             lo = span[0::2].reshape(I0, H0).contiguous()
             lo_g = lo.to(self.device, non_blocking=True)
