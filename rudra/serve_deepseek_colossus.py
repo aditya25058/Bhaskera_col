@@ -663,9 +663,7 @@ class DeepSeekColossusMoEWrapper(nn.Module):
         for pname in ("gate_proj", "up_proj", "down_proj"):
             key = f"{pfx}.{pname}.weight"
             ref = self.handles[self.weight_map[key]].get_tensor(key)
-            got = self._exp_proj(self.slots[slot_idx],
-                                 {"gate_proj": "gate", "up_proj": "up",
-                                  "down_proj": "down"}[pname]).weight.data
+            got = getattr(self.slots[slot_idx], pname).weight.data
             ok = ok and torch.equal(got.cpu(), ref.cpu())
         # unbind check slot (pool entries remain as valid cache)
         self.expert_to_slot.pop(0, None)
