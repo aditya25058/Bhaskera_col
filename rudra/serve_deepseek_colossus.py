@@ -117,6 +117,22 @@ class FastExpertSlot(nn.Module):
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
+_VENV_SITE = "/home/palakm/MoEServingSim/aditya/venv/lib/python3.10/site-packages"
+
+
+def _load_nvcomp():
+    """Official nvidia.nvcomp bindings (namespace-shadow fix). Returns module or None."""
+    try:
+        import nvidia
+        _nvd = os.path.join(_VENV_SITE, "nvidia")
+        if _nvd not in list(nvidia.__path__):
+            nvidia.__path__.append(_nvd)
+        import nvidia.nvcomp as nvcomp
+        return nvcomp
+    except Exception:
+        return None
+
+
 class ShardMap:
     """Phase 1c-R: whole-file aligned mmap + parsed safetensors header, one mapping per shard.
 
@@ -202,6 +218,66 @@ class DeepSeekColossusMoEWrapper(nn.Module):
                 cls._cudart_failed = True
         return cls._cudart
 
+    # Phase 2 (--ans): shared pinned staging + GPU scratch for ANS path.
+    # Staging (host): comp_stg 16MB + lo_stg 24MB pinned. Scratch (per device):
+    # lo",(per-proj 7.9MB) + comp segs + hi (per-proj) + single nvcomp Codec.
+    # Layers execute sequentially so one shared set per device is race-free.
+    _ans_staging = None
+    _ans_scratch = {}
+    _ans_codec = {}
+    _ans_index = None
+    _ans_blobs = {}
+
+    @classmethod
+    def _get_ans_staging(cls):
+        if cls._ans_staging is None:
+            cls._ans_staging = (
+                torch.empty(16 * 1024 * 1024, dtype=torch.uint8, device="cpu", pin_memory=True),
+                torch.empty(24 * 1024 * 1024, dtype=torch.uint8, device="cpu", pin_memory=True),
+            )
+        return cls._ans_staging
+
+    @classmethod
+    def _get_ans_scratch(cls, device, hidden, inter):
+        key = str(device)
+        if key not in cls._ans_scratch:
+            dt = torch.bfloat16
+            hb = inter * hidden  # bytes per full projection (bf16)
+            hb2 = hb // 2        # bytes per lo/hi half
+            cls._ans_scratch[key] = {
+                "lo": [torch.empty((inter, hidden), dtype=torch.uint8, device=device),
+                       torch.empty((inter, hidden), dtype=torch.uint8, device=device),
+                       torch.empty((hidden, inter), dtype=torch.uint8, device=device)],
+                "comp": torch.empty(16 * 1024 * 1024, dtype=torch.uint8, device=device),
+                "hi": [torch.empty((inter, hidden), dtype=torch.uint8, device=device),
+                       torch.empty((inter, hidden), dtype=torch.uint8, device=device),
+                       torch.empty((hidden, inter), dtype=torch.uint8, device=device)],
+            }
+            nvcomp = _load_nvcomp()
+            cls._ans_codec[key] = nvcomp.Codec(algorithm="ans") if nvcomp else None
+        return cls._ans_scratch[key], cls._ans_codec.get(key)
+
+    @classmethod
+    def _get_ans_index(cls, store_dir):
+        if cls._ans_index is None:
+            with open(os.path.join(store_dir, "index.json")) as f:
+                cls._ans_index = json.load(f)
+        return cls._ans_index
+
+    @classmethod
+    def _get_ans_blobmap(cls, store_dir):
+        if store_dir not in cls._ans_blobs:
+            import mmap as _mmap
+            maps = {}
+            for fn in sorted(os.listdir(store_dir)):
+                if fn.endswith(".ansh"):
+                    path = os.path.join(store_dir, fn)
+                    fh = open(path, "rb")
+                    mm = _mmap.mmap(fh.fileno(), 0, access=_mmap.ACCESS_COPY)
+                    maps[fn] = (fh, mm, torch.frombuffer(mm, dtype=torch.uint8))
+            cls._ans_blobs[store_dir] = maps
+        return cls._ans_blobs[store_dir]
+
     def __init__(
         self,
         layer_idx: int,
@@ -219,6 +295,7 @@ class DeepSeekColossusMoEWrapper(nn.Module):
         host_register: bool = False,
         model_dir: str = None,
         shard_register: bool = False,
+        ans_store: str = None,
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -237,6 +314,10 @@ class DeepSeekColossusMoEWrapper(nn.Module):
         self.host_register = bool(host_register)
         self.model_dir = model_dir
         self.shard_register = bool(shard_register)
+        self.ans_store = ans_store
+        self.ans_bytes_m = 0
+        self.ans_decomp_ms = 0.0
+        self.ans_dispatches = 0
         self._hostreg_ok = {}
         self._hostreg_failed = set()
         self.hostreg_pinned_gb = 0.0
@@ -369,6 +450,124 @@ class DeepSeekColossusMoEWrapper(nn.Module):
         except Exception:
             return None
 
+    def _ans_codec_for(self, device):
+        if str(device) not in self._ans_codec or self._ans_codec[str(device)] is None:
+            nvcomp = _load_nvcomp()
+            if nvcomp is None:
+                return None
+            self._ans_scratch[str(device)] = True  # marker; scratch alloc'd per call
+            self._ans_codec[str(device)] = nvcomp.Codec(algorithm="ans")
+        return self._ans_codec[str(device)]
+
+    def _ans_stage_expert(self, expert_id: int):
+        """DMA lo-strided + comp blob for one expert. Returns stage dict (DMAs async)."""
+        idx = self._get_ans_index(self.ans_store)
+        blobs = self._get_ans_blobmap(self.ans_store)
+        pfx = f"model.layers.{self.layer_idx}.mlp.experts.{expert_id}"
+        stage = {"expert": expert_id, "lo": [], "comp": [], "hi_len": [], "nbytes": 0}
+        for proj, pname in (("gate", "gate_proj"), ("up", "up_proj"), ("down", "down_proj")):
+            key = f"{pfx}.{pname}.weight"
+            meta = idx[key]
+            # lo half: strided even bytes from original shard mapping (zero-copy view)
+            shard = self.weight_map[key]
+            full = ShardMap.get(os.path.join(self.model_dir, shard)).view_tensor(key)
+            lo = full.view(torch.uint8).reshape(full.shape[0], -1)[:, 0::2].contiguous()
+            lo_g = lo.to(self.device, non_blocking=True)
+            # comp blob slice from blob-file mapping (contiguous)
+            _fh, _mm, bu8 = blobs[meta["blob"]]
+            cb = bu8[meta["offset"]:meta["offset"] + meta["comp_len"]]
+            comp_g = cb.to(self.device, non_blocking=True)
+            stage["lo"].append(lo_g)
+            stage["comp"].append((comp_g, meta["hi_len"]))
+            stage["hi_len"].append(meta["hi_len"])
+            stage["nbytes"] += lo_g.nbytes + comp_g.nbytes
+        return stage
+
+    def _ans_decode_batch(self, stages):
+        """ONE nvcomp batched ANS decode for a layer's staged misses. Returns list of hi blobs."""
+        nvcomp = _load_nvcomp()
+        codec = self._ans_codec_for(self.device)
+        arrs = []
+        for st in stages:
+            for comp_g, _hi_len in st["comp"]:
+                arrs.append(nvcomp.as_array(comp_g))
+        return codec.decode(arrs)
+
+    def ans_self_check(self) -> bool:
+        """Reconstruct layer expert-0 via ANS path; torch.equal vs safe_open. Structural gate."""
+        import torch.utils.dlpack as dlpack
+        pfx = f"model.layers.{self.layer_idx}.mlp.experts.0"
+        st = self._ans_stage_expert(0)
+        torch.cuda.synchronize(self.device)
+        dec = self._ans_decode_batch([st])
+        his = []
+        for d in dec:
+            his.append(bytes(d) if isinstance(d, (bytes, bytearray, memoryview))
+                       else dlpack.from_dlpack(d).cpu().numpy().tobytes())
+        # Per-projection interleave + compare (exact byte reconstruction)
+        ok = True
+        for pi, pname in enumerate(("gate_proj", "up_proj", "down_proj")):
+            key = f"{pfx}.{pname}.weight"
+            ref = self.handles[self.weight_map[key]].get_tensor(key)
+            full = ShardMap.get(os.path.join(self.model_dir, self.weight_map[key])).view_tensor(key)
+            lo = full.view(torch.uint8).reshape(full.shape[0], -1)[:, 0::2].contiguous()
+            hi_t = torch.frombuffer(bytearray(his[pi]), dtype=torch.uint8).reshape(full.shape[0], -1)
+            rec = torch.empty(full.shape[0], full.shape[1] * 2, dtype=torch.uint8)
+            rec[:, 0::2] = lo
+            rec[:, 1::2] = hi_t
+            ok = ok and torch.equal(rec.view(torch.bfloat16).reshape(ref.shape).cpu(), ref.cpu())
+        return bool(ok)
+
+    def _ans_interleave(self, slot_idx: int, lo_list, hi_list):
+        """Assemble exact BF16 expert weights in slot from lo/hi uint8 halves (GPU D2D)."""
+        slot = self.slots[slot_idx]
+        projs = (slot.gate_proj.weight, slot.up_proj.weight, slot.down_proj.weight)
+        for w, lo, hi in zip(projs, lo_list, hi_list):
+            w8 = w.view(torch.uint8).reshape(w.shape[0], -1)
+            w8[:, 0::2].copy_(lo, non_blocking=True)
+            w8[:, 1::2].copy_(hi, non_blocking=True)
+
+    def _load_experts_ans(self, exp_ids):
+        """Batched ANS miss path: stage all, ONE nvcomp decode, interleave all. Exact."""
+        import torch.utils.dlpack as dlpack
+        staged, slots = [], []
+        for exp_id in exp_ids:
+            self.misses += 1
+            slot_idx = self.slot_lru.pop(0)
+            staged.append(self._ans_stage_expert(exp_id))
+            slots.append(slot_idx)
+            self.ans_bytes_m += staged[-1]["nbytes"]
+        if not staged:
+            return
+        self.dma_bytes += sum(s["nbytes"] for s in staged)
+        ev0 = torch.cuda.Event(enable_timing=True)
+        ev1 = torch.cuda.Event(enable_timing=True)
+        ev0.record(torch.cuda.current_stream(self.device))
+        dec = self._ans_decode_batch(staged)
+        ev1.record(torch.cuda.current_stream(self.device))
+        ev1.synchronize()
+        self.ans_decomp_ms += ev0.elapsed_time(ev1) / 1000.0
+        self.ans_dispatches += len(staged)
+        flat = []
+        for d in dec:
+            flat.append(bytes(d) if isinstance(d, (bytes, bytearray, memoryview))
+                        else dlpack.from_dlpack(d).cpu().numpy().tobytes())
+        pos = 0
+        for exp_id, slot_idx, st in zip(exp_ids, slots, staged):
+            his = []
+            for pi, hi_len in enumerate(st["hi_len"]):
+                hb = flat[pos]
+                pos += 1
+                assert len(hb) == hi_len, (len(hb), hi_len)
+                I, H = st["lo"][pi].shape[0], st["lo"][pi].shape[1]
+                his.append(torch.frombuffer(bytearray(hb), dtype=torch.uint8).reshape(I, H).to(self.device))
+            self._ans_interleave(slot_idx, st["lo"], his)
+            if slot_idx in self.slot_to_expert:
+                self.expert_to_slot.pop(self.slot_to_expert[slot_idx], None)
+            self.slot_to_expert[slot_idx] = exp_id
+            self.expert_to_slot[exp_id] = slot_idx
+            self.slot_lru.append(slot_idx)
+
     def _load_expert_to_slot(self, expert_id: int, slot_idx: int, kind: str = "demand",
                              record: bool = True):
         slot_mod = self.slots[slot_idx]
@@ -494,12 +693,15 @@ class DeepSeekColossusMoEWrapper(nn.Module):
 
             missing_experts = [e for e in needed_experts if e not in self.expert_to_slot]
             if missing_experts:
-                for exp_id in missing_experts:
-                    self.misses += 1
-                    slot_idx = self.slot_lru.pop(0)
-                    self._load_expert_to_slot(exp_id, slot_idx)
-                    self.slot_lru.append(slot_idx)
-                torch.cuda.current_stream(self.device).wait_stream(self.dma_stream)
+                if self.ans_store:
+                    self._load_experts_ans(missing_experts)
+                else:
+                    for exp_id in missing_experts:
+                        self.misses += 1
+                        slot_idx = self.slot_lru.pop(0)
+                        self._load_expert_to_slot(exp_id, slot_idx)
+                        self.slot_lru.append(slot_idx)
+                    torch.cuda.current_stream(self.device).wait_stream(self.dma_stream)
 
 
         # 4. Compute routed experts
@@ -523,6 +725,10 @@ class DeepSeekColossusMoEWrapper(nn.Module):
                     self.hits += 1
                     self.slot_lru.remove(slot_idx)
                     self.slot_lru.append(slot_idx)
+            elif self.ans_store:
+                # On-demand ANS load for multi-token prefill where needed > capacity
+                self._load_experts_ans([i])
+                slot_idx = self.expert_to_slot[i]
             else:
                 # On-demand load for multi-token prefill where needed_experts > capacity
                 self.misses += 1
@@ -671,6 +877,7 @@ def serve_deepseek(args):
             host_register=args.host_register,
             model_dir=MODEL_PATH,
             shard_register=args.shard_register,
+            ans_store=args.ans_store,
         )
 
         if args.warm_slots:
@@ -740,6 +947,13 @@ def serve_deepseek(args):
         for l_idx in range(1, cfg.num_hidden_layers):
             model.model.layers[l_idx].register_forward_pre_hook(
                 _make_zssr_hook(colossus_wrappers[l_idx - 1]))
+
+    if args.ans_store:
+        # Phase 2 structural gate: reconstruct layer-1 expert-0 via ANS path.
+        print(f"  ANS self-check (layer 1 expert 0 vs safe_open, torch.equal)...")
+        ok = colossus_wrappers[0].ans_self_check()
+        print(f"  ANS self-check: {'PASS' if ok else 'FAIL'}")
+        assert ok, "ANS reconstruction mismatch — aborting before timed run."
     model.eval()
 
 
@@ -770,6 +984,9 @@ def serve_deepseek(args):
         w.prefetch_dma_ms = 0.0
         w._dma_pending = []
         w._prefetched = {}
+        w.ans_bytes_m = 0
+        w.ans_decomp_ms = 0.0
+        w.ans_dispatches = 0
 
     generated_ids = input_ids.clone()
 
@@ -907,6 +1124,10 @@ def serve_deepseek(args):
     total_lookups = total_hits + total_misses
     hit_rate = (total_hits / total_lookups * 100.0) if total_lookups > 0 else 0.0
     total_dma_mb = sum(w.dma_bytes for w in colossus_wrappers) / (1024**2)
+    total_ans_mb = sum(w.ans_bytes_m for w in colossus_wrappers) / (1024**2)
+    total_ans_n = sum(w.ans_dispatches for w in colossus_wrappers)
+    total_ans_dms = sum(w.ans_decomp_ms for w in colossus_wrappers) * 1000.0
+    ans_ratio = (total_ans_mb / total_dma_mb) if total_dma_mb else 0.0
     # Phase 1 causal set
     total_zp = sum(w.zssr_predictions for w in colossus_wrappers)
     total_zc = sum(w.zssr_correct for w in colossus_wrappers)
@@ -944,6 +1165,9 @@ def serve_deepseek(args):
     print(f"  Cache Hits                : {total_hits:,} ({hit_rate:.1f}%)")
     print(f"  Cache Misses (Cold DMA)   : {total_misses:,}")
     print(f"  Total PCIe DMA Transferred: {total_dma_mb:7.1f} MB")
+    if args.ans_store:
+        print(f"  ANS Wire Compression      : {total_ans_n:,} dispatches, {total_ans_mb:,.1f}MB "
+              f"(ratio {ans_ratio:.3f} vs 45MB whole), decomp {total_ans_dms:.2f}ms")
     print(f"  ZSSR Prefetch             : {'on (top-%d%s)' % (args.prefetch_topk, ', coalesced' if args.coalesced_dma else '') if args.zssr_prefetch else 'off'} | "
           f"pred {total_zp:,} correct {total_zc:,} (recall {recall:.1f}%) | prefetch {total_pf:,.1f}MB useful {total_pfu:,.1f}MB wasted {total_wasted:,.1f}MB")
     print(f"  DMA Causality             : demand {total_dby:,.1f}MB in {total_dms:.2f}ms (eff {eff_gbps:.1f} GB/s, EXPOSED) | "
@@ -991,6 +1215,11 @@ def serve_deepseek(args):
         "shard_reg_shards": len(DeepSeekColossusMoEWrapper._shard_registered),
         "shard_reg_gb": DeepSeekColossusMoEWrapper._shard_reg_gb,
         "shard_reg_seconds": DeepSeekColossusMoEWrapper._shard_reg_seconds,
+        "ans_store": args.ans_store,
+        "ans_dispatches": total_ans_n,
+        "ans_mb": total_ans_mb,
+        "ans_ratio": ans_ratio,
+        "ans_decomp_ms": total_ans_dms,
         "zssr_predictions": total_zp,
         "zssr_correct": total_zc,
         "zssr_recall_pct": recall,
@@ -1037,8 +1266,12 @@ if __name__ == "__main__":
                         help="Opt out: DMA directly from mmap handles (~6GB/s staged)")
     parser.add_argument("--host_register", action="store_true", default=False,
                         help="Phase 1c: cudaHostRegister mmap tensors once for zero-copy link-rate DMA")
+    parser.add_argument("--ans_store", type=str, default=None,
+                        help="Phase 2: ANS hi-byte store dir (1.36x wire compression, exact, GPU-decoded)")
     parser.add_argument("--shard_register", action="store_true", default=False,
                         help="Phase 1c-R: one-time whole-shard HostRegister warmup (untimed), then zero-copy DMA")
+    parser.add_argument("--ans_store", type=str, default=None,
+                        help="Phase 2: ANS hi-byte store dir (0.70 wire ratio, exact, GPU-decoded)")
 
 
     parser.add_argument("--use_cache", action="store_true", default=True)
