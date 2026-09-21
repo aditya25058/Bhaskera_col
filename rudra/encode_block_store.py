@@ -106,7 +106,9 @@ def main():
                     if not isinstance(enc, list):
                         enc = [enc]
                     for (bi, nrows), a in zip(metas, enc):
-                        eb = dlpack.from_dlpack(a).cpu().numpy().tobytes()
+                        # a.size = ACTUAL payload bytes (buffer may be padded to max)
+                        eb_full = dlpack.from_dlpack(a).cpu().numpy().tobytes()
+                        eb = eb_full[:a.size]
                         pos = out.tell()
                         out.write(eb)
                         index[f"{l}/{e}/{bi}/{proj}"] = {
