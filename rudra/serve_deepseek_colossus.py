@@ -464,14 +464,20 @@ class DeepSeekColossusMoEWrapper(nn.Module):
         idx = self._get_ans_index(self.ans_store)
         blobs = self._get_ans_blobmap(self.ans_store)
         pfx = f"model.layers.{self.layer_idx}.mlp.experts.{expert_id}"
-        stage = {"expert": expert_id, "lo": [], "comp": [], "hi_len": [], "nbytes": 0}
+        stage = {"expert": expert_id, "lo": [], "comp": [], "hi_len": [], "nbytes": 0, "shapes": []}
         for proj, pname in (("gate", "gate_proj"), ("up", "up_proj"), ("down", "down_proj")):
             key = f"{pfx}.{pname}.weight"
             meta = idx[key]
-            # lo half: strided even bytes from original shard mapping (zero-copy view)
+            # lo half: raw byte span (arbitrary file offset) -> even bytes. No dtype
+            # view: safetensors data offsets are not 2-byte aligned in general.
             shard = self.weight_map[key]
-            full = ShardMap.get(os.path.join(self.model_dir, shard)).view_tensor(key)
-            lo = full.view(torch.uint8).reshape(full.shape[0], -1)[:, 0::2].contiguous()
+            sm = ShardMap.get(os.path.join(self.model_dir, shard))
+            info = sm.header[key]
+            b, e = info["data_offsets"]
+            s = sm.data_start + b
+            span = sm.u8[s:e]
+            I0, H0 = info["shape"][0], info["shape"][1]
+            lo = span[0::2].reshape(I0, H0).contiguous()
             lo_g = lo.to(self.device, non_blocking=True)
             # comp blob slice from blob-file mapping (contiguous)
             _fh, _mm, bu8 = blobs[meta["blob"]]
@@ -509,10 +515,14 @@ class DeepSeekColossusMoEWrapper(nn.Module):
         for pi, pname in enumerate(("gate_proj", "up_proj", "down_proj")):
             key = f"{pfx}.{pname}.weight"
             ref = self.handles[self.weight_map[key]].get_tensor(key)
-            full = ShardMap.get(os.path.join(self.model_dir, self.weight_map[key])).view_tensor(key)
-            lo = full.view(torch.uint8).reshape(full.shape[0], -1)[:, 0::2].contiguous()
-            hi_t = torch.frombuffer(bytearray(his[pi]), dtype=torch.uint8).reshape(full.shape[0], -1)
-            rec = torch.empty(full.shape[0], full.shape[1] * 2, dtype=torch.uint8)
+            sm = ShardMap.get(os.path.join(self.model_dir, self.weight_map[key]))
+            info = sm.header[key]
+            b, e = info["data_offsets"]
+            span = sm.u8[sm.data_start + b:sm.data_start + e]
+            I0, H0 = info["shape"][0], info["shape"][1]
+            lo = span[0::2].reshape(I0, H0).contiguous()
+            hi_t = torch.frombuffer(bytearray(his[pi]), dtype=torch.uint8).reshape(I0, H0)
+            rec = torch.empty(I0, H0 * 2, dtype=torch.uint8)
             rec[:, 0::2] = lo
             rec[:, 1::2] = hi_t
             ok = ok and torch.equal(rec.view(torch.bfloat16).reshape(ref.shape).cpu(), ref.cpu())
