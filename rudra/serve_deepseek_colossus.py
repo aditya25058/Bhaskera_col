@@ -296,6 +296,9 @@ class DeepSeekColossusMoEWrapper(nn.Module):
         model_dir: str = None,
         shard_register: bool = False,
         ans_store: str = None,
+        col_measure: bool = False,
+        col_topk_max: int = 512,
+        col_pred_experts: int = 8,
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -319,6 +322,17 @@ class DeepSeekColossusMoEWrapper(nn.Module):
         self.ans_decomp_ms = 0.0
         self.ans_dispatches = 0
         self._ans_dec_pending = []
+        # Phase 1A: column-prediction measurement (NO movement change; execution untouched)
+        self.col_measure = bool(col_measure)
+        self.col_topk_max = int(col_topk_max)
+        self.col_pred_experts = int(col_pred_experts)
+        self._h_pre = None            # stashed by layer-entrance hook (pre-attention hidden)
+        self._col_w = {}              # expert_id -> (gate_cpu_f32, up_cpu_f32), small LRU
+        self.col_pred_bytes = 0
+        self.col_actual_bytes = 0
+        self.col_hit_at = {}          # K -> intersection count
+        self.col_pred_at = {}         # K -> predicted count
+        self.col_actual_at = {}       # K -> actual count
         self._hostreg_ok = {}
         self._hostreg_failed = set()
         self.hostreg_pinned_gb = 0.0
@@ -665,6 +679,68 @@ class DeepSeekColossusMoEWrapper(nn.Module):
             self._dma_end(ev_s, kind, nbytes)
         return nbytes
 
+    def _col_weights(self, expert_id: int):
+        """Lazy CPU fp32 gate/up for column-energy scoring (cap 16/layer, ~500MB max)."""
+        if expert_id in self._col_w:
+            return self._col_w[expert_id]
+        pfx = f"model.layers.{self.layer_idx}.mlp.experts.{expert_id}"
+        g = self.handles[self.weight_map[f"{pfx}.gate_proj.weight"]].get_tensor(f"{pfx}.gate_proj.weight")
+        u = self.handles[self.weight_map[f"{pfx}.up_proj.weight"]].get_tensor(f"{pfx}.up_proj.weight")
+        out = (g.float(), u.float())
+        if len(self._col_w) >= 16:
+            self._col_w.pop(next(iter(self._col_w)))
+        self._col_w[expert_id] = out
+        del g, u
+        return out
+
+    @staticmethod
+    def _col_energy_topk(h_vec, gate_w, up_w, k: int):
+        import torch.nn.functional as F
+        with torch.no_grad():
+            e = (F.silu(h_vec @ gate_w.T) * (h_vec @ up_w.T)).pow(2).squeeze(0)
+            return torch.topk(e, k=min(k, e.numel())).indices.tolist()
+
+    @torch.no_grad()
+    def col_measure_step(self, h_post, topk_actual):
+        """Phase 1A: predicted (h_pre, energy-ranked) vs actual (h_post, energy-ranked) columns.
+
+        No movement, no slot changes. Ground truth = top-K energy columns using the
+        TRUE post-attention hidden state for each NATIVELY routed expert.
+        """
+        import torch.nn.functional as F
+        if self._h_pre is None:
+            return
+        KMAX = self.col_topk_max
+        KS = (128, 256, 512)
+        h_pre = self._h_pre.detach().float().reshape(-1, self.gate.weight.shape[1])[-1:]
+        h_true = h_post.detach().float().reshape(-1, self.gate.weight.shape[1])[-1:]
+        col_bytes = 3 * int(getattr(self.cfg, "hidden_size", 5120)) * 2  # per column (BF16)
+        # Expert probe from pre-attention stream
+        logits = (h_pre @ self.gate.weight.detach().float().t()).squeeze(0)
+        pred_experts = torch.topk(logits, k=min(self.col_pred_experts, logits.numel())).indices.tolist()
+        actual_experts = topk_actual.unique().tolist() if hasattr(topk_actual, "unique") else list(topk_actual)
+        for exp_id in pred_experts:
+            g, u = self._col_weights(exp_id)
+            pred_cols = self._col_energy_topk(h_pre, g, u, KMAX)
+            self.col_pred_bytes += len(pred_cols) * col_bytes
+            for K in KS:
+                if K > len(pred_cols):
+                    continue
+                ps = set(pred_cols[:K])
+                self.col_pred_at[K] = self.col_pred_at.get(K, 0) + len(ps)
+                if exp_id in actual_experts:
+                    ga, ua = self._col_weights(exp_id)
+                    act_cols = set(self._col_energy_topk(h_true, ga, ua, KMAX)[:K])
+                    self.col_actual_at[K] = self.col_actual_at.get(K, 0) + len(act_cols)
+                    self.col_hit_at[K] = self.col_hit_at.get(K, 0) + len(ps & act_cols)
+        for exp_id in actual_experts:
+            if exp_id not in pred_experts:
+                ga, ua = self._col_weights(exp_id)
+                act_cols = self._col_energy_topk(h_true, ga, ua, KMAX)
+                for K in KS:
+                    if K <= len(act_cols):
+                        self.col_actual_at[K] = self.col_actual_at.get(K, 0) + K
+
     @torch.no_grad()
     def zssr_prefetch(self, hidden_in: torch.Tensor):
         """Phase 1 probe (called at layer entrance, pre-attention).
@@ -707,6 +783,13 @@ class DeepSeekColossusMoEWrapper(nn.Module):
         # 1. Gate routing (returns topk_idx, topk_weight, aux_loss)
         topk_indices, topk_weights, _ = self.gate(hidden_states)
         needed_experts = topk_indices.unique().tolist()
+
+        # Phase 1A: column P/R measurement (no movement, no slot changes)
+        if self.col_measure:
+            try:
+                self.col_measure_step(hidden_states, topk_indices)
+            except Exception:
+                pass
 
         # Phase 1 verify: reconcile ZSSR prediction against ground-truth routing.
         if self._prefetched:
@@ -917,6 +1000,9 @@ def serve_deepseek(args):
             model_dir=MODEL_PATH,
             shard_register=args.shard_register,
             ans_store=args.ans_store,
+            col_measure=args.col_measure,
+            col_topk_max=args.col_topk_max,
+            col_pred_experts=args.col_pred_experts,
         )
 
         if args.warm_slots:
@@ -968,19 +1054,22 @@ def serve_deepseek(args):
               f"({dt_w / max(1, len(DeepSeekColossusMoEWrapper._shard_registered)):.2f}s/shard)")
         sys.stdout.flush()
 
-    if args.zssr_prefetch:
-        # Phase 1 probes: layer-entrance (pre-attention) ZSSR prefetch hooks.
-        # Registered AFTER P2P hooks so the probe sees post-move tensors.
-        print(f"  Installing ZSSR pre-attention prefetch hooks (top-{args.prefetch_topk}, "
-              f"coalesced={args.coalesced_dma}) on layers 1..59...")
+    if args.zssr_prefetch or args.col_measure:
+        # Layer-entrance hooks: ALWAYS stash pre-attention hidden (1A measurement);
+        # prefetch DMA only when --zssr-prefetch. Registered AFTER P2P hooks.
+        print(f"  Installing layer-entrance hooks (stash h_pre"
+              f"{f' + ZSSR prefetch top-{args.prefetch_topk}' if args.zssr_prefetch else ''}"
+              f"{' + column-P/R measurement' if args.col_measure else ''}) on layers 1..59...")
         def _make_zssr_hook(wrapper):
             def _hook(module, hook_args):
                 try:
                     hidden_in = hook_args[0]
                     if isinstance(hidden_in, torch.Tensor):
-                        wrapper.zssr_prefetch(hidden_in)
+                        wrapper._h_pre = hidden_in.detach()
+                        if wrapper.zssr_enabled:
+                            wrapper.zssr_prefetch(hidden_in)
                 except Exception as e:
-                    print(f"  [warn] zssr probe L{wrapper.layer_idx}: {e}")
+                    print(f"  [warn] entrance hook L{wrapper.layer_idx}: {e}")
                 return None
             return _hook
         for l_idx in range(1, cfg.num_hidden_layers):
@@ -1027,6 +1116,13 @@ def serve_deepseek(args):
         w.ans_decomp_ms = 0.0
         w.ans_dispatches = 0
         w._ans_dec_pending = []
+        w._h_pre = None
+        w._col_w = {}
+        w.col_pred_bytes = 0
+        w.col_actual_bytes = 0
+        w.col_hit_at = {}
+        w.col_pred_at = {}
+        w.col_actual_at = {}
 
     generated_ids = input_ids.clone()
 
@@ -1170,6 +1266,16 @@ def serve_deepseek(args):
     total_ans_n = sum(w.ans_dispatches for w in colossus_wrappers)
     total_ans_dms = sum(w.ans_decomp_ms for w in colossus_wrappers) * 1000.0
     ans_ratio = (total_ans_mb / total_dma_mb) if total_dma_mb else 0.0
+    # Phase 1A column P/R aggregation (micro-averaged over all layer-steps)
+    col_pr = {}
+    for K in (128, 256, 512):
+        ph = sum(w.col_hit_at.get(K, 0) for w in colossus_wrappers)
+        pp = sum(w.col_pred_at.get(K, 0) for w in colossus_wrappers)
+        pa = sum(w.col_actual_at.get(K, 0) for w in colossus_wrappers)
+        col_pr[K] = {"precision": (ph / pp if pp else 0.0),
+                     "recall": (ph / pa if pa else 0.0),
+                     "pred_cols": pp, "actual_cols": pa}
+    col_pred_mb = sum(w.col_pred_bytes for w in colossus_wrappers) / (1024**2)
     # Phase 1 causal set
     total_zp = sum(w.zssr_predictions for w in colossus_wrappers)
     total_zc = sum(w.zssr_correct for w in colossus_wrappers)
@@ -1210,6 +1316,12 @@ def serve_deepseek(args):
     if args.ans_store:
         print(f"  ANS Wire Compression      : {total_ans_n:,} dispatches, {total_ans_mb:,.1f}MB "
               f"(ratio {ans_ratio:.3f} vs 45MB whole), decomp {total_ans_dms:.2f}ms")
+    if args.col_measure:
+        print(f"  Column P/R (pred h_pre vs actual h_post):")
+        for K in (128, 256, 512):
+            m = col_pr[K]
+            print(f"    K={K:3d}: P={m['precision'] * 100:5.1f}% R={m['recall'] * 100:5.1f}% "
+                  f"(pred {m['pred_cols']:,} actual {m['actual_cols']:,} cols; {col_pred_mb:,.1f}MB predicted)")
     print(f"  ZSSR Prefetch             : {'on (top-%d%s)' % (args.prefetch_topk, ', coalesced' if args.coalesced_dma else '') if args.zssr_prefetch else 'off'} | "
           f"pred {total_zp:,} correct {total_zc:,} (recall {recall:.1f}%) | prefetch {total_pf:,.1f}MB useful {total_pfu:,.1f}MB wasted {total_wasted:,.1f}MB")
     print(f"  DMA Causality             : demand {total_dby:,.1f}MB in {total_dms:.2f}ms (eff {eff_gbps:.1f} GB/s, EXPOSED) | "
@@ -1262,6 +1374,9 @@ def serve_deepseek(args):
         "ans_mb": total_ans_mb,
         "ans_ratio": ans_ratio,
         "ans_decomp_ms": total_ans_dms,
+        "col_measure": bool(args.col_measure),
+        "col_pr": {str(K): col_pr[K] for K in col_pr},
+        "col_pred_mb": col_pred_mb,
         "zssr_predictions": total_zp,
         "zssr_correct": total_zc,
         "zssr_recall_pct": recall,
@@ -1312,6 +1427,10 @@ if __name__ == "__main__":
                         help="Phase 1c-R: one-time whole-shard HostRegister warmup (untimed), then zero-copy DMA")
     parser.add_argument("--ans_store", type=str, default=None,
                         help="Phase 2: ANS hi-byte store dir (0.70 wire ratio, exact, GPU-decoded)")
+    parser.add_argument("--col_measure", action="store_true", default=False,
+                        help="Phase 1A: measure ZSSR column P/R vs ground truth (no movement change)")
+    parser.add_argument("--col_topk_max", type=int, default=512)
+    parser.add_argument("--col_pred_experts", type=int, default=8)
 
 
     parser.add_argument("--use_cache", action="store_true", default=True)
