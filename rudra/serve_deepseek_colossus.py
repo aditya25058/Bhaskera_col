@@ -352,6 +352,8 @@ class DeepSeekColossusMoEWrapper(nn.Module):
         self.ans_pref_bytes_m = 0
         self.ans_stage_ms = 0.0
         self.ans_interleave_ms = 0.0
+        self.ans_stage_minflt = 0
+        self.ans_stage_majflt = 0
         self.zssr_probe_ms = 0.0
         # Phase 1A: column-prediction measurement (NO movement change; execution untouched)
         self.col_measure = bool(col_measure)
@@ -609,6 +611,16 @@ class DeepSeekColossusMoEWrapper(nn.Module):
                 rest.append((ev0, ev1))
         self._ans_dec_pending = rest
 
+    @staticmethod
+    def _fault_counters():
+        """(minflt, majflt) for this process — attributes staging cost to faults vs Python."""
+        try:
+            with open("/proc/self/stat") as f:
+                p = f.read().rsplit(")", 1)[1].split()
+            return int(p[7]), int(p[9])
+        except Exception:
+            return (0, 0)
+
     def _load_experts_ans(self, exp_ids, kind: str = "demand"):
         """Batched ANS miss path: stage all, ONE nvcomp decode, interleave all. Exact.
 
@@ -621,6 +633,7 @@ class DeepSeekColossusMoEWrapper(nn.Module):
         self._drain_ans()
         staged, slots = [], []
         t_s0 = time.perf_counter()
+        f0_min, f0_maj = self._fault_counters()
         for exp_id in exp_ids:
             if kind == "demand":
                 self.misses += 1
@@ -631,7 +644,10 @@ class DeepSeekColossusMoEWrapper(nn.Module):
                 self.ans_bytes_m += staged[-1]["nbytes"]
             else:
                 self.ans_pref_bytes_m += staged[-1]["nbytes"]
+        f1_min, f1_maj = self._fault_counters()
         self.ans_stage_ms += (time.perf_counter() - t_s0) * 1000.0
+        self.ans_stage_minflt += (f1_min - f0_min)
+        self.ans_stage_majflt += (f1_maj - f0_maj)
         if not staged:
             return []
         self.dma_bytes += sum(s["nbytes"] for s in staged)
@@ -1206,6 +1222,8 @@ def serve_deepseek(args):
         w.ans_pref_bytes_m = 0
         w.ans_stage_ms = 0.0
         w.ans_interleave_ms = 0.0
+        w.ans_stage_minflt = 0
+        w.ans_stage_majflt = 0
         w.zssr_probe_ms = 0.0
         w._h_pre = None
         w._col_w = {}
@@ -1368,6 +1386,8 @@ def serve_deepseek(args):
     total_ans_pref_mb = sum(w.ans_pref_bytes_m for w in colossus_wrappers) / (1024**2)
     total_stage_ms = sum(w.ans_stage_ms for w in colossus_wrappers)
     total_inter_ms = sum(w.ans_interleave_ms for w in colossus_wrappers)
+    total_minflt = sum(w.ans_stage_minflt for w in colossus_wrappers)
+    total_majflt = sum(w.ans_stage_majflt for w in colossus_wrappers)
     exposed_ans = total_ans_mb  # demand ANS transfers issue post-verify: on critical path
     # Phase 1A column P/R aggregation (micro-averaged over all layer-steps)
     col_pr = {}
@@ -1438,7 +1458,7 @@ def serve_deepseek(args):
     if args.ans_store and args.zssr_prefetch:
         print(f"  Stacked Breakdown         : probe {total_probe_ms:.1f}ms | prefetch-DMA {total_ans_pref_mb:,.1f}MB | "
               f"demand-DMA {exposed_ans:,.1f}MB | decomp {total_ans_dms:.2f}ms | "
-              f"stage {total_stage_ms:.1f}ms | interleave {total_inter_ms:.1f}ms | hidden {hidden_est:,.1f}MB")
+              f"stage {total_stage_ms:.1f}ms (minflt {total_minflt:,}, majflt {total_majflt:,}) | interleave {total_inter_ms:.1f}ms | hidden {hidden_est:,.1f}MB")
     if args.col_measure:
         print(f"  Column P/R (pred h_pre vs actual h_post):")
         for K in (128, 256, 512, 768, 1024):
@@ -1504,6 +1524,8 @@ def serve_deepseek(args):
         "ans_decomp_ms": total_ans_dms,
         "ans_pref_mb": total_ans_pref_mb,
         "ans_stage_ms": total_stage_ms,
+        "ans_stage_minflt": total_minflt,
+        "ans_stage_majflt": total_majflt,
         "ans_interleave_ms": total_inter_ms,
         "zssr_probe_ms": total_probe_ms,
         "exposed_ans_mb": exposed_ans,
