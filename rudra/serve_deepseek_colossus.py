@@ -349,6 +349,10 @@ class DeepSeekColossusMoEWrapper(nn.Module):
         self.ans_decomp_ms = 0.0
         self.ans_dispatches = 0
         self._ans_dec_pending = []
+        self.ans_pref_bytes_m = 0
+        self.ans_stage_ms = 0.0
+        self.ans_interleave_ms = 0.0
+        self.zssr_probe_ms = 0.0
         # Phase 1A: column-prediction measurement (NO movement change; execution untouched)
         self.col_measure = bool(col_measure)
         self.col_topk_max = int(col_topk_max)
@@ -605,23 +609,31 @@ class DeepSeekColossusMoEWrapper(nn.Module):
                 rest.append((ev0, ev1))
         self._ans_dec_pending = rest
 
-    def _load_experts_ans(self, exp_ids):
+    def _load_experts_ans(self, exp_ids, kind: str = "demand"):
         """Batched ANS miss path: stage all, ONE nvcomp decode, interleave all. Exact.
 
-        Zero CPU roundtrips: hi stays on GPU via DLPack views; lo DMA'd strided
-        (async); decode timed with non-blocking events drained next forward.
+        Zero CPU roundtrips: hi stays on GPU via DLPack views; lo DMA'd
+        (contiguous repack when available, else strided async); decode timed
+        with non-blocking events drained next forward. kind='prefetch' counts
+        to the speculative ledger instead of demand misses.
         """
         import torch.utils.dlpack as dlpack
         self._drain_ans()
         staged, slots = [], []
+        t_s0 = time.perf_counter()
         for exp_id in exp_ids:
-            self.misses += 1
+            if kind == "demand":
+                self.misses += 1
             slot_idx = self.slot_lru.pop(0)
             staged.append(self._ans_stage_expert(exp_id))
             slots.append(slot_idx)
-            self.ans_bytes_m += staged[-1]["nbytes"]
+            if kind == "demand":
+                self.ans_bytes_m += staged[-1]["nbytes"]
+            else:
+                self.ans_pref_bytes_m += staged[-1]["nbytes"]
+        self.ans_stage_ms += (time.perf_counter() - t_s0) * 1000.0
         if not staged:
-            return
+            return []
         self.dma_bytes += sum(s["nbytes"] for s in staged)
         if self.device.type == "cuda":
             ev0 = torch.cuda.Event(enable_timing=True)
@@ -638,6 +650,7 @@ class DeepSeekColossusMoEWrapper(nn.Module):
                 flat.append(d)
             else:
                 flat.append(dlpack.from_dlpack(d))  # GPU tensor, zero copy
+        t_i0 = time.perf_counter()
         pos = 0
         for exp_id, slot_idx, st in zip(exp_ids, slots, staged):
             his = []
@@ -658,6 +671,8 @@ class DeepSeekColossusMoEWrapper(nn.Module):
             self.slot_to_expert[slot_idx] = exp_id
             self.expert_to_slot[exp_id] = slot_idx
             self.slot_lru.append(slot_idx)
+        self.ans_interleave_ms += (time.perf_counter() - t_i0) * 1000.0
+        return [(e, s["nbytes"]) for e, s in zip(exp_ids, staged)]
 
     def _load_expert_to_slot(self, expert_id: int, slot_idx: int, kind: str = "demand",
                              record: bool = True):
@@ -800,6 +815,7 @@ class DeepSeekColossusMoEWrapper(nn.Module):
         """
         if not self.zssr_enabled:
             return []
+        t_probe0 = time.perf_counter()
         try:
             h = hidden_in[:, -1, :].to(dtype=torch.float32, device=self.gate.weight.device)
             scores = torch.softmax(h @ self.gate.weight.detach().float().t(), dim=-1)
@@ -809,11 +825,21 @@ class DeepSeekColossusMoEWrapper(nn.Module):
             pred = topi.view(-1).tolist()
         except Exception:
             return []
+        self.zssr_probe_ms += (time.perf_counter() - t_probe0) * 1000.0
         if conf < self.prefetch_conf:
             self.zssr_suppressed += 1
             return []
         new_ids = [e for e in dict.fromkeys(pred) if e not in self.expert_to_slot and e not in self._prefetched]
         if not new_ids:
+            return pred
+        if self.ans_store:
+            # Stacked path: speculative movement through compressed representation
+            # (cheap waste). Demand path verifies; slots shared.
+            staged_info = self._load_experts_ans(new_ids, kind="prefetch")
+            for exp_id, nbytes in staged_info:
+                self._prefetched[exp_id] = self._prefetched.get(exp_id, 0) + nbytes
+                self._prefmeta[exp_id] = [conf, 0]
+            self.zssr_predictions += len(new_ids)
             return pred
         if self.coalesced:
             ev_s = self._dma_begin() if self.device.type == "cuda" else None
@@ -1177,6 +1203,10 @@ def serve_deepseek(args):
         w.ans_decomp_ms = 0.0
         w.ans_dispatches = 0
         w._ans_dec_pending = []
+        w.ans_pref_bytes_m = 0
+        w.ans_stage_ms = 0.0
+        w.ans_interleave_ms = 0.0
+        w.zssr_probe_ms = 0.0
         w._h_pre = None
         w._col_w = {}
         w.col_pred_bytes = 0
@@ -1330,6 +1360,13 @@ def serve_deepseek(args):
     total_ans_n = sum(w.ans_dispatches for w in colossus_wrappers)
     total_ans_dms = sum(w.ans_decomp_ms for w in colossus_wrappers) * 1000.0
     ans_ratio = (total_ans_mb / total_dma_mb) if total_dma_mb else 0.0
+    # Stacked breakdown: prediction / prefetch-DMA / demand-DMA / decomp / handling
+    total_probe_ms = sum(w.zssr_probe_ms for w in colossus_wrappers)
+    total_ans_pref_mb = sum(w.ans_pref_bytes_m for w in colossus_wrappers) / (1024**2)
+    total_stage_ms = sum(w.ans_stage_ms for w in colossus_wrappers)
+    total_inter_ms = sum(w.ans_interleave_ms for w in colossus_wrappers)
+    exposed_ans = total_ans_mb  # demand ANS transfers issue post-verify: on critical path
+    hidden_est = total_pfu  # speculative bytes consumed (whole or ANS path): overlapped by construction
     # Phase 1A column P/R aggregation (micro-averaged over all layer-steps)
     col_pr = {}
     for K in (128, 256, 512, 768, 1024):
@@ -1392,6 +1429,10 @@ def serve_deepseek(args):
     if args.ans_store:
         print(f"  ANS Wire Compression      : {total_ans_n:,} dispatches, {total_ans_mb:,.1f}MB "
               f"(ratio {ans_ratio:.3f} vs 45MB whole), decomp {total_ans_dms:.2f}ms")
+    if args.ans_store and args.zssr_prefetch:
+        print(f"  Stacked Breakdown         : probe {total_probe_ms:.1f}ms | prefetch-DMA {total_ans_pref_mb:,.1f}MB | "
+              f"demand-DMA {exposed_ans:,.1f}MB | decomp {total_ans_dms:.2f}ms | "
+              f"stage {total_stage_ms:.1f}ms | interleave {total_inter_ms:.1f}ms | hidden {hidden_est:,.1f}MB")
     if args.col_measure:
         print(f"  Column P/R (pred h_pre vs actual h_post):")
         for K in (128, 256, 512, 768, 1024):
@@ -1455,6 +1496,12 @@ def serve_deepseek(args):
         "ans_mb": total_ans_mb,
         "ans_ratio": ans_ratio,
         "ans_decomp_ms": total_ans_dms,
+        "ans_pref_mb": total_ans_pref_mb,
+        "ans_stage_ms": total_stage_ms,
+        "ans_interleave_ms": total_inter_ms,
+        "zssr_probe_ms": total_probe_ms,
+        "exposed_ans_mb": exposed_ans,
+        "hidden_mb": hidden_est,
         "col_measure": bool(args.col_measure),
         "col_pr": {str(K): col_pr[K] for K in col_pr},
         "col_pred_mb": col_pred_mb,
