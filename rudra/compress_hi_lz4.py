@@ -20,7 +20,6 @@ import time
 
 import lz4.frame
 import torch
-from safetensors import safe_open
 
 
 def expert_keys(cfg_n_layers, n_routed):
@@ -31,24 +30,47 @@ def expert_keys(cfg_n_layers, n_routed):
                 yield f"{pfx}.{proj}.weight"
 
 
+def read_shard_header(path):
+    import struct
+    with open(path, "rb") as f:
+        (hlen,) = struct.unpack("<Q", f.read(8))
+        return json.loads(f.read(hlen)), 8 + hlen
+
+
 def compress_shard(args):
     # Worker writes its shard container directly; returns only metadata.
     # (Parent gathering 28k blobs would OOM: ~126GB pickled.)
+    # Reads via os.pread (6.4GB/s proven): torch bytes(storage) path runs at
+    # 0.5MB/s on mmap-backed safetensors tensors on this host (root cause TBD).
     model_path, shard, keys, level, out_dir = args
-    h = safe_open(os.path.join(model_path, shard), framework="pt")
+    header, data_start = read_shard_header(os.path.join(model_path, shard))
+    fd = os.open(os.path.join(model_path, shard), os.O_RDONLY)
     fn = shard.replace(".safetensors", ".lz4h")
     meta = []
-    with open(os.path.join(out_dir, fn), "wb") as f:
-        for key in keys:
-            t = h.get_tensor(key)
-            raw = bytes(t.untyped_storage())[:t.nbytes]
-            u8 = torch.frombuffer(bytearray(raw), dtype=torch.uint8)
-            hi = u8[1::2].numpy().tobytes()
-            blob = lz4.frame.compress(hi, compression_level=level)
-            off = f.tell()
-            f.write(blob)
-            meta.append((key, off, len(blob), len(hi), tuple(t.shape)))
-            del raw, u8, hi, blob
+    try:
+        with open(os.path.join(out_dir, fn), "wb") as f:
+            for key in keys:
+                b, e = header[key]["data_offsets"]
+                n = e - b
+                raw = bytearray(n)
+                mv = memoryview(raw)
+                off = data_start + b
+                while n > 0:
+                    chunk = os.pread(fd, n, off)
+                    if not chunk:
+                        raise IOError(f"short read {key}")
+                    mv[len(mv) - n:len(mv) - n + len(chunk)] = chunk
+                    off += len(chunk)
+                    n -= len(chunk)
+                u8 = torch.frombuffer(raw, dtype=torch.uint8)
+                hi = u8[1::2].numpy().tobytes()
+                blob = lz4.frame.compress(hi, compression_level=level)
+                pos = f.tell()
+                f.write(blob)
+                meta.append((key, pos, len(blob), len(hi), tuple(header[key]["shape"])))
+                del raw, u8, hi, blob
+    finally:
+        os.close(fd)
     return shard, fn, meta
 
 
