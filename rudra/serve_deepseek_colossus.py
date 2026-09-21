@@ -788,8 +788,10 @@ class DeepSeekColossusMoEWrapper(nn.Module):
         if self.col_measure:
             try:
                 self.col_measure_step(hidden_states, topk_indices)
-            except Exception:
-                pass
+            except Exception as e:
+                if not getattr(self, "_col_warn_done", False):
+                    self._col_warn_done = True
+                    print(f"  [warn] col_measure L{self.layer_idx}: {type(e).__name__}: {e}")
 
         # Phase 1 verify: reconcile ZSSR prediction against ground-truth routing.
         if self._prefetched:
