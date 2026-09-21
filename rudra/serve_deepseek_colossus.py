@@ -1388,10 +1388,12 @@ def serve_deepseek(args):
     total_zs = sum(getattr(w, "zssr_suppressed", 0) for w in colossus_wrappers)
     total_pf = sum(w.prefetch_bytes_total for w in colossus_wrappers) / (1024**2)
     total_pfu = sum(w.prefetch_useful_bytes for w in colossus_wrappers) / (1024**2)
+    total_ans_pref_mb = sum(w.ans_pref_bytes_m for w in colossus_wrappers) / (1024**2)
+    total_pf_all = total_pf + total_ans_pref_mb
     total_dby = sum(w.demand_bytes_m for w in colossus_wrappers) / (1024**2)
     total_dms = sum(w.demand_dma_ms for w in colossus_wrappers) * 1000.0
     total_pms = sum(w.prefetch_dma_ms for w in colossus_wrappers) * 1000.0
-    total_wasted = total_pf - total_pfu
+    total_wasted = total_pf_all - total_pfu
     hidden_est = total_pfu  # speculative bytes consumed (whole or ANS path): overlapped by construction
     recall = (total_zc / total_zp * 100.0) if total_zp else 0.0
     exposed_tot = total_dby + total_ans_mb  # all demand transfers issue post-verify
