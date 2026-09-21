@@ -318,6 +318,7 @@ class DeepSeekColossusMoEWrapper(nn.Module):
         self.ans_bytes_m = 0
         self.ans_decomp_ms = 0.0
         self.ans_dispatches = 0
+        self._ans_dec_pending = []
         self._hostreg_ok = {}
         self._hostreg_failed = set()
         self.hostreg_pinned_gb = 0.0
@@ -477,7 +478,8 @@ class DeepSeekColossusMoEWrapper(nn.Module):
             s = sm.data_start + b
             span = sm.u8[s:s + (e - b)]
             I0, H0 = info["shape"][0], info["shape"][1]
-            lo = span[0::2].reshape(I0, H0).contiguous()
+            # strided view DMA'd directly (async); .contiguous() would be a sync CPU gather.
+            lo = span[0::2].reshape(I0, H0)
             lo_g = lo.to(self.device, non_blocking=True)
             # comp blob slice from blob-file mapping (contiguous)
             _fh, _mm, bu8 = blobs[meta["blob"]]
@@ -537,9 +539,28 @@ class DeepSeekColossusMoEWrapper(nn.Module):
             w8[:, 0::2].copy_(lo, non_blocking=True)
             w8[:, 1::2].copy_(hi, non_blocking=True)
 
+    def _drain_ans(self, sync: bool = False):
+        """Collect completed ANS-decode timings without blocking (unless sync)."""
+        if not self._ans_dec_pending:
+            return
+        if sync and self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        rest = []
+        for ev0, ev1 in self._ans_dec_pending:
+            if sync or (self.device.type == "cuda" and ev1.query()):
+                self.ans_decomp_ms += ev0.elapsed_time(ev1) / 1000.0
+            else:
+                rest.append((ev0, ev1))
+        self._ans_dec_pending = rest
+
     def _load_experts_ans(self, exp_ids):
-        """Batched ANS miss path: stage all, ONE nvcomp decode, interleave all. Exact."""
+        """Batched ANS miss path: stage all, ONE nvcomp decode, interleave all. Exact.
+
+        Zero CPU roundtrips: hi stays on GPU via DLPack views; lo DMA'd strided
+        (async); decode timed with non-blocking events drained next forward.
+        """
         import torch.utils.dlpack as dlpack
+        self._drain_ans()
         staged, slots = [], []
         for exp_id in exp_ids:
             self.misses += 1
@@ -550,27 +571,35 @@ class DeepSeekColossusMoEWrapper(nn.Module):
         if not staged:
             return
         self.dma_bytes += sum(s["nbytes"] for s in staged)
-        ev0 = torch.cuda.Event(enable_timing=True)
-        ev1 = torch.cuda.Event(enable_timing=True)
-        ev0.record(torch.cuda.current_stream(self.device))
+        if self.device.type == "cuda":
+            ev0 = torch.cuda.Event(enable_timing=True)
+            ev1 = torch.cuda.Event(enable_timing=True)
+            ev0.record(torch.cuda.current_stream(self.device))
         dec = self._ans_decode_batch(staged)
-        ev1.record(torch.cuda.current_stream(self.device))
-        ev1.synchronize()
-        self.ans_decomp_ms += ev0.elapsed_time(ev1) / 1000.0
+        if self.device.type == "cuda":
+            ev1.record(torch.cuda.current_stream(self.device))
+            self._ans_dec_pending.append((ev0, ev1))
         self.ans_dispatches += len(staged)
         flat = []
         for d in dec:
-            flat.append(bytes(d) if isinstance(d, (bytes, bytearray, memoryview))
-                        else dlpack.from_dlpack(d).cpu().numpy().tobytes())
+            if isinstance(d, (bytes, bytearray, memoryview)):
+                flat.append(d)
+            else:
+                flat.append(dlpack.from_dlpack(d))  # GPU tensor, zero copy
         pos = 0
         for exp_id, slot_idx, st in zip(exp_ids, slots, staged):
             his = []
             for pi, hi_len in enumerate(st["hi_len"]):
                 hb = flat[pos]
                 pos += 1
-                assert len(hb) == hi_len, (len(hb), hi_len)
-                I, H = st["lo"][pi].shape[0], st["lo"][pi].shape[1]
-                his.append(torch.frombuffer(bytearray(hb), dtype=torch.uint8).reshape(I, H).to(self.device))
+                if isinstance(hb, (bytes, bytearray)):
+                    assert len(hb) == hi_len, (len(hb), hi_len)
+                    I, H = st["lo"][pi].shape[0], st["lo"][pi].shape[1]
+                    his.append(torch.frombuffer(bytearray(hb), dtype=torch.uint8).reshape(I, H).to(self.device))
+                else:
+                    I, H = st["lo"][pi].shape[0], st["lo"][pi].shape[1]
+                    assert hb.numel() == hi_len, (hb.numel(), hi_len)
+                    his.append(hb.reshape(I, H))
             self._ans_interleave(slot_idx, st["lo"], his)
             if slot_idx in self.slot_to_expert:
                 self.expert_to_slot.pop(self.slot_to_expert[slot_idx], None)
@@ -997,6 +1026,7 @@ def serve_deepseek(args):
         w.ans_bytes_m = 0
         w.ans_decomp_ms = 0.0
         w.ans_dispatches = 0
+        w._ans_dec_pending = []
 
     generated_ids = input_ids.clone()
 
@@ -1128,6 +1158,8 @@ def serve_deepseek(args):
         torch.cuda.synchronize(dev1)
     for w in colossus_wrappers:
         w._drain_dma(sync=True)
+        if hasattr(w, "_drain_ans"):
+            w._drain_ans(sync=True)
 
     total_hits = sum(w.hits for w in colossus_wrappers)
     total_misses = sum(w.misses for w in colossus_wrappers)
