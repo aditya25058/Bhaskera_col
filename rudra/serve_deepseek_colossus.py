@@ -714,12 +714,18 @@ class DeepSeekColossusMoEWrapper(nn.Module):
         if self._h_pre is None:
             return
         KMAX = self.col_topk_max
-        KS = (128, 256, 512)
+        KS = (128, 256, 512, 768, 1024)
         h_pre = self._h_pre.detach().float().reshape(-1, self.gate.weight.shape[1])[-1:]
         h_true = h_post.detach().float().reshape(-1, self.gate.weight.shape[1])[-1:]
         col_bytes = 3 * int(getattr(self.cfg, "hidden_size", 5120)) * 2  # per column (BF16)
         # Expert probe from pre-attention stream
         logits = (h_pre @ self.gate.weight.detach().float().t()).squeeze(0)
+        probs = torch.softmax(logits, dim=-1)
+        topv, _ = torch.topk(probs, k=min(self.col_pred_experts, probs.numel()))
+        conf = topv[0].item()
+        self.col_conf_sum = getattr(self, "col_conf_sum", 0.0) + conf
+        self.col_conf_n = getattr(self, "col_conf_n", 0) + 1
+        self.col_conf_hi_n = getattr(self, "col_conf_hi_n", 0) + (1 if conf >= 0.5 else 0)
         pred_experts = torch.topk(logits, k=min(self.col_pred_experts, logits.numel())).indices.tolist()
         actual_experts = topk_actual.unique().tolist() if hasattr(topk_actual, "unique") else list(topk_actual)
         for exp_id in pred_experts:
@@ -1128,6 +1134,9 @@ def serve_deepseek(args):
         w.col_hit_at = {}
         w.col_pred_at = {}
         w.col_actual_at = {}
+        w.col_conf_sum = 0.0
+        w.col_conf_n = 0
+        w.col_conf_hi_n = 0
 
     generated_ids = input_ids.clone()
 
@@ -1273,7 +1282,7 @@ def serve_deepseek(args):
     ans_ratio = (total_ans_mb / total_dma_mb) if total_dma_mb else 0.0
     # Phase 1A column P/R aggregation (micro-averaged over all layer-steps)
     col_pr = {}
-    for K in (128, 256, 512):
+    for K in (128, 256, 512, 768, 1024):
         ph = sum(w.col_hit_at.get(K, 0) for w in colossus_wrappers)
         pp = sum(w.col_pred_at.get(K, 0) for w in colossus_wrappers)
         pa = sum(w.col_actual_at.get(K, 0) for w in colossus_wrappers)
@@ -1281,6 +1290,9 @@ def serve_deepseek(args):
                      "recall": (ph / pa if pa else 0.0),
                      "pred_cols": pp, "actual_cols": pa}
     col_pred_mb = sum(w.col_pred_bytes for w in colossus_wrappers) / (1024**2)
+    col_conf = sum(getattr(w, "col_conf_sum", 0.0) for w in colossus_wrappers)
+    col_confn = sum(getattr(w, "col_conf_n", 0) for w in colossus_wrappers)
+    col_confhi = sum(getattr(w, "col_conf_hi_n", 0) for w in colossus_wrappers)
     # Phase 1 causal set
     total_zp = sum(w.zssr_predictions for w in colossus_wrappers)
     total_zc = sum(w.zssr_correct for w in colossus_wrappers)
@@ -1323,10 +1335,12 @@ def serve_deepseek(args):
               f"(ratio {ans_ratio:.3f} vs 45MB whole), decomp {total_ans_dms:.2f}ms")
     if args.col_measure:
         print(f"  Column P/R (pred h_pre vs actual h_post):")
-        for K in (128, 256, 512):
+        for K in (128, 256, 512, 768, 1024):
             m = col_pr[K]
-            print(f"    K={K:3d}: P={m['precision'] * 100:5.1f}% R={m['recall'] * 100:5.1f}% "
+            print(f"    K={K:4d}: P={m['precision'] * 100:5.1f}% R={m['recall'] * 100:5.1f}% "
                   f"(pred {m['pred_cols']:,} actual {m['actual_cols']:,} cols; {col_pred_mb:,.1f}MB predicted)")
+        print(f"  Probe confidence: mean top-1 prob {col_conf / max(1, col_confn):.3f}, "
+              f"frac>=0.5: {col_confhi / max(1, col_confn) * 100:.1f}% ({col_confn} probes)")
     print(f"  ZSSR Prefetch             : {'on (top-%d%s)' % (args.prefetch_topk, ', coalesced' if args.coalesced_dma else '') if args.zssr_prefetch else 'off'} | "
           f"pred {total_zp:,} correct {total_zc:,} (recall {recall:.1f}%) | prefetch {total_pf:,.1f}MB useful {total_pfu:,.1f}MB wasted {total_wasted:,.1f}MB")
     print(f"  DMA Causality             : demand {total_dby:,.1f}MB in {total_dms:.2f}ms (eff {eff_gbps:.1f} GB/s, EXPOSED) | "
@@ -1434,7 +1448,7 @@ if __name__ == "__main__":
                         help="Phase 2: ANS hi-byte store dir (0.70 wire ratio, exact, GPU-decoded)")
     parser.add_argument("--col_measure", action="store_true", default=False,
                         help="Phase 1A: measure ZSSR column P/R vs ground truth (no movement change)")
-    parser.add_argument("--col_topk_max", type=int, default=512)
+    parser.add_argument("--col_topk_max", type=int, default=1024)
     parser.add_argument("--col_pred_experts", type=int, default=8)
 
 
