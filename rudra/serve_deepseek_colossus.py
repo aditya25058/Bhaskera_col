@@ -621,6 +621,41 @@ class DeepSeekColossusMoEWrapper(nn.Module):
         except Exception:
             return (0, 0)
 
+    @classmethod
+    def prefault_all(cls, model_dir, weight_map, ans_store=None):
+        """Untimed startup: create every mapping the run will touch and fault all
+        pages once (1 byte per 4KB via vectorized strided sum). Establishes PTEs
+        AND warms page cache so timed decode pays ~zero first-touch cost.
+        Returns (seconds, pages_touched_estimate)."""
+        import mmap as _mmap
+        t0 = time.perf_counter()
+        pages = 0
+        expert_shards = sorted({s for k, s in weight_map.items() if ".mlp.experts." in k})
+        for sh in expert_shards:
+            sm = ShardMap.get(os.path.join(model_dir, sh))
+            try:
+                sm.mm.madvise(_mmap.MADV_WILLNEED)
+            except Exception:
+                pass
+            pages += int(sm.u8.numel() // 4096)
+            _ = sm.u8[::4096].to(torch.uint8).sum().item()
+        if ans_store:
+            # Warm the SAME mappings runtime will use (separate mmaps would fault anew).
+            cls._get_ans_blobmap(ans_store)
+            try:
+                cls._get_lo_blobmap(ans_store)
+            except Exception:
+                pass
+            for maps in (cls._ans_blobs.get(ans_store, {}), getattr(cls, "_lo_blobs", {}).get(ans_store, {}) or {}):
+                for _fn, (_fh, _mm, bu8) in maps.items():
+                    try:
+                        _mm.madvise(_mmap.MADV_WILLNEED)
+                    except Exception:
+                        pass
+                    pages += int(bu8.numel() // 4096)
+                    _ = bu8[::4096].sum().item()
+        return time.perf_counter() - t0, pages
+
     def _load_experts_ans(self, exp_ids, kind: str = "demand"):
         """Batched ANS miss path: stage all, ONE nvcomp decode, interleave all. Exact.
 
@@ -1183,6 +1218,18 @@ def serve_deepseek(args):
         ok = colossus_wrappers[0].ans_self_check()
         print(f"  ANS self-check: {'PASS' if ok else 'FAIL'}")
         assert ok, "ANS reconstruction mismatch — aborting before timed run."
+
+    if args.prefault:
+        # Untimed startup: fault every mapping once (PTEs + cache), reported
+        # separately. Timed decode below must show ~zero first-touch faults.
+        print(f"\n[6.5] Prefaulting all shard + blob mappings (untimed)...")
+        sys.stdout.flush()
+        pf_sec, pf_pages = DeepSeekColossusMoEWrapper.prefault_all(
+            MODEL_PATH, weight_map, args.ans_store)
+        print(f"  Prefault: {pf_pages:,} pages in {pf_sec:.1f}s (excluded from decode metrics)")
+        sys.stdout.flush()
+    else:
+        pf_sec, pf_pages = 0.0, 0
     model.eval()
 
 
@@ -1192,6 +1239,7 @@ def serve_deepseek(args):
     # ─────────────────────────────────────────────────────────────────────────
     prompt = args.prompt
     print(f"\n[7] Starting Generation Benchmark:")
+    f0_min, f0_maj = DeepSeekColossusMoEWrapper._fault_counters()
     print(f"  Prompt: {repr(prompt)}")
     print(f"  Max New Tokens: {args.max_new_tokens}")
 
@@ -1371,6 +1419,8 @@ def serve_deepseek(args):
         w._drain_dma(sync=True)
         if hasattr(w, "_drain_ans"):
             w._drain_ans(sync=True)
+    f1_min, f1_maj = DeepSeekColossusMoEWrapper._fault_counters()
+    run_minflt, run_majflt = f1_min - f0_min, f1_maj - f0_maj
 
     total_hits = sum(w.hits for w in colossus_wrappers)
     total_misses = sum(w.misses for w in colossus_wrappers)
@@ -1476,6 +1526,9 @@ def serve_deepseek(args):
     print(f"  Peak VRAM GPU 0           : {peak_hbm0:7.2f} GB / 93.1 GB")
     if args.num_gpus > 1:
         print(f"  Peak VRAM GPU 1           : {peak_hbm1:7.2f} GB / 93.1 GB")
+    print(f"  Faults (run)              : minflt {run_minflt:,} / majflt {run_majflt:,}")
+    if args.prefault:
+        print(f"  Prefault (untimed)        : {pf_pages:,} pages in {pf_sec:.1f}s")
     print("-" * 80)
     print(f"  Generated Text Output:")
     print(f"  {repr(gen_text)}")
@@ -1552,6 +1605,11 @@ def serve_deepseek(args):
         "exact_vs_baseline": (gen_text == ref_text) if (prompt == "def quicksort(arr):" and args.max_new_tokens == 16) else None,
         "peak_vram_gpu0_gb": peak_hbm0,
         "peak_vram_gpu1_gb": peak_hbm1 if args.num_gpus > 1 else None,
+        "run_minflt": run_minflt,
+        "run_majflt": run_majflt,
+        "prefault": bool(args.prefault),
+        "prefault_seconds": pf_sec,
+        "prefault_pages": pf_pages,
         "generated_text": gen_text,
     }
 
@@ -1590,6 +1648,8 @@ if __name__ == "__main__":
                         help="Phase 1c-R: one-time whole-shard HostRegister warmup (untimed), then zero-copy DMA")
     parser.add_argument("--ans_store", type=str, default=None,
                         help="Phase 2: ANS hi-byte store dir (0.70 wire ratio, exact, GPU-decoded)")
+    parser.add_argument("--prefault", action="store_true", default=False,
+                        help="Untimed startup: fault all shard+blob mappings once (PTEs+cache), reported separately")
     parser.add_argument("--col_measure", action="store_true", default=False,
                         help="Phase 1A: measure ZSSR column P/R vs ground truth (no movement change)")
     parser.add_argument("--col_topk_max", type=int, default=1024)
