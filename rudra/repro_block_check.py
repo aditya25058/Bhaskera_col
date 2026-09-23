@@ -53,5 +53,16 @@ print(f"assembled: {len(desc['misses'])} misses, {len(desc['hits'])} hits", flus
 print("fetching+decoding...", flush=True)
 fetched = wrap._block_fetch_decode([(p, m) for (p, m) in desc["misses"]])
 print(f"fetched: {len(fetched)} blocks", flush=True)
+print("installing block 0 only...", flush=True)
+import torch as _t
+pkey, m, lo, hi = fetched[0][0], fetched[0][1], fetched[0][2], fetched[0][3]
+print(f"  lo {tuple(lo.shape)} {lo.device} hi {tuple(hi.shape)} {hi.device}", flush=True)
+slot = wrap.slots[slot_idx]
+_L, _E, _bi, _pname = pkey
+w = {"gate_proj": slot.gate_proj.weight, "up_proj": slot.up_proj.weight,
+     "down_proj": slot.down_proj.weight}[_pname]
+print(f"  slot w {tuple(w.shape)} {w.device}", flush=True)
+w8 = w.view(_t.uint8).reshape(w.shape[0], -1)
+print("  view ok", flush=True)
 ok = wrap.block_self_check()
 print("SELF_CHECK:", ok, flush=True)
