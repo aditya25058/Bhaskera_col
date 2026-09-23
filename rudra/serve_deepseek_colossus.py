@@ -816,6 +816,27 @@ class DeepSeekColossusMoEWrapper(nn.Module):
 
     _block_index = None
     _block_blobs = {}
+    # F1: static per-expert block tables {(L,E): [(pname, bi, meta)]} built once.
+    # Kills the 340k-entry index scan previously paid PER MISS per layer.
+    _block_table = None
+    _block_table_store = None
+
+    @classmethod
+    def _get_block_table(cls, store_dir):
+        if cls._block_table is None or cls._block_table_store != store_dir:
+            idx = cls._get_block_index(store_dir)
+            table = {}
+            for k, m in idx.items():
+                try:
+                    L, E, bi, pname = k.split("/")
+                    table.setdefault((int(L), int(E)), []).append((pname, int(bi), m))
+                except Exception:
+                    continue
+            for v in table.values():
+                v.sort()
+            cls._block_table = table
+            cls._block_table_store = store_dir
+        return cls._block_table
 
     @classmethod
     def _get_block_index(cls, store_dir):
@@ -855,35 +876,27 @@ class DeepSeekColossusMoEWrapper(nn.Module):
         Batched nvcomp decode across the layer is done by the caller via
         _block_decode_many; this returns the staged descriptor.
         """
-        idx = self._get_block_index(self.block_store)
         pool = self.block_pool
         desc = {"expert": expert_id, "slot": slot_idx, "kind": kind,
                 "hits": [], "misses": [], "hit_bytes": 0, "miss_bytes": 0,
                 "subset": subset is not None}
-        prefix = f"{self.layer_idx}/{expert_id}/"
-        for pname in ("gate_proj", "up_proj", "down_proj"):
-            suffix = "/" + pname
-            bis = sorted({int(k.split("/")[2]) for k in idx
-                          if k.startswith(prefix) and k.endswith(suffix)})
-            if subset is not None and pname in subset:
-                keep = set(subset[pname])
-                bis = [bi for bi in bis if bi in keep]
-            for bi in bis:
-                bkey = f"{self.layer_idx}/{expert_id}/{bi}/{pname}"
-                m = idx[bkey]
-                pkey = (self.layer_idx, expert_id, bi, pname)
-                ent = pool.entries.get(pkey)
-                if ent is not None:
-                    pool.tick += 1
-                    pool.freq[pkey] = pool.freq.get(pkey, 0) + 1
-                    pool.stamp[pkey] = pool.tick
-                    pool.hits += 1
-                    desc["hits"].append((pkey, ent, m))
-                    desc["hit_bytes"] = desc.get("hit_bytes", 0) + 0
-                else:
-                    pool.tick += 1
-                    pool.misses += 1
-                    desc["misses"].append((pkey, m))
+        # F1: static per-expert table (no 340k index scan per miss)
+        table = self._get_block_table(self.block_store)
+        for pname, bi, m in table.get((self.layer_idx, expert_id), []):
+            if subset is not None and pname in subset and bi not in subset[pname]:
+                continue
+            pkey = (self.layer_idx, expert_id, bi, pname)
+            ent = pool.entries.get(pkey)
+            if ent is not None:
+                pool.tick += 1
+                pool.freq[pkey] = pool.freq.get(pkey, 0) + 1
+                pool.stamp[pkey] = pool.tick
+                pool.hits += 1
+                desc["hits"].append((pkey, ent, m))
+            else:
+                pool.tick += 1
+                pool.misses += 1
+                desc["misses"].append((pkey, m))
         return desc
 
     def _lo_block_view(self, layer_idx: int, expert_id: int, bi: int, pname: str, lo_maps):
