@@ -961,11 +961,18 @@ class DeepSeekColossusMoEWrapper(nn.Module):
         import nvidia.nvcomp as _nv
         for (_pkey, _m, _lo, comp_g) in staged:
             arrs.append(_nv.as_array(comp_g))
-        dec = codec.decode(arrs) if arrs else []
+        # Preallocated outputs: never import foreign DLPack memory (its capsule
+        # destructor segfaults on batched decodes). Decode writes into OUR tensors.
+        out_tensors = [torch.empty(m["hi_len"], dtype=torch.uint8, device=self.device)
+                       for (_pkey, m, _lo, _cg) in staged]
+        out_arrs = [_nv.as_array(t) for t in out_tensors]
+        try:
+            dec = codec.decode(arrs, out=out_arrs) if arrs else []
+        except Exception:
+            dec = codec.decode(arrs, out=[t for t in out_tensors]) if arrs else []
         flat = []
-        for d in dec:
-            flat.append(bytes(d) if isinstance(d, (bytes, bytearray, memoryview))
-                        else dlpack.from_dlpack(d))
+        for t, (_pkey, m, _lo, _cg) in zip(out_tensors, staged):
+            flat.append(t[:m["hi_len"]])
         out = []
         for (pkey, m, lo, comp_g), hb in zip(staged, flat):
             _L, _E, _bi, _pname = pkey
