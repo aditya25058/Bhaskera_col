@@ -1670,14 +1670,28 @@ def serve_deepseek(args):
     # Run End-to-End Generation Benchmark
     # ─────────────────────────────────────────────────────────────────────────
     prompt = args.prompt
+    prompts = [prompt]
+    if args.prompt_file:
+        with open(args.prompt_file) as f:
+            prompts = [l.rstrip("\n") for l in f if l.strip()]
+    if args.batch_size > 1 and len(prompts) == 1:
+        prompts = prompts * args.batch_size
+    B = len(prompts)
     print(f"\n[7] Starting Generation Benchmark:")
     f0_min, f0_maj = DeepSeekColossusMoEWrapper._fault_counters()
-    print(f"  Prompt: {repr(prompt)}")
-    print(f"  Max New Tokens: {args.max_new_tokens}")
+    print(f"  Batch: {B} prompt(s) | Max New Tokens: {args.max_new_tokens}")
+    for bi, p in enumerate(prompts):
+        print(f"  Prompt[{bi}]: {repr(p)}")
 
-    input_ids = tokenizer.encode(prompt, return_tensors="pt").to(dev0)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"
+    enc = tokenizer(prompts, return_tensors="pt", padding=True)
+    input_ids = enc["input_ids"].to(dev0)
+    attn_mask = enc["attention_mask"].to(dev0)
     prompt_len = input_ids.shape[1]
-    print(f"  Prompt Length: {prompt_len} tokens")
+    prompt_real = int(attn_mask.sum().item())
+    print(f"  Prompt Length: {prompt_len} tokens (padded), {prompt_real} real")
 
     # Reset cache metrics before generation
     for w in colossus_wrappers:
@@ -1705,8 +1719,6 @@ def serve_deepseek(args):
         w.ans_stage_minflt = 0
         w.ans_stage_majflt = 0
         w.zssr_probe_ms = 0.0
-    for p in block_pools.values():
-        p.reset_stats()
         w._h_pre = None
         w._col_w = {}
         w.col_pred_bytes = 0
@@ -1717,6 +1729,8 @@ def serve_deepseek(args):
         w.col_conf_sum = 0.0
         w.col_conf_n = 0
         w.col_conf_hi_n = 0
+    for p in block_pools.values():
+        p.reset_stats()
 
     generated_ids = input_ids.clone()
 
@@ -1730,22 +1744,25 @@ def serve_deepseek(args):
     past_key_values = DynamicCache() if args.use_cache else None
 
     with torch.no_grad():
-        out = model(input_ids=generated_ids, past_key_values=past_key_values, use_cache=args.use_cache)
-        logits = out.logits  # [1, prompt_len, vocab_size] on dev1
-        next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True).to(dev0)
+        out = model(input_ids=generated_ids, attention_mask=attn_mask, past_key_values=past_key_values, use_cache=args.use_cache)
+        logits = out.logits  # [B, prompt_len, vocab_size]
+        next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True).to(dev0)  # [B, 1]
         past_key_values = getattr(out, "past_key_values", None)
 
 
     torch.cuda.synchronize(dev0)
     torch.cuda.synchronize(dev1)
     t_prefill = time.perf_counter() - t_prefill_start
-    prefill_tps = prompt_len / t_prefill
-    print(f"  Prefill Time : {t_prefill*1000:.2f} ms ({prefill_tps:.2f} tok/s)")
+    prefill_tps = prompt_real / t_prefill
+    print(f"  Prefill Time : {t_prefill*1000:.2f} ms ({prefill_tps:.2f} tok/s over {prompt_real} real tokens)")
     sys.stdout.flush()
 
     generated_ids = torch.cat([generated_ids, next_token], dim=1)
+    new_counts = [1] * B
+    finished = [False] * B
+    eos_id = tokenizer.eos_token_id
 
-    # 2. Decode Phase (Token-by-Token)
+    # 2. Decode Phase (lockstep batch; breaks when ALL rows hit EOS)
     print(f"\n  --- Decode Phase ({args.max_new_tokens - 1} tokens) [KV-Cache: {args.use_cache}] ---")
     sys.stdout.flush()
     decode_latencies = []
@@ -1773,7 +1790,7 @@ def serve_deepseek(args):
             else:
                 out = model(input_ids=generated_ids, use_cache=False)
             logits = out.logits
-            next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True).to(dev0)
+            next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True).to(dev0)  # [B, 1]
             if args.use_cache:
                 past_key_values = getattr(out, "past_key_values", None)
 
@@ -1781,6 +1798,18 @@ def serve_deepseek(args):
         torch.cuda.synchronize(dev1)
         t_step = time.perf_counter() - t_step_start
         decode_latencies.append(t_step)
+
+        # EOS bookkeeping per row (lockstep continues until ALL rows finish)
+        for bi in range(B):
+            if finished[bi]:
+                continue
+            tid = int(next_token[bi, 0].item())
+            new_counts[bi] += 1
+            if tid == eos_id:
+                finished[bi] = True
+        if all(finished):
+            generated_ids = torch.cat([generated_ids, next_token], dim=1)
+            break
 
         # Per-step cache metrics (Phase 1 causal set: DMA bytes vs exposed DMA)
         cur_hits = sum(w.hits for w in colossus_wrappers)
@@ -1844,6 +1873,8 @@ def serve_deepseek(args):
     total_decode_time = sum(decode_latencies)
     avg_decode_lat = total_decode_time / len(decode_latencies) if decode_latencies else 0.0
     decode_tps = 1.0 / avg_decode_lat if avg_decode_lat > 0 else 0.0
+    batch_new_tokens = sum(new_counts)
+    batch_decode_tps = batch_new_tokens / total_decode_time if total_decode_time > 0 else 0.0
 
     # Final sync + drain so event-measured ledgers are complete
     torch.cuda.synchronize(dev0)
@@ -1922,7 +1953,8 @@ def serve_deepseek(args):
     peak_hbm0 = torch.cuda.max_memory_allocated(dev0) / (1024**3)
     peak_hbm1 = torch.cuda.max_memory_allocated(dev1) / (1024**3)
 
-    gen_text = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
+    gen_texts = [tokenizer.decode(generated_ids[bi], skip_special_tokens=True) for bi in range(B)]
+    gen_text = gen_texts[0]
 
     print("\n" + "=" * 80)
     print("  COLOSSUS SERVING BENCHMARK RESULTS")
@@ -1936,8 +1968,9 @@ def serve_deepseek(args):
     print(f"  Dynamic Slot Capacity C   : {args.capacity} slots / layer ({(args.capacity / cfg.n_routed_experts)*100:.1f}% expert residency)")
     print(f"  Routed Expert Reduction   : {(1.0 - args.capacity / cfg.n_routed_experts)*100:.1f}% reduction in routed expert GPU memory")
     print("-" * 80)
-    print(f"  Prefill Latency           : {t_prefill*1000:7.1f} ms ({prefill_tps:5.1f} tok/s for {prompt_len} tokens)")
-    print(f"  Decode Latency (Avg)      : {avg_decode_lat*1000:7.1f} ms / token")
+    print(f"  Batch Size              : {B} seqs | Batch Decode Throughput: {batch_decode_tps:7.2f} tok/s agg ({batch_new_tokens} toks)")
+    print(f"  Prefill Latency           : {t_prefill*1000:7.1f} ms ({prefill_tps:5.1f} tok/s for {prompt_real} real tokens)")
+    print(f"  Decode Latency (Avg)      : {avg_decode_lat*1000:7.1f} ms / step ({decode_tps:5.2f} tok/s single-stream)")
     print(f"  Decode Throughput         : {decode_tps:7.2f} tokens / sec")
     print(f"  Cache Hits                : {total_hits:,} ({hit_rate:.1f}%)")
     print(f"  Cache Misses (Cold DMA)   : {total_misses:,}")
@@ -1974,8 +2007,12 @@ def serve_deepseek(args):
     if args.prefault:
         print(f"  Prefault (untimed)        : {pf_pages:,} pages in {pf_sec:.1f}s")
     print("-" * 80)
-    print(f"  Generated Text Output:")
+    print(f"  Generated Text Output[0]:")
     print(f"  {repr(gen_text)}")
+    if B > 1:
+        for bi in range(1, B):
+            print(f"  Generated Text Output[{bi}]:")
+            print(f"  {repr(gen_texts[bi])}")
     print("=" * 80)
 
     # Save to JSON
@@ -1989,9 +2026,14 @@ def serve_deepseek(args):
         "gpus": [p0.name] if args.num_gpus == 1 else [p0.name, p1.name],
         "capacity_slots": args.capacity,
         "residency_reduction_pct": (1.0 - args.capacity / cfg.n_routed_experts) * 100.0,
-        "prompt": prompt,
+        "prompt": prompts[0] if B == 1 else prompts,
+        "prompts": prompts,
+        "batch_size": B,
         "prompt_tokens": prompt_len,
+        "prompt_real_tokens": prompt_real,
         "generated_tokens": args.max_new_tokens,
+        "batch_decode_tokens": batch_new_tokens,
+        "batch_decode_tps": batch_decode_tps,
         "prefill_ms": t_prefill * 1000,
         "prefill_tps": prefill_tps,
         "decode_avg_ms": avg_decode_lat * 1000,
@@ -2054,7 +2096,7 @@ def serve_deepseek(args):
         "overlap_pct": overlap,
         "exposed_mb": exposed_tot,
         "effective_gbps": eff_gbps,
-        "exact_vs_baseline": (gen_text == ref_text) if (prompt == "def quicksort(arr):" and args.max_new_tokens == 16) else None,
+        "exact_vs_baseline": (gen_text == ref_text) if (B == 1 and prompts[0] == "def quicksort(arr):" and args.max_new_tokens == 16) else None,
         "peak_vram_gpu0_gb": peak_hbm0,
         "peak_vram_gpu1_gb": peak_hbm1 if args.num_gpus > 1 else None,
         "run_minflt": run_minflt,
@@ -2063,6 +2105,7 @@ def serve_deepseek(args):
         "prefault_seconds": pf_sec,
         "prefault_pages": pf_pages,
         "generated_text": gen_text,
+        "generated_texts": gen_texts,
     }
 
     if args.output_json:
@@ -2077,6 +2120,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--num_gpus", type=int, default=1)
     parser.add_argument("--prompt", type=str, default="def quicksort(arr):")
+    parser.add_argument("--prompt_file", type=str, default=None,
+                        help="File with one prompt per line; forms the batch (overrides --prompt)")
+    parser.add_argument("--batch_size", type=int, default=1,
+                        help="Repeat single prompt B times for offline batch throughput")
     parser.add_argument("--max_new_tokens", type=int, default=16)
     parser.add_argument("--capacity", type=int, default=12)
     parser.add_argument("--capacity_gpu1", type=int, default=7)
