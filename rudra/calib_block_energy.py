@@ -45,6 +45,9 @@ def main():
                 if k in wm:
                     by_shard.setdefault(wm[k], []).append((l, e, proj, k))
     calib = {}
+    # Gate and up projections may live in DIFFERENT shards: accumulate per-block
+    # squared norms (lightweight) per shard, combine across shards at the end.
+    scores = {}  # (l, e, proj) -> [(score, bi)]
     t0 = time.perf_counter()
     n_done = 0
     for shard, ks in sorted(by_shard.items()):
@@ -55,8 +58,6 @@ def main():
             data_start = 8 + hlen
             fd = os.open(path, os.O_RDONLY)
             try:
-                # group gate/up pairs per expert for joint scoring
-                per_exp = {}
                 for l, e, proj, k in ks:
                     b, en = header[k]["data_offsets"]
                     n = en - b
@@ -73,26 +74,33 @@ def main():
                     I0, H0 = header[k]["shape"][0], header[k]["shape"][1]
                     w = torch.frombuffer(raw, dtype=torch.uint8).view(
                         torch.bfloat16).reshape(I0, H0).float().numpy()
-                    per_exp.setdefault((l, e), {})[proj] = w
-                    del raw
-                for (l, e), d in per_exp.items():
-                    g, u = d["gate_proj"], d["up_proj"]
-                    nb = (g.shape[0] + args.block - 1) // args.block
-                    scores = []
+                    nb = (I0 + args.block - 1) // args.block
+                    bl = []
                     for bi in range(nb):
-                        r0, r1 = bi * args.block, min((bi + 1) * args.block, g.shape[0])
-                        s = float((g[r0:r1] ** 2).sum() * (u[r0:r1] ** 2).sum())
-                        scores.append((s, bi))
-                    scores.sort(reverse=True)
-                    ntop = max(2, int(nb * args.frac + 0.5))
-                    top = sorted(bi for _, bi in scores[:ntop])
-                    calib[f"{l}/{e}"] = {"gate_proj": top, "up_proj": top,
-                                         "nblocks": nb, "ntop": ntop}
+                        r0, r1 = bi * args.block, min((bi + 1) * args.block, I0)
+                        bl.append((float((w[r0:r1] ** 2).sum()), bi))
+                    scores[(l, e, proj)] = bl
                     n_done += 1
+                    del raw, w
             finally:
                 os.close(fd)
         if n_done % 2000 == 0:
-            print(f"  ...{n_done} experts ({time.perf_counter() - t0:.0f}s)", flush=True)
+            print(f"  ...{n_done} tensors ({time.perf_counter() - t0:.0f}s)", flush=True)
+    n_exp = 0
+    for l in range(1, args.layers):
+        for e in range(args.experts):
+            g = scores.get((l, e, "gate_proj"))
+            u = scores.get((l, e, "up_proj"))
+            if not g or not u:
+                continue
+            gd = dict((bi, s) for s, bi in g)
+            nb = len(g)
+            ranked = sorted(((gd.get(bi, 0.0) * s, bi) for s, bi in u), reverse=True)
+            ntop = max(2, int(nb * args.frac + 0.5))
+            top = sorted(bi for _, bi in ranked[:ntop])
+            calib[f"{l}/{e}"] = {"gate_proj": top, "up_proj": top,
+                                 "nblocks": nb, "ntop": ntop}
+            n_exp += 1
     with open(os.path.join(args.out, "calib.json"), "w") as f:
         json.dump(calib, f)
     print(f"DONE {len(calib)} experts in {time.perf_counter() - t0:.1f}s -> {args.out}/calib.json",
