@@ -40,7 +40,7 @@ def main():
     by_shard = {}
     for l in range(1, args.layers):
         for e in range(args.experts):
-            for proj in ("gate_proj", "up_proj"):
+            for proj in ("gate_proj", "up_proj", "down_proj"):
                 k = f"model.layers.{l}.mlp.experts.{e}.{proj}.weight"
                 if k in wm:
                     by_shard.setdefault(wm[k], []).append((l, e, proj, k))
@@ -91,6 +91,7 @@ def main():
         for e in range(args.experts):
             g = scores.get((l, e, "gate_proj"))
             u = scores.get((l, e, "up_proj"))
+            d = scores.get((l, e, "down_proj"))
             if not g or not u:
                 continue
             gd = dict((bi, s) for s, bi in g)
@@ -98,8 +99,17 @@ def main():
             ranked = sorted(((gd.get(bi, 0.0) * s, bi) for s, bi in u), reverse=True)
             ntop = max(2, int(nb * args.frac + 0.5))
             top = sorted(bi for _, bi in ranked[:ntop])
-            calib[f"{l}/{e}"] = {"gate_proj": top, "up_proj": top,
-                                 "nblocks": nb, "ntop": ntop}
+            entry = {"gate_proj": top, "up_proj": top,
+                     "nblocks": nb, "ntop": ntop}
+            if d:
+                dd = dict((bi, s) for s, bi in d)
+                nbd = len(d)
+                dranked = sorted(dd.items(), key=lambda kv: kv[1], reverse=True)
+                ntopd = max(4, int(nbd * args.frac + 0.5))
+                entry["down_proj"] = sorted(bi for bi, _ in dranked[:ntopd])
+                entry["down_nblocks"] = nbd
+                entry["down_ntop"] = ntopd
+            calib[f"{l}/{e}"] = entry
             n_exp += 1
     with open(os.path.join(args.out, "calib.json"), "w") as f:
         json.dump(calib, f)
