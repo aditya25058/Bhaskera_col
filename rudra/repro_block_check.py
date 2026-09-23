@@ -46,5 +46,12 @@ wrap = W(layer_idx=1, moe_module=moe, cfg=cfg, device=dev, capacity=2,
          handles=handles, weight_map=wm, dma_stream=dma,
          model_dir=MODEL, block_pool=pool, block_store=BLOCKH, ans_store=ANSH)
 print("wrapper built; running block_self_check...", flush=True)
+slot_idx = wrap.slot_lru.pop(0)
+print("assembling...", flush=True)
+desc = wrap._block_assemble(0, slot_idx, kind="demand")
+print(f"assembled: {len(desc['misses'])} misses, {len(desc['hits'])} hits", flush=True)
+print("decoding/installing...", flush=True)
+wrap._block_decode_many([desc])
+print("decode_many OK", flush=True)
 ok = wrap.block_self_check()
 print("SELF_CHECK:", ok, flush=True)
