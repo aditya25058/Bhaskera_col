@@ -959,9 +959,11 @@ class DeepSeekColossusMoEWrapper(nn.Module):
         if _nvd not in list(nvidia.__path__):
             nvidia.__path__.append(_nvd)
         import nvidia.nvcomp as _nv
-        for (_pkey, _m, _lo, comp_g) in staged:
+        for (_desc, _pkey, _m, _lo, comp_g) in stage:
             arrs.append(_nv.as_array(comp_g))
+        print(f"  [dbg] staged {len(stage)} blocks, decoding...", flush=True)
         dec = codec.decode(arrs) if arrs else []
+        print(f"  [dbg] decode returned {len(dec) if hasattr(dec, '__len__') else '?'} items", flush=True)
         flat = []
         for d in dec:
             flat.append(bytes(d) if isinstance(d, (bytes, bytearray, memoryview))
