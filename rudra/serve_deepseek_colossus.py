@@ -386,6 +386,7 @@ class DeepSeekColossusMoEWrapper(nn.Module):
         col_pred_experts: int = 8,
         block_pool=None,
         block_store: str = None,
+        calib_dir: str = None,
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -408,6 +409,7 @@ class DeepSeekColossusMoEWrapper(nn.Module):
         self.ans_store = ans_store
         self.block_pool = block_pool
         self.block_store = block_store
+        self.calib_dir = calib_dir
         self.ans_bytes_m = 0
         self.ans_decomp_ms = 0.0
         self.ans_dispatches = 0
@@ -839,27 +841,33 @@ class DeepSeekColossusMoEWrapper(nn.Module):
     def _block_counts(self, nrows: int):
         return (nrows + self.block_pool.block - 1) // self.block_pool.block
 
-    def _block_assemble(self, expert_id: int, slot_idx: int, kind: str = "demand"):
+    def _block_assemble(self, expert_id: int, slot_idx: int, kind: str = "demand",
+                        subset=None):
         """Assemble FULL expert into slot from block pool (hits) + block DMA (misses).
 
         B0 scope (stated openly): transfer + residency are block-granular
         (128-row units, independently DMA'd/decoded/tracked); SELECTION is
         expert-level (probe top-8 -> all blocks; demand -> all blocks).
-        Block-SUBSET selection (top-N by energy) is B1 and needs a
-        serving-cost scoring solution first. Compute stays expert-granular
-        (single exact GEMM); split-execute is deferred likewise.
+        subset: optional {pname: set(bi)} restricting transfer+residency to
+        calibrated top blocks (B1: static energy subsets, zero runtime cost).
+        Demand callers pass subset=None (exact fallback covers everything).
+        Compute stays expert-granular (single exact GEMM); split-execute deferred.
         Batched nvcomp decode across the layer is done by the caller via
         _block_decode_many; this returns the staged descriptor.
         """
         idx = self._get_block_index(self.block_store)
         pool = self.block_pool
         desc = {"expert": expert_id, "slot": slot_idx, "kind": kind,
-                "hits": [], "misses": [], "hit_bytes": 0, "miss_bytes": 0}
+                "hits": [], "misses": [], "hit_bytes": 0, "miss_bytes": 0,
+                "subset": subset is not None}
         prefix = f"{self.layer_idx}/{expert_id}/"
         for pname in ("gate_proj", "up_proj", "down_proj"):
             suffix = "/" + pname
             bis = sorted({int(k.split("/")[2]) for k in idx
                           if k.startswith(prefix) and k.endswith(suffix)})
+            if subset is not None and pname in subset:
+                keep = set(subset[pname])
+                bis = [bi for bi in bis if bi in keep]
             for bi in bis:
                 bkey = f"{self.layer_idx}/{expert_id}/{bi}/{pname}"
                 m = idx[bkey]
@@ -904,41 +912,46 @@ class DeepSeekColossusMoEWrapper(nn.Module):
             cls._block_blobs[store_dir] = maps
         return cls._block_blobs[store_dir]
 
-    def _block_decode_many(self, descs):
-        """ONE nvcomp decode for every missed block across a layer's descs, then
-        install (resident HBM copies + fresh assembles) into slots and pool.
-        Returns {expert_id: staged_bytes} for ledger accounting by the caller."""
+    _calib_store = None
+
+    @classmethod
+    def _get_calib(cls, calib_dir):
+        """Static per-expert top-block sets (offline weight-norm calibration)."""
+        if calib_dir and cls._calib_store is None:
+            with open(os.path.join(calib_dir, "calib.json")) as f:
+                cls._calib_store = json.load(f)
+        return cls._calib_store
+
+    def _block_fetch_decode(self, miss_items):
+        """Shared fetch: DMA lo+comp per block, ONE batched nvcomp decode.
+        miss_items: [(pkey, meta)]. Returns [(pkey, meta, lo_g, hi_g)] GPU-side."""
         import torch.utils.dlpack as dlpack
         pool = self.block_pool
         pool._ensure_cap(int(getattr(self.cfg, "hidden_size", 5120)))
         lo_maps = self._get_lo_blobmap(self.ans_store) if self.ans_store else None
         blob_maps = self._get_block_blobmap(self.block_store)
-        # 1. Stage all miss blocks: DMA lo-slice + comp blob per block.
-        stage = []  # (desc, pkey, meta, lo_g, comp_g)
-        for desc in descs:
-            for (pkey, m) in desc["misses"]:
-                _L, _E, _bi, _pname = pkey
-                if lo_maps is not None:
-                    lm = self._lo_block_view(_L, _E, _bi, _pname, lo_maps)
-                else:
-                    # strided fallback: even bytes from original shard (async DMA)
-                    tkey = f"model.layers.{_L}.mlp.experts.{_E}.{_pname}.weight"
-                    shard = self.weight_map[tkey]
-                    sm = ShardMap.get(os.path.join(self.model_dir, shard))
-                    info = sm.header[tkey]
-                    b, e = info["data_offsets"]
-                    s = sm.data_start + b
-                    span = sm.u8[s:s + (e - b)]
-                    R, C = info["shape"][0], info["shape"][1]
-                    rows = min(pool.block, R - _bi * pool.block)
-                    r0 = _bi * pool.block
-                    lm = span[r0 * C * 2:(r0 + rows) * C * 2].reshape(rows, C * 2)[:, 0::2].reshape(rows, C)
-                lo = lm.to(self.device, non_blocking=True)
-                _fh, _mm, bu8 = blob_maps[m["blob"]]
-                cb = bu8[m["offset"]:m["offset"] + m["comp_len"]]
-                comp_g = cb.to(self.device, non_blocking=True)
-                stage.append((desc, pkey, m, lo, comp_g))
-        # 2. Single batched decode.
+        staged = []
+        for (pkey, m) in miss_items:
+            _L, _E, _bi, _pname = pkey
+            if lo_maps is not None:
+                lm = self._lo_block_view(_L, _E, _bi, _pname, lo_maps)
+            else:
+                tkey = f"model.layers.{_L}.mlp.experts.{_E}.{_pname}.weight"
+                shard = self.weight_map[tkey]
+                sm = ShardMap.get(os.path.join(self.model_dir, shard))
+                info = sm.header[tkey]
+                b, e = info["data_offsets"]
+                s = sm.data_start + b
+                span = sm.u8[s:s + (e - b)]
+                R, C = info["shape"][0], info["shape"][1]
+                rows = min(pool.block, R - _bi * pool.block)
+                r0 = _bi * pool.block
+                lm = span[r0 * C * 2:(r0 + rows) * C * 2].reshape(rows, C * 2)[:, 0::2].reshape(rows, C)
+            lo = lm.to(self.device, non_blocking=True)
+            _fh, _mm, bu8 = blob_maps[m["blob"]]
+            cb = bu8[m["offset"]:m["offset"] + m["comp_len"]]
+            comp_g = cb.to(self.device, non_blocking=True)
+            staged.append((pkey, m, lo, comp_g))
         codec = self._ans_codec_for(self.device)
         arrs = []
         import nvidia
@@ -946,25 +959,86 @@ class DeepSeekColossusMoEWrapper(nn.Module):
         if _nvd not in list(nvidia.__path__):
             nvidia.__path__.append(_nvd)
         import nvidia.nvcomp as _nv
-        for (_desc, _pkey, _m, _lo, comp_g) in stage:
+        for (_pkey, _m, _lo, comp_g) in staged:
             arrs.append(_nv.as_array(comp_g))
         dec = codec.decode(arrs) if arrs else []
         flat = []
         for d in dec:
             flat.append(bytes(d) if isinstance(d, (bytes, bytearray, memoryview))
                         else dlpack.from_dlpack(d))
-        # 3. Install: fresh pool entries + slot regions.
-        pos = 0
-        for (desc, pkey, m, lo, comp_g) in stage:
-            hb = flat[pos]
-            pos += 1
+        out = []
+        for (pkey, m, lo, comp_g), hb in zip(staged, flat):
             _L, _E, _bi, _pname = pkey
             rows = m["rows"]
-            H = lo.shape[1] if lo.dim() == 2 else None
             if isinstance(hb, (bytes, bytearray)):
                 hi = torch.frombuffer(bytearray(hb), dtype=torch.uint8).reshape(rows, -1).to(self.device)
             else:
                 hi = hb.reshape(rows, -1)
+            out.append((pkey, m, lo, hi))
+        return out
+
+    def _block_prefetch_subset(self, exp_subset):
+        """Pool-only subset prefetch (no slots, no binding): {exp: {pname: [bi]}}.
+        Returns {expert: staged_bytes} for ledger accounting."""
+        pool = self.block_pool
+        idx = self._get_block_index(self.block_store)
+        miss_items, owner = [], []
+        per_exp_bytes = {}
+        for exp_id, sub in exp_subset.items():
+            for pname, bis in sub.items():
+                for bi in bis:
+                    bkey = f"{self.layer_idx}/{exp_id}/{bi}/{pname}"
+                    m = idx.get(bkey)
+                    if m is None:
+                        continue
+                    pkey = (self.layer_idx, exp_id, bi, pname)
+                    ent = pool.entries.get(pkey)
+                    if ent is not None:
+                        pool.tick += 1
+                        pool.freq[pkey] = pool.freq.get(pkey, 0) + 1
+                        pool.stamp[pkey] = pool.tick
+                        pool.hits += 1
+                    else:
+                        pool.tick += 1
+                        pool.misses += 1
+                        miss_items.append((pkey, m))
+                        owner.append(exp_id)
+        fetched = self._block_fetch_decode(miss_items)
+        for (pkey, m, lo, hi), exp_id in zip(fetched, owner):
+            _L, _E, _bi, _pname = pkey
+            rows = m["rows"]
+            H = lo.shape[1]
+            ent = torch.empty(rows, H * 2, dtype=torch.uint8, device=self.device)
+            ent[:, 0::2].copy_(lo.reshape(rows, -1), non_blocking=True)
+            ent[:, 1::2].copy_(hi.reshape(rows, -1), non_blocking=True)
+            ent = ent.view(torch.bfloat16).reshape(rows, H).detach().clone()
+            while len(pool.entries) >= pool.cap_blocks:
+                pool._evict_sampled()
+            pool.entries[pkey] = [ent]
+            pool._keys.append(pkey)
+            pool.freq[pkey] = 1
+            pool.stamp[pkey] = pool.tick
+            nb = lo.numel() + m["comp_len"]
+            pool.dma_bytes += nb
+            per_exp_bytes[exp_id] = per_exp_bytes.get(exp_id, 0) + nb
+        return per_exp_bytes
+
+    def _block_decode_many(self, descs):
+        """ONE nvcomp decode for every missed block across a layer's descs, then
+        install (resident HBM copies + fresh assembles) into slots and pool.
+        Returns {expert_id: staged_bytes} for ledger accounting by the caller."""
+        pool = self.block_pool
+        pool._ensure_cap(int(getattr(self.cfg, "hidden_size", 5120)))
+        miss_items = []  # (pkey, meta, desc)
+        for desc in descs:
+            for (pkey, m) in desc["misses"]:
+                miss_items.append((pkey, m, desc))
+        fetched = self._block_fetch_decode([(p, m) for (p, m, _d) in miss_items])
+        # 3. Install: fresh pool entries + slot regions.
+        per_exp = {}
+        for (pkey, m, lo, hi), (_p0, _m0, desc) in zip(fetched, miss_items):
+            _L, _E, _bi, _pname = pkey
+            rows = m["rows"]
             slot = self.slots[desc["slot"]]
             w = {"gate_proj": slot.gate_proj.weight, "up_proj": slot.up_proj.weight,
                  "down_proj": slot.down_proj.weight}[_pname]
@@ -982,9 +1056,10 @@ class DeepSeekColossusMoEWrapper(nn.Module):
             pool._keys.append(pkey)
             pool.freq[pkey] = 1
             pool.stamp[pkey] = pool.tick
-            pool.dma_bytes += lo.numel() + m["comp_len"]
-            desc["staged_bytes"] = desc.get("staged_bytes", 0) + lo.numel() + m["comp_len"]
-            # resident-hit blocks copy from pool entries into slot regions
+            nb = lo.numel() + m["comp_len"]
+            pool.dma_bytes += nb
+            desc["staged_bytes"] = desc.get("staged_bytes", 0) + nb
+            per_exp[desc["expert"]] = per_exp.get(desc["expert"], 0) + nb
         for desc in descs:
             slot = self.slots[desc["slot"]]
             for (pkey, ent, m) in desc["hits"]:
@@ -1166,7 +1241,22 @@ class DeepSeekColossusMoEWrapper(nn.Module):
         if not new_ids:
             return pred
         if self.block_pool is not None:
-            # B0: expert-selective, block-granular transfers (subset selection = B1)
+            # B1: static top-block subsets (calib) -> pool-only prefetch.
+            # Falls back to full-block expert sets when no calib (B0 behavior).
+            calib = self._get_calib(self.calib_dir) if self.calib_dir else None
+            if calib is not None:
+                exp_subset = {}
+                for exp_id in new_ids:
+                    ce = calib.get(f"{self.layer_idx}/{exp_id}")
+                    if ce is None:
+                        continue
+                    exp_subset[exp_id] = {p: ce[p] for p in ("gate_proj", "up_proj", "down_proj") if p in ce}
+                per_exp = self._block_prefetch_subset(exp_subset) if exp_subset else {}
+                for exp_id in new_ids:
+                    self._prefetched[exp_id] = self._prefetched.get(exp_id, 0) + per_exp.get(exp_id, 0)
+                    self._prefmeta[exp_id] = [conf, 0]
+                self.zssr_predictions += len(new_ids)
+                return pred
             descs = []
             for exp_id in new_ids:
                 slot_idx = self.slot_lru.pop(0)
@@ -1453,6 +1543,7 @@ def serve_deepseek(args):
             col_pred_experts=args.col_pred_experts,
             block_pool=block_pools.get(str(dev)),
             block_store=args.block_store,
+            calib_dir=args.calib,
         )
 
         if args.warm_slots:
@@ -1836,7 +1927,8 @@ def serve_deepseek(args):
               f"(ratio {ans_ratio:.3f} vs 45MB whole), decomp {total_ans_dms:.2f}ms")
     if args.block_pool_gb > 0:
         print(f"  Block Pool (B0 A/B)       : {total_bh + total_bm:,} block lookups "
-              f"({block_hit_rate:.1f}% hit), {total_bdma:,.1f}MB staged")
+              f"({block_hit_rate:.1f}% hit), {total_bdma:,.1f}MB staged"
+              f"{' + B1 static subsets ' + args.calib if args.calib else ''}")
     if args.ans_store and args.zssr_prefetch:
         print(f"  Stacked Breakdown         : probe {total_probe_ms:.1f}ms | prefetch-DMA {total_ans_pref_mb:,.1f}MB | "
               f"demand-DMA {exposed_ans:,.1f}MB | decomp {total_ans_dms:.2f}ms | "
@@ -1905,6 +1997,7 @@ def serve_deepseek(args):
         "ans_store": args.ans_store,
         "block_pool_gb": float(args.block_pool_gb),
         "block_store": args.block_store,
+        "calib": args.calib,
         "block_cols": int(args.block_cols),
         "block_hits": total_bh,
         "block_misses": total_bm,
@@ -1993,6 +2086,8 @@ if __name__ == "__main__":
                         help="Phase 1A: measure ZSSR column P/R vs ground truth (no movement change)")
     parser.add_argument("--block_pool_gb", type=float, default=0.0,
                         help="B0: block-granular pool budget in GB per GPU-share (0=disabled)")
+    parser.add_argument("--calib", type=str, default=None,
+                        help="B1: static top-block calibration dir (subset prefetch); needs block pool")
     parser.add_argument("--block_store", type=str, default=None,
                         help="B0: block-ANS store dir (block_index.json + .bansh)")
     parser.add_argument("--block_cols", type=int, default=128)
