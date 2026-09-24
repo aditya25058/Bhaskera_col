@@ -1350,8 +1350,11 @@ def serve_deepseek(args):
             sel = {w.layer_idx for w in colossus_wrappers} if args.cpu_layers == "all" \
                 else {int(x) for x in args.cpu_layers.split(",") if x.strip()}
             from concurrent.futures import ThreadPoolExecutor
-            cpu_pool = ThreadPoolExecutor(max_workers=max(1, args.cpu_threads))
-            torch.set_num_threads(1)  # one thread per pool worker (bench-proven)
+            # Pool path measured SLOWER (19 ms vs 9.5 ms sequential): concurrent
+            # oneDNN GEMVs serialize; kept behind flag for investigation.
+            cpu_pool = (ThreadPoolExecutor(max_workers=max(1, args.cpu_threads))
+                        if args.cpu_pool else None)
+            torch.set_num_threads(1 if args.cpu_pool else args.cpu_threads)
             n = 0
             for w in colossus_wrappers:
                 if w.layer_idx in sel:
@@ -1359,7 +1362,7 @@ def serve_deepseek(args):
                     w.cpu_cache_cap = args.cpu_cache
                     w.cpu_pool = cpu_pool
                     n += 1
-            print(f"  CPU expert layers: {n} (pool={args.cpu_threads} workers, cache={args.cpu_cache}/layer)")
+            print(f"  CPU expert layers: {n} (mode={'pool' if cpu_pool else 'sequential'}, threads={args.cpu_threads}, cache={args.cpu_cache}/layer)")
     print(f"    GPU 0 Allocated (with C={args.capacity} slots): {torch.cuda.memory_allocated(dev0) / (1024**3):.2f} GB")
     if args.num_gpus > 1:
         print(f"    GPU 1 Allocated (with C={args.capacity_gpu1} slots): {torch.cuda.memory_allocated(dev1) / (1024**3):.2f} GB")
@@ -2072,6 +2075,8 @@ if __name__ == "__main__":
     parser.add_argument("--cpu_layers", type=str, default="",
                         help="3-1: MoE layers to run on CPU in ulp1 mode ('all' or comma list, e.g. '1,5')")
     parser.add_argument("--cpu_threads", type=int, default=6)
+    parser.add_argument("--cpu_pool", action="store_true", default=False,
+                        help="3-2: concurrent pool dispatch (measured slower; investigation only)")
     parser.add_argument("--cpu_cache", type=int, default=128,
                         help="3-1: per-layer FIFO CPU weight cache (experts)")
     parser.add_argument("--audit_logits", type=str, default=None,
