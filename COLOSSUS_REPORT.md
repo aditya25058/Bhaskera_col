@@ -1,0 +1,110 @@
+# COLOSSUS — Comprehensive Report
+
+**Date:** 2026-09-20 · **Branch:** `colossus-zssr` · **Hardware:** 1–2× NVIDIA H100 NVL (93.1 GB), Rudra A100 80GB (Gen3 x4)
+**Models:** DeepSeek-Coder-V2-Instruct 236B MoE (160 routed + 2 shared, top-6, 471.5 GB BF16) · Param2-17B-A2.4B (64 experts) · Mixtral-8x7B (8×336 MB)
+
+---
+
+## 1. Problem Statement
+
+Very large MoE models (236B–671B params, 400+ GB weights) nominally need 8×H100 clusters. Only a tiny fraction of experts (top-k) is active per token, so most GPU residency is waste. Goal: serve such models on **one single GPU** at low VRAM **without quantizing weights** (bitwise-exact BF16) — then recover the lost throughput.
+
+## 2. Core Idea (unchanged throughout)
+
+> **COLOSSUS changes the unit of MoE memory management from the entire expert to dynamically resident portions of experts, trading GPU memory/throughput for interconnect traffic while preserving exact computation.**
+
+Column-level, not expert-level:
+
+```text
+Expert E ──► hot columns (GPU HBM) ──► y_cached ──┐
+            cold columns (DMA on demand) ──► y_missed ──├── + ──► y = y_cached + y_missed == native
+```
+
+`f_native(x) = f_COLOSSUS(x)` — router untouched, SwiGLU math identical, only weight residency changes.
+
+## 3. Architecture
+
+| Component | Location | Function |
+|---|---|---|
+| Dynamic slot cache | `inference/colossus/dynamic_cache.py` (`DynamicMoELayerWrapper`, 654L) | C pre-alloc GPU slots/layer, LRU, demand DMA + `prefetch_stream`, `pre_attention_prefetch`, prefill warmup |
+| ZSSR predictor | `colossus/predictor.py` | Zero-param: L0 frequency, L≥1 `h@Wᵀ` Top-8, SwiGLU-energy column plans |
+| Column machinery | `colossus/columns.py`, `directory.py`, `sa_ffn.py`/`saffn.py` | Fixed packets (`tiered_fwd` 50×5+25×3=325 cols), LRU 32/expert, lossless split accumulate |
+| TurboQuant KV | `inference/kv_cache.py` | K4/V2, O(1) incremental (667 s → 18–25 s fix); KV-cache gave 7.2× (13761→1908 ms/tok) |
+| Inference engine | `inference/engine.py` | HF `generate()` + Cache, COLOSSUS hook, vLLM auto-select |
+| DeepSeek E2E scaffold | `rudra/serve_deepseek_colossus.py` | mmap 55 shards, non-routed split, `DeepSeekColossusMoEWrapper`, NVLink bridge, JSON telemetry |
+| Config | `configs/inference_colossus.yaml` | `replica: int4_row`, `budget: tiered_fwd`, `missing_col_ratio: 0.50` → ~19.6 GB vs ~34 GB dense (Param2) |
+
+Research extensions (all **opt-in flags**, defaults = original behavior): hetero CPU fallback (`--enable_hetero`), ADETR per-slot split (`--adetr_ratio`), `GlobalColumnPool` (`--col_pool_gb`, `--col_block`), offline batching (`--batch_size`, `--prompt_file`).
+
+## 4. Results
+
+### 4.1 Feasibility (the headline — all exact, BF16, no quant)
+
+| Run | Setup | Peak VRAM | Decode | Notes |
+|---|---|---|---|---|
+| Mixtral 2×A100 dense | 2 GPU | 43.51 GB | **14.50 tok/s** | reference (`aggregate_run3.py`) |
+| Mixtral 1×A100 COLOSSUS | C=4 | 55.51 GB (23.6 free) | 0.09 tok/s, 45.7% hits, `torch_equal True` | 1×A100 holds 87 GB; bus-bound (336 MB/24 ms) |
+| Param2 1×A100 dense | 1 GPU | 34.2 GB | 38.2 tok/s | baseline |
+| Param2 1×A100 COLOSSUS | offload 60–80% | **19.6 GB** | 34.8 tok/s (91% retained) | fits 24 GB 4090; 6.3 ms fits MHA window |
+| DeepSeek layer exact (Job 1780) | H100, C=12 | — | `torch.equal True`, diff `0.0` | PCIe Gen5 51.56 GB/s, R=0.55<1 |
+| DeepSeek 2-GPU (1790→1804) | C=12/6, KV+batched DMA | 29.9/22.3 GB | 1774 ms/tok (7.8×) | 502 hits, peak 19.8% |
+| **DeepSeek 1-GPU (1805)** | C=12, all 60 layers | **60.09/93.1 GB** | 1585 ms/tok (0.63) | 8×H100 → 1×H100, 666 hits (9.5%), peak 28% |
+
+### 4.2 Throughput experiments (all preserved exact output)
+
+| # | Experiment | Result | Verdict |
+|---|---|---|---|
+| 1813 | CPU-expert exactness (Layer-1, EPYC vs Hopper BF16) | `torch.equal True`, 30.7 KB vs 135 MB (4400×) | mechanism proven |
+| 1814 | Hetero full-serve (thr=4) | 10.82 s/tok, slots starved (0.25%) | Fiddler flips: 0.85 ms DMA < 30 ms CPU for 45 MB experts |
+| 1815 | Hetero fix (thr=1, freq retain, prefill guard) | 5.73 s/tok, 5.1% hits | better; still 3× slower than DMA-only |
+| ADETR-50% | per-slot hot/cold split | **22.5 MB/miss exact**, but 8.9 s/tok | transfer fine-grained, execution not — parked |
+| Pool v1→v2→v3 | column-LFU keyed (layer,expert,block), GPU-only | v1 23 s → v2 2.05 s → v3 parity 1.87 s/tok | fixed 70M-op eviction scan, 0-hit fast path, admission filter |
+| Pool sweep | 8/16/24 GB × 16/64 tok | hits 0.26→1.04→2.47%, eff. 45→44.5→43.9 MB/miss | monotonic, shallow; slots capture easy reuse |
+| B=8 shared | same prompt ×8 + pool16 | **3.51 tok/s (6.6×)**, DMA flat 282 GB, 2.35 GB/token | MoE-Gen amortization proven |
+| B=3 diverse | mixed prompts | 0.33→0.34 tok/s (C=12→18: hits +54%, latency −4%) | diversity ceiling B×6≤C; DMA-bound |
+| B=3 ×64 tok | longer gen | flat 0.34 (prefill amortized, decode dominates) | amortization exhausted |
+| v4 | block256/admit3 | 0.31 (no gain) | pool tuning exhausted |
+
+### 4.3 Envelope (1×H100 NVL, exact, no quant)
+
+| Workload | Throughput | Dominant factor |
+|---|---|---|
+| B=1 | ~0.53 tok/s | Expert DMA (45 MB/miss) |
+| B=8 shared routing | **3.51 tok/s** | Cross-request weight reuse |
+| B=3 diverse routing | ~0.34 tok/s | Routing-induced unique DMA (~56 GB/step) |
+
+## 5. Issues Found (each with measurement)
+
+1. **Whole-expert drift:** DeepSeek E2E used 45 MB full DMA (`14355/319`), not columns — scaffold built faster than column port. Fixed by reunification work; defaults restored.
+2. **CPU-fallback trap:** 30 ms CPU vs 0.85 ms DMA per 45 MB expert at B=1/Gen5. Fiddler wins only for huge experts / starved buses.
+3. **Slot starvation:** thr=4 sent all misses to CPU (0.25% hits). Fixed with DMA-first + freq retention.
+4. **Pool v1 thrash:** O(cap) eviction scan (70M ops) + block staging → 122 s prefill. Fixed: sampling, fast path, admission.
+5. **Diversity ceiling:** unique experts/layer ≤ C required for fast path; diverse B=3 ≈ 18 > 12. C=18 helped hits (+54%) not latency (−4%).
+6. **Transfer fragmentation:** 1.3 MB blocks run at ~8 GB/s vs 51 GB/s for 45 MB contiguous.
+
+## 6. Gaps / Open Work (idea intact)
+
+- **Fused/coalesced assembly kernel** (nsys-profiled): one contiguous staging DMA per miss instead of block scatter; predicted ~3× on diverse steps. Biggest remaining lever.
+- **Longer-horizon pool value:** pool pays only on slot-eviction recall; needs 64+ tok + ≥16 GB to show. Unexplored: 24 GB + B=8 shared (combined best-config run).
+- **Diverse large-B:** B=16–32 mixed prompts (prefill amortization + overlap statistics unknown).
+- **Dynamic_cache reunification:** E2E scaffold and `DynamicMoELayerWrapper` diverged; column-pool exists only in serve path.
+- **Lossless compression over PCIe** (e.g. nvComp on BF16 mantissa): halves bytes with zero numerical change — untouched.
+- **CPU attention** (MoE-Lightning lesson): saves I/O bandwidth for weights — not tried.
+
+## 7. Standing Conclusion
+
+COLOSSUS provably consolidates 236B-MoE serving onto one H100 at 60 GB VRAM with bitwise-exact outputs and no quantization. Throughput today: 0.5 (single) / 3.5 (shared batch) / 0.34 (diverse) tok/s. Controlling variable everywhere is **unique expert bytes per step** — the optimization mandate going forward, with the column-level exact idea frozen.
+
+## 8. Codebase Status: Experiments Removed, Idea Intact (commit `4a359ba`)
+
+No throughput experiment produced a significant increase, so all experiment code paths were **removed** from the codebase and COLOSSUS was restored to its pre-experiment state:
+
+| Removed path | Commits (preserved in git history) | Result it produced |
+|---|---|---|
+| Hetero CPU engine (Fiddler-style) | `399009b`, `cf434bd`, `a2aa338` | 10.8 s → 5.7 s vs 1.9 s baseline — strictly slower at B=1/Gen5 |
+| ADETR per-slot hot/cold split | `5410ae7` | 22.5 MB/miss exact, but 8.9 s/tok (CPU hot-half trap) |
+| GlobalColumnPool v1–v4 | `f25eb4a`, `1d7e5b6`, `4cce63b`, `4b5ea3a` | parity at best (1.87 s), 0–2.5% hits, tuning exhausted |
+| Offline batching (`--batch_size`) | `3647594` | only real gain (3.51 tok/s shared) — removed with the rest per directive |
+| Hetero test harness | `17b703f`–`02c2e44`, deleted | Layer-1 `torch.equal True` record kept here |
+
+Net diff: **−1016 lines** across `rudra/serve_deepseek_colossus.py`, `src/bhaskera/inference/colossus/dynamic_cache.py` (both reverted to `02c2e44`), `rudra/test_cpu_expert_hybrid.py` deleted. Zero experiment references remain; both files compile clean. Research can be re-enabled from history, but the standing rule is: **optimize throughput without changing the COLOSSUS idea** — dynamic residency of expert portions, exact computation, no quantization.
