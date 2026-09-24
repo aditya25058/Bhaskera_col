@@ -1264,11 +1264,12 @@ class DeepSeekColossusMoEWrapper(nn.Module):
                     topv, topi = torch.topk(scores, k=k)
                     conf = topv[0].item()
                     if conf >= self.prefetch_conf:
-                        plan[tgt] = (self.layer_idx, topi.tolist(), conf)
+                        rec = (self.layer_idx, topi.tolist(), conf)
+                        plan[tgt] = rec
+                        type(self)._lookahead_pending.setdefault(tgt, []).append(rec)
+                        self.zssr_lookahead_probes += 1
         except Exception:
             return {}
-        type(self)._lookahead_pending.update(plan)
-        self.zssr_lookahead_probes += len(plan)
         return plan
 
     def zssr_prefetch(self, hidden_in: torch.Tensor):
@@ -1377,13 +1378,16 @@ class DeepSeekColossusMoEWrapper(nn.Module):
                     if exp_id in self._prefmeta:
                         self._prefmeta[exp_id][1] = 1
         # Lookahead recall: predictions made for THIS layer by earlier layers.
-        _lp = type(self)._lookahead_pending.pop(self.layer_idx, None)
-        if _lp is not None:
-            _pl, _pred, _conf = _lp
-            _d = self.layer_idx - _pl
+        # Multiple depths may be pending (list); each verified at its own depth.
+        _pend = type(self)._lookahead_pending.pop(self.layer_idx, [])
+        if _pend:
             _act = set(needed_experts)
-            self.lookahead_hit[_d] = self.lookahead_hit.get(_d, 0) + len(set(_pred) & _act)
-            self.lookahead_actual[_d] = self.lookahead_actual.get(_d, 0) + len(_act)
+            for (_pl, _pred, _conf) in _pend:
+                _d = self.layer_idx - _pl
+                if _d <= 0:
+                    continue
+                self.lookahead_hit[_d] = self.lookahead_hit.get(_d, 0) + len(set(_pred) & _act)
+                self.lookahead_actual[_d] = self.lookahead_actual.get(_d, 0) + len(_act)
 
         # 2. Compute shared experts (permanently resident)
         shared_out = self.shared_experts(identity)
