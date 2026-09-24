@@ -1,0 +1,16 @@
+def quicksort(arr):
+def fibonacci(n):
+Write a binary search tree class in Python
+Implement a thread-safe LRU cache
+Parse a JSON stream incrementally
+def merge_sort(arr):
+Reverse a linked list in place
+Find the longest palindromic substring
+Implement Dijkstra shortest path
+def binary_search(arr, x):
+Validate a Sudoku board
+Serialize a binary tree to string
+Implement async producer consumer queue
+def knapsack(weights, values, capacity):
+Detect a cycle in a directed graph
+Format a table as aligned ASCII columns
