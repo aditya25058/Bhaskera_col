@@ -612,8 +612,12 @@ class DeepSeekColossusMoEWrapper(nn.Module):
         ent = type(self)._h2b_calib.get(f"{self.layer_idx}/{expert_id}")
         return ent["hot"] if ent else None
 
-    def _h2b_cold_views(self, expert_id):
-        """FIFO-cached cold complement views (contiguous CPU copies, page-cache speed)."""
+    def _h2b_views(self, expert_id):
+        """FIFO-cached hot+cold views (contiguous CPU copies, built once per expert).
+
+        Hot (GPU DMA source): gate/up rows + down cols at hot idx (15.7MB).
+        Cold (CPU compute source): complement (31MB). Total 47MB/entry.
+        """
         w = self._h2b_cold.get(expert_id)
         if w is None:
             hot = self._h2b_hot(expert_id) or []
@@ -622,30 +626,32 @@ class DeepSeekColossusMoEWrapper(nn.Module):
             tu = self.handles[self.weight_map[f"{pfx}.up_proj.weight"]].get_tensor(f"{pfx}.up_proj.weight")
             td = self.handles[self.weight_map[f"{pfx}.down_proj.weight"]].get_tensor(f"{pfx}.down_proj.weight")
             I = tg.shape[0]
+            ht = torch.tensor(hot)
             hset = set(hot)
             ct = torch.tensor([i for i in range(I) if i not in hset])
-            w = {"gate": tg[ct], "up": tu[ct], "down": td[:, ct].contiguous()}
+            hg, hu = tg[ht], tu[ht]
+            hd = td[:, ht].contiguous()
+            w = {"hg": hg, "hu": hu, "hd": hd,
+                 "gate": tg[ct], "up": tu[ct], "down": td[:, ct].contiguous()}
             self._h2b_cold[expert_id] = w
             self._h2b_cold_fifo.append(expert_id)
             if len(self._h2b_cold_fifo) > self.cpu_cache_cap:
                 self._h2b_cold.pop(self._h2b_cold_fifo.pop(0), None)
         return w
 
+    def _h2b_cold_views(self, expert_id):
+        """FIFO-cached cold complement views (contiguous CPU copies, page-cache speed)."""
+        return self._h2b_views(expert_id)
+
     def _h2b_load_hot(self, expert_id, slot_idx):
         """DMA hot rows/cols into column slot (async, dma_stream). Binds on completion path."""
-        hot = self._h2b_hot(expert_id)
-        assert hot, f"H2b: no hot set L{self.layer_idx}E{expert_id}"
-        ht = torch.tensor(hot)
-        pfx = f"model.layers.{self.layer_idx}.mlp.experts.{expert_id}"
-        tg = self.handles[self.weight_map[f"{pfx}.gate_proj.weight"]].get_tensor(f"{pfx}.gate_proj.weight")
-        tu = self.handles[self.weight_map[f"{pfx}.up_proj.weight"]].get_tensor(f"{pfx}.up_proj.weight")
-        td = self.handles[self.weight_map[f"{pfx}.down_proj.weight"]].get_tensor(f"{pfx}.down_proj.weight")
-        nbytes = int((len(hot) * tg.shape[1] * 2) * 2 + tg.shape[1] * len(hot) * 2)
+        v = self._h2b_views(expert_id)
+        nbytes = int(v["hg"].nbytes + v["hu"].nbytes + v["hd"].nbytes)
         slot = self.slots[slot_idx]
         with torch.no_grad(), torch.cuda.stream(self.dma_stream):
-            slot.gate_proj.weight.copy_(tg[ht], non_blocking=True)
-            slot.up_proj.weight.copy_(tu[ht], non_blocking=True)
-            slot.down_proj.weight.copy_(td[:, ht].contiguous(), non_blocking=True)
+            slot.gate_proj.weight.copy_(v["hg"], non_blocking=True)
+            slot.up_proj.weight.copy_(v["hu"], non_blocking=True)
+            slot.down_proj.weight.copy_(v["hd"], non_blocking=True)
         if slot_idx in self.slot_to_expert:
             self.expert_to_slot.pop(self.slot_to_expert.pop(slot_idx), None)
         self.slot_to_expert[slot_idx] = expert_id
