@@ -2,6 +2,7 @@
 
 **Date:** 2026-09-20 · **Branch:** `colossus-zssr` · **Hardware:** 1–2× NVIDIA H100 NVL (93.1 GB), Rudra A100 80GB (Gen3 x4)
 **Models:** DeepSeek-Coder-V2-Instruct 236B MoE (160 routed + 2 shared, top-6, 471.5 GB BF16) · Param2-17B-A2.4B (64 experts) · Mixtral-8x7B (8×336 MB)
+**Latest:** §9 (Exp 39) added 2026-09-24.
 
 ---
 
@@ -108,3 +109,23 @@ No throughput experiment produced a significant increase, so all experiment code
 | Hetero test harness | `17b703f`–`02c2e44`, deleted | Layer-1 `torch.equal True` record kept here |
 
 Net diff: **−1016 lines** across `rudra/serve_deepseek_colossus.py`, `src/bhaskera/inference/colossus/dynamic_cache.py` (both reverted to `02c2e44`), `rudra/test_cpu_expert_hybrid.py` deleted. Zero experiment references remain; both files compile clean. Research can be re-enabled from history, but the standing rule is: **optimize throughput without changing the COLOSSUS idea** — dynamic residency of expert portions, exact computation, no quantization.
+
+## 9. Exp 39 — Speculative family closed by routing-structure measurement (2026-09-24, commits `725fb50`, `0c5647d`)
+
+**Question:** can speculative verification batching (SVB) convert the B=8 shared gain into B=1 interactive gain? Requires K consecutive tokens to share experts the way K same-position sequences do.
+
+**Method** (measurement only, defaults OFF, baseline paths untouched): `--log_routing` dumps per-layer per-step expert unions; `shared_only` wrapper mode (resident attention + 2 shared experts, zero DMA, early return after `shared_out`) drafts K tokens from each Pass-A prefix; greedy prefix-match vs Pass-A truth (`--svb_probe_positions`, `--svb_K`).
+
+| Measurement | Result |
+|---|---|
+| B=1 single-step union/layer | 6.00 experts (top-6; 59 MoE layers — layer 0 dense) |
+| K=8 consecutive-token union/layer | **39.92 (6.65× single)** |
+| Consecutive-step routing Jaccard | **0.041** — essentially independent expert sets per position |
+| B=8 shared union/layer/step (`--batch_size` revived, re-measured) | **6.00, min=max=6, all steps** — bit-identical routing; **5.36 tok/s agg** |
+| Shared-only draft cost | 66–69 ms/step (~25× cheaper than full step) |
+| Shared-only draft acceptance (K=8, 5 probes) | matches 0/4/1/3/2, mean 2.0; offsets 0–3 agree 4/5, 3/5, 3/5, 2/5, offsets 4+ collapse |
+| External-drafter vocab check (Path 1) | DeepSeek-V2 100k vs deepseek-coder-1.3b 32k — incompatible, blocked before measurement |
+
+**Conclusion:** batching correlates on position, speculation correlates on sequence; DeepSeek-V2 routing correlates on neither across positions. Oracle ceiling for K=8 SVB = 8/6.65 ≈ **1.2×**, below break-even with draft overhead; realistic acceptance (2–3 tokens) → 0.3–0.45×, a loss. This binds the **entire speculative family** (EAGLE, Medusa, MoE-SpeQ, SP-MoE) on offloaded MoE with this routing pattern — verification always pays the consecutive-token union. SP-MoE/MoE-SpeQ tested coarser models (Phi-MoE/Mixtral) with stickier routing; the incompatibility is structural to fine-grained top-6/160 routing, not draft quality. No integration pursued — clean kill.
+
+**Artifacts (server):** `deepseek_svb0_{b1,b8}.json`, `routing_{b1,b8}.json`. Harness retained as opt-in flags (`--log_routing`, `--svb_probe_positions`, `--svb_K`) for future draft-policy tests. Standing envelope updated: B=1 ~0.3–0.6 tok/s (host-dependent), B=8 shared 5.36 tok/s agg.
