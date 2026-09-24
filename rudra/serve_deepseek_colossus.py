@@ -385,6 +385,7 @@ class DeepSeekColossusMoEWrapper(nn.Module):
         self._cpu_cache = {}     # expert_id -> {gate,up,down} CPU mmap tensors
         self._cpu_fifo = []
         self.cpu_cache_cap = 128
+        self.cpu_pool = None     # shared ThreadPoolExecutor (set by driver in cpu mode)
         self.cpu_ms = 0.0
         self.cpu_n = 0
 
@@ -1016,6 +1017,14 @@ class DeepSeekColossusMoEWrapper(nn.Module):
                 self._cpu_cache.pop(self._cpu_fifo.pop(0), None)
         return w
 
+    def _cpu_one_expert(self, flat, rows, e):
+        w = self._cpu_weights(e)
+        xe = flat[rows]
+        with torch.no_grad():
+            return torch.nn.functional.linear(
+                torch.nn.functional.silu(torch.nn.functional.linear(xe, w["gate"])) *
+                torch.nn.functional.linear(xe, w["up"]), w["down"])
+
     def _cpu_moe_forward(self, hidden_states, shared_out, topk_indices, topk_weights, orig_shape):
         """Routed experts on CPU (oneDNN BF16 GEMV); shared/residual stay GPU-side."""
         t0 = time.perf_counter()
@@ -1028,16 +1037,22 @@ class DeepSeekColossusMoEWrapper(nn.Module):
             for k in range(TI.shape[1]):
                 groups.setdefault(int(TI[b, k]), []).append((b, k))
         out = torch.zeros_like(flat)
-        for e, poses in groups.items():
-            w = self._cpu_weights(e)
-            rows = torch.tensor([b for b, _ in poses])
-            xe = flat[rows]
-            with torch.no_grad():
-                ye = torch.nn.functional.linear(
-                    torch.nn.functional.silu(torch.nn.functional.linear(xe, w["gate"])) *
-                    torch.nn.functional.linear(xe, w["up"]), w["down"])
-            for (b, k), yrow in zip(poses, ye):
-                out[b] += yrow * TW[b, k]
+        if self.cpu_pool is not None:
+            # 3-2: concurrent experts (bench-proven 3.1 ms/layer); pool shared
+            # across layers/steps, one thread per expert (global threads=1).
+            jobs = [(poses, self.cpu_pool.submit(
+                self._cpu_one_expert, flat,
+                torch.tensor([bb for bb, _ in poses]), e))
+                for e, poses in groups.items()]
+            for poses, fut in jobs:
+                for (b, k), yrow in zip(poses, fut.result()):
+                    out[b] += yrow * TW[b, k]
+        else:
+            for e, poses in groups.items():
+                ye = self._cpu_one_expert(
+                    flat, torch.tensor([b for b, _ in poses]), e)
+                for (b, k), yrow in zip(poses, ye):
+                    out[b] += yrow * TW[b, k]
         ret = shared_out + out.reshape(orig_shape).to(shared_out.device, dtype=shared_out.dtype)
         self.cpu_ms += (time.perf_counter() - t0) * 1000.0
         self.cpu_n += 1
@@ -1324,14 +1339,17 @@ def serve_deepseek(args):
         else:
             sel = {w.layer_idx for w in colossus_wrappers} if args.cpu_layers == "all" \
                 else {int(x) for x in args.cpu_layers.split(",") if x.strip()}
+            from concurrent.futures import ThreadPoolExecutor
+            cpu_pool = ThreadPoolExecutor(max_workers=max(1, args.cpu_threads))
+            torch.set_num_threads(1)  # one thread per pool worker (bench-proven)
             n = 0
             for w in colossus_wrappers:
                 if w.layer_idx in sel:
                     w.cpu_layer = True
                     w.cpu_cache_cap = args.cpu_cache
+                    w.cpu_pool = cpu_pool
                     n += 1
-            torch.set_num_threads(args.cpu_threads)
-            print(f"  CPU expert layers: {n} (threads={args.cpu_threads}, cache={args.cpu_cache}/layer)")
+            print(f"  CPU expert layers: {n} (pool={args.cpu_threads} workers, cache={args.cpu_cache}/layer)")
     print(f"    GPU 0 Allocated (with C={args.capacity} slots): {torch.cuda.memory_allocated(dev0) / (1024**3):.2f} GB")
     if args.num_gpus > 1:
         print(f"    GPU 1 Allocated (with C={args.capacity_gpu1} slots): {torch.cuda.memory_allocated(dev1) / (1024**3):.2f} GB")
