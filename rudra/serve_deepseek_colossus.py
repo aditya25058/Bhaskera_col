@@ -117,6 +117,23 @@ class FastExpertSlot(nn.Module):
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
+class FastColSlot(nn.Module):
+    """H2b: hot-intermediate column slot (uniform ntop rows/cols; exact split compute).
+
+    gate/up hold hot ROWS [ntop, H]; down holds hot COLUMNS [H, ntop].
+    Forward yields y_hot; CPU computes y_cold; y_hot + y_cold == full (ulp1).
+    """
+    def __init__(self, hidden: int, ntop: int, device: torch.device):
+        super().__init__()
+        self.gate_proj = nn.Linear(hidden, ntop, bias=False, device=device, dtype=torch.bfloat16)
+        self.up_proj = nn.Linear(hidden, ntop, bias=False, device=device, dtype=torch.bfloat16)
+        self.down_proj = nn.Linear(ntop, hidden, bias=False, device=device, dtype=torch.bfloat16)
+        self.requires_grad_(False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+
+
 _VENV_SITE = "/home/palakm/MoEServingSim/aditya/venv/lib/python3.10/site-packages"
 
 
@@ -326,6 +343,8 @@ class DeepSeekColossusMoEWrapper(nn.Module):
         col_measure: bool = False,
         col_topk_max: int = 1024,
         col_pred_experts: int = 8,
+        h2b: bool = False,
+        calib_col_dir: str = None,
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -393,11 +412,29 @@ class DeepSeekColossusMoEWrapper(nn.Module):
         self.gate = moe_module.gate
         self.shared_experts = moe_module.shared_experts
 
+        # H2b: hot-intermediate column slots (uniform ntop; 3x coverage per GB).
+        self.h2b = bool(h2b)
+        self.calib_col_dir = calib_col_dir
+        self.h2b_ntop = 0
+        self._h2b_cold = {}      # expert_id -> {gate,up,down} cold CPU views
+        self._h2b_cold_fifo = []
+        self.h2b_cold_ms = 0.0
+        self.h2b_cold_n = 0
+        self._h2b_exec = None    # overlap executor (driver-owned)
+        if self.h2b:
+            hot0 = self._h2b_hot(0)
+            self.h2b_ntop = len(hot0) if hot0 else 512
+            H = int(getattr(cfg, "hidden_size", 5120))
         # Dynamic slots on GPU (allocated directly in HBM)
-        self.slots: List[nn.Module] = nn.ModuleList([
-            FastExpertSlot(cfg, device=device)
-            for _ in range(capacity)
-        ])
+        if self.h2b:
+            self.slots: List[nn.Module] = nn.ModuleList([
+                FastColSlot(H, self.h2b_ntop, device) for _ in range(capacity)
+            ])
+        else:
+            self.slots: List[nn.Module] = nn.ModuleList([
+                FastExpertSlot(cfg, device=device)
+                for _ in range(capacity)
+            ])
 
         self.slot_to_expert: Dict[int, int] = {}
         self.expert_to_slot: Dict[int, int] = {}
@@ -563,6 +600,78 @@ class DeepSeekColossusMoEWrapper(nn.Module):
             else:
                 self.slot_lru.append(slot_idx)  # nothing staged; slot back
         return [e for e in new_ids if e in self._c1_staged]
+
+    # H2b: exact column partitioning (GPU hot + CPU cold). Class cache: static
+    # intermediate-dim hot sets (ascending) from calib_col.json.
+    _h2b_calib = None
+
+    def _h2b_hot(self, expert_id):
+        if type(self)._h2b_calib is None:
+            with open(os.path.join(self.calib_col_dir, "calib_col.json")) as f:
+                type(self)._h2b_calib = json.load(f)
+        ent = type(self)._h2b_calib.get(f"{self.layer_idx}/{expert_id}")
+        return ent["hot"] if ent else None
+
+    def _h2b_cold_views(self, expert_id):
+        """FIFO-cached cold complement views (contiguous CPU copies, page-cache speed)."""
+        w = self._h2b_cold.get(expert_id)
+        if w is None:
+            hot = self._h2b_hot(expert_id) or []
+            pfx = f"model.layers.{self.layer_idx}.mlp.experts.{expert_id}"
+            tg = self.handles[self.weight_map[f"{pfx}.gate_proj.weight"]].get_tensor(f"{pfx}.gate_proj.weight")
+            tu = self.handles[self.weight_map[f"{pfx}.up_proj.weight"]].get_tensor(f"{pfx}.up_proj.weight")
+            td = self.handles[self.weight_map[f"{pfx}.down_proj.weight"]].get_tensor(f"{pfx}.down_proj.weight")
+            I = tg.shape[0]
+            hset = set(hot)
+            ct = torch.tensor([i for i in range(I) if i not in hset])
+            w = {"gate": tg[ct], "up": tu[ct], "down": td[:, ct].contiguous()}
+            self._h2b_cold[expert_id] = w
+            self._h2b_cold_fifo.append(expert_id)
+            if len(self._h2b_cold_fifo) > self.cpu_cache_cap:
+                self._h2b_cold.pop(self._h2b_cold_fifo.pop(0), None)
+        return w
+
+    def _h2b_load_hot(self, expert_id, slot_idx):
+        """DMA hot rows/cols into column slot (async, dma_stream). Binds on completion path."""
+        hot = self._h2b_hot(expert_id)
+        assert hot, f"H2b: no hot set L{self.layer_idx}E{expert_id}"
+        ht = torch.tensor(hot)
+        pfx = f"model.layers.{self.layer_idx}.mlp.experts.{expert_id}"
+        tg = self.handles[self.weight_map[f"{pfx}.gate_proj.weight"]].get_tensor(f"{pfx}.gate_proj.weight")
+        tu = self.handles[self.weight_map[f"{pfx}.up_proj.weight"]].get_tensor(f"{pfx}.up_proj.weight")
+        td = self.handles[self.weight_map[f"{pfx}.down_proj.weight"]].get_tensor(f"{pfx}.down_proj.weight")
+        nbytes = int((len(hot) * tg.shape[1] * 2) * 2 + tg.shape[1] * len(hot) * 2)
+        slot = self.slots[slot_idx]
+        with torch.no_grad(), torch.cuda.stream(self.dma_stream):
+            slot.gate_proj.weight.copy_(tg[ht], non_blocking=True)
+            slot.up_proj.weight.copy_(tu[ht], non_blocking=True)
+            slot.down_proj.weight.copy_(td[:, ht].contiguous(), non_blocking=True)
+        if slot_idx in self.slot_to_expert:
+            self.expert_to_slot.pop(self.slot_to_expert.pop(slot_idx), None)
+        self.slot_to_expert[slot_idx] = expert_id
+        self.expert_to_slot[expert_id] = slot_idx
+        self.dma_bytes += nbytes
+        return nbytes
+
+    def _h2b_cpu_cold(self, x_cpu, TI, TW):
+        """Cold-intermediate SwiGLU on CPU (oneDNN); returns CPU tensor (same shape as flat)."""
+        flat = x_cpu.reshape(-1, x_cpu.shape[-1])
+        groups = {}
+        for b in range(TI.shape[0]):
+            for k in range(TI.shape[1]):
+                groups.setdefault(int(TI[b, k]), []).append((b, k))
+        out = torch.zeros_like(flat)
+        for e, poses in groups.items():
+            w = self._h2b_cold_views(e)
+            rows = torch.tensor([b for b, _ in poses])
+            xe = flat[rows]
+            with torch.no_grad():
+                ye = torch.nn.functional.linear(
+                    torch.nn.functional.silu(torch.nn.functional.linear(xe, w["gate"])) *
+                    torch.nn.functional.linear(xe, w["up"]), w["down"])
+            for (b, k), yrow in zip(poses, ye):
+                out[b] += yrow * TW[b, k]
+        return out
 
     def warm_up_slots(self, initial_experts: List[int]):
         """Pre-populates dynamic slots with initial experts."""
@@ -1272,6 +1381,14 @@ class DeepSeekColossusMoEWrapper(nn.Module):
             return self._cpu_moe_forward(hidden_states, shared_out,
                                          topk_indices, topk_weights, orig_shape)
 
+        # H2b: dispatch CPU-cold now; GPU-hot runs in sections 3-4 below;
+        # combine at return (genuine overlap: hot GEMM ∥ cold GEMV).
+        _h2b_fut = None
+        if self.h2b and needed_experts and self._h2b_exec is not None:
+            _h2b_fut = self._h2b_exec.submit(
+                self._h2b_cpu_cold, hidden_states.detach().to("cpu"),
+                topk_indices.cpu(), topk_weights.cpu())
+
         # 3. Dynamic Slot Management & Expert Streaming
         # Fast path for single-token decode (needed_experts <= capacity): batch-stream all missing experts
         if len(needed_experts) <= self.capacity:
@@ -1301,7 +1418,10 @@ class DeepSeekColossusMoEWrapper(nn.Module):
                             slot_idx = self.slot_lru.pop(0)
                             if self.col_prefetch:
                                 self._c1_unbind_slot(slot_idx)
-                            self._load_expert_to_slot(exp_id, slot_idx)
+                            if self.h2b:
+                                self._h2b_load_hot(exp_id, slot_idx)
+                            else:
+                                self._load_expert_to_slot(exp_id, slot_idx)
                             self.slot_lru.append(slot_idx)
                     torch.cuda.current_stream(self.device).wait_stream(self.dma_stream)
 
@@ -1337,7 +1457,10 @@ class DeepSeekColossusMoEWrapper(nn.Module):
                 slot_idx = self.slot_lru.pop(0)
                 if self.col_prefetch:
                     self._c1_unbind_slot(slot_idx)
-                self._load_expert_to_slot(i, slot_idx)
+                if self.h2b:
+                    self._h2b_load_hot(i, slot_idx)
+                else:
+                    self._load_expert_to_slot(i, slot_idx)
                 self.slot_lru.append(slot_idx)
                 torch.cuda.current_stream(self.device).wait_stream(self.dma_stream)
 
@@ -1359,6 +1482,15 @@ class DeepSeekColossusMoEWrapper(nn.Module):
             .sum(dim=1)
             .type(new_x.dtype)
         )
+
+        # H2b combine: hot weighted sum (GPU slots) + cold weighted sum (CPU,
+        # overlapped with sections 3-4). y_hot + y_cold == full expert (ulp1).
+        if self.h2b and _h2b_fut is not None:
+            t0 = time.perf_counter()
+            cold = _h2b_fut.result().to(shared_out.device, dtype=shared_out.dtype)
+            self.h2b_cold_ms += (time.perf_counter() - t0) * 1000.0
+            self.h2b_cold_n += 1
+            return shared_out + final_out.view(*orig_shape) + cold.view(*orig_shape)
 
         return shared_out + final_out.view(*orig_shape)
 
@@ -1487,6 +1619,8 @@ def serve_deepseek(args):
             col_measure=args.col_measure,
             col_topk_max=args.col_topk_max,
             col_pred_experts=args.col_pred_experts,
+            h2b=args.h2b,
+            calib_col_dir=args.calib_col,
         )
 
         if args.warm_slots:
@@ -1534,6 +1668,23 @@ def serve_deepseek(args):
             w.block_index_dir = args.block_index
             w.calib_dir = args.calib
         print(f"  C-1 hot-column prefetch: block_index={args.block_index} calib={args.calib}")
+
+    # H2b: exact column partitioning (GPU hot thirds + CPU cold; ulp1 only).
+    if args.h2b:
+        assert args.exactness_mode == "ulp1", "--h2b needs --exactness_mode ulp1"
+        assert args.calib_col, "--h2b needs --calib_col"
+        assert not args.ans_store, "--h2b incompatible with --ans_store"
+        assert not args.cpu_layers, "--h2b incompatible with --cpu_layers"
+        assert not args.zssr_prefetch, "--h2b incompatible with --zssr-prefetch (v1)"
+        assert not args.col_prefetch, "--h2b incompatible with --col_prefetch"
+        assert not args.warm_slots, "--h2b incompatible with --warm_slots (v1)"
+        from concurrent.futures import ThreadPoolExecutor
+        h2b_exec = ThreadPoolExecutor(max_workers=1)
+        torch.set_num_threads(6)
+        for w in colossus_wrappers:
+            w._h2b_exec = h2b_exec
+        print(f"  H2b column executor: hot={colossus_wrappers[0].h2b_ntop}/1536 per slot, "
+              f"cold on CPU (overlap), calib={args.calib_col}")
     print(f"    GPU 0 Allocated (with C={args.capacity} slots): {torch.cuda.memory_allocated(dev0) / (1024**3):.2f} GB")
     if args.num_gpus > 1:
         print(f"    GPU 1 Allocated (with C={args.capacity_gpu1} slots): {torch.cuda.memory_allocated(dev1) / (1024**3):.2f} GB")
@@ -2166,6 +2317,10 @@ def serve_deepseek(args):
         # C-1 column prefetch
         "col_prefetch": bool(args.col_prefetch),
         "col_complete_ms": sum(w.col_complete_ms for w in colossus_wrappers),
+        # H2b column executor
+        "h2b": bool(args.h2b),
+        "h2b_cold_ms": (sum(w.h2b_cold_ms for w in colossus_wrappers) /
+                        max(1, sum(w.h2b_cold_n for w in colossus_wrappers))),
         # Path 3-1 flip audit
         "exactness_mode": args.exactness_mode,
         "cpu_layers": args.cpu_layers,
@@ -2250,6 +2405,11 @@ if __name__ == "__main__":
                         help="C-1: dir with block_index.json (block geometry)")
     parser.add_argument("--calib", type=str, default=None,
                         help="C-1: dir with calib.json (static top-block energy sets)")
+    # H2b exact column partitioning (default OFF; needs ulp1)
+    parser.add_argument("--h2b", action="store_true", default=False,
+                        help="H2b: GPU hot-thirds in col slots + CPU cold, overlapped")
+    parser.add_argument("--calib_col", type=str, default=None,
+                        help="H2b: dir with calib_col.json (intermediate-dim hot sets)")
     # Path 3-1 (all default OFF; bitwise default preserves existing behavior)
     parser.add_argument("--exactness_mode", choices=["bitwise", "ulp1"], default="bitwise",
                         help="bitwise: GPU-only (assert-grade exact); ulp1: allow CPU expert path (<=1-ulp, logged)")
