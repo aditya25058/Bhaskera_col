@@ -130,6 +130,20 @@ Net diff: **−1016 lines** across `rudra/serve_deepseek_colossus.py`, `src/bhas
 
 **Artifacts (server):** `deepseek_svb0_{b1,b8}.json`, `routing_{b1,b8}.json`. Harness retained as opt-in flags (`--log_routing`, `--svb_probe_positions`, `--svb_K`) for future draft-policy tests. Standing envelope (1×H100, exact): B=1 GPU 0.42–0.63 tok/s · B=1 CPU (ulp1) 1.36–1.55 · B=8 GPU shared 5.36 agg · **B=8 CPU shared 10.10 agg** (`deepseek_cpu_b8.json` — composition confirmed, ~6.5× over B=1 CPU).
 
+## 11. C-1 — Hot-column prefetch: columns as the risk unit (2026-09-24, commits `4d127a8`, `ae2ed3a`)
+
+**Design:** ZSSR-predicted experts stage calib-hot blocks only (raw 128-row-block DMA from safetensors mmap, ~14.9 MB/expert ≈ 1/3 of whole; no ANS, no pool). Demand verifies → completes cold blocks into the staged slot; unverified staging auto-counts as waste. Tests whether misprediction cost scales with granularity at matched recall.
+
+| Run | Recall | Prefetch | Useful | Wasted | Waste/demand | tps | Exact |
+|---|---|---|---|---|---|---|---|
+| conf 0.5 | 52.3% (524/1001) | 14,890 MB | 7,795 MB | 7,095 MB | **2.6%** | 0.543 | True |
+| conf 0.7 | 47.4% (309/652) | 9,699 MB | 4,596 MB | 5,102 MB | **1.8%** | 0.535 | True |
+| whole-prefetch (Exp 17) | ~62% | — | — | +47% coeff | — | 0.31 | True |
+
+**Verdict — mechanism PASS, wall parity:** waste coefficient 3× better than whole-expert prefetch (14.9 vs 45 MB/prediction) at comparable recall; waste negligible against demand (≤2.6% vs 15% gate); assembly bit-exact. But cold completion costs 3.9 ms/expert vs 0.85 ms whole load (block fragmentation, as predicted) → net wall parity with baseline. Columns proven as the risk-control unit; B=1 wall needs coverage (C-2), not just cheaper speculation.
+
+**Artifacts (server):** `deepseek_c1_smoke.json`, `deepseek_c1_conf07.json`. Flags: `--col_prefetch/--block_index/--calib` (all default OFF; asserts probe+geometry+energy present, rejects ANS/CPU combos).
+
 ## 10. Path 3-0/3-1 — CPU expert compute + ulp1 exactness gate (2026-09-24, commits `d0fcc91`, `cc57cc9`)
 
 **Ceiling:** 6 experts × 47.2 MB × 59 layers ≈ 16.7 GB RAM-read/token; box measured 57–102 GB/s achievable (below 320 GB/s STREAM hope — cause undetermined, no resctrl cap; 4 GB swap in use). Only ~5% of wire speed needed to beat the 1585 ms/token baseline.
