@@ -960,7 +960,8 @@ class DeepSeekColossusMoEWrapper(nn.Module):
         needed_experts = topk_indices.unique().tolist()
 
         # SVB Phase 0a: log per-layer routing union (decode only; gated by caller).
-        if self.routing_log is not None:
+        # Shared-only probe forwards excluded (gate runs, routed path skipped).
+        if self.routing_log is not None and not self.shared_only:
             self.routing_log.append((self.layer_idx, needed_experts))
 
         # Phase 1A: column P/R measurement (no movement, no slot changes)
@@ -1810,8 +1811,7 @@ def serve_deepseek(args):
         # SVB Phase 0
         "svb_probes": svb_probes,
         "svb_K": int(args.svb_K),
-        "routing_log_steps": (len(colossus_wrappers[0].routing_log) // max(1, len(colossus_wrappers))
-                              if colossus_wrappers[0].routing_log else 0),
+        "routing_log_steps": len(colossus_wrappers[0].routing_log or []),
     }
 
     if args.log_routing:
