@@ -420,6 +420,148 @@ class DeepSeekColossusMoEWrapper(nn.Module):
         self.prefetch_dma_ms = 0.0   # measured (event-drained) prefetch transfer time
         self._dma_pending = []       # (kind, ev_start, ev_end, bytes)
         self._prefetched = {}        # expert_id -> prefetched bytes (unverified)
+        # C-1: hot-column prefetch (raw blocks, no ANS/pool). Slot holds staged
+        # hot blocks unverified; demand completes cold blocks on verify.
+        self.col_prefetch = False
+        self.block_index_dir = None
+        self.calib_dir = None
+        self.slot_col_state = {}     # slot_idx -> {"expert": e, "hot": set((pname,bi))}
+        self._c1_staged = {}         # expert_id -> slot_idx (unverified staging)
+        self.col_complete_ms = 0.0
+
+    # C-1 class-level caches (geometry + static energy tables; read-only).
+    _c1_block_table = {}
+    _c1_calib = None
+
+    @classmethod
+    def _c1_get_blocks(cls, store_dir):
+        """{(L,E): [(pname, bi, rows)]} from block_index.json (geometry only)."""
+        if store_dir not in cls._c1_block_table:
+            with open(os.path.join(store_dir, "block_index.json")) as f:
+                idx = json.load(f)
+            table = {}
+            for k in idx:
+                try:
+                    L, E, bi, pname = k.split("/")
+                    table.setdefault((int(L), int(E)), []).append((pname, int(bi)))
+                except Exception:
+                    continue
+            for v in table.values():
+                v.sort()
+            cls._c1_block_table[store_dir] = table
+        return cls._c1_block_table[store_dir]
+
+    @classmethod
+    def _c1_get_calib(cls, calib_dir):
+        if cls._c1_calib is None:
+            with open(os.path.join(calib_dir, "calib.json")) as f:
+                cls._c1_calib = json.load(f)
+        return cls._c1_calib
+
+    def _c1_hot(self, expert_id):
+        """{pname: set(bi)} hot blocks from static energy calibration (None if absent)."""
+        cal = self._c1_get_calib(self.calib_dir)
+        ent = cal.get(f"{self.layer_idx}/{expert_id}")
+        if not ent:
+            return None
+        return {p: set(ent.get(p, [])) for p in ("gate_proj", "up_proj", "down_proj")}
+
+    def _c1_exp_blocks(self, expert_id):
+        return self._c1_get_blocks(self.block_index_dir).get((self.layer_idx, expert_id), [])
+
+    def _c1_unbind_slot(self, slot_idx):
+        """Drop col-prefetch state for a slot being reused (bytes auto-counted as waste)."""
+        st = self.slot_col_state.pop(slot_idx, None)
+        if st is not None:
+            self._c1_staged.pop(st["expert"], None)
+            # Staging evicted before verify: leave bytes in prefetch total,
+            # remove from unverified so generic verify can't count them useful.
+            self._prefetched.pop(st["expert"], None)
+        if slot_idx in self.slot_to_expert:
+            self.expert_to_slot.pop(self.slot_to_expert.pop(slot_idx), None)
+
+    def _c1_stage_hot(self, expert_id, slot_idx):
+        """DMA hot blocks into slot rows (async, dma_stream). Returns hot bytes (0=skip)."""
+        hot = self._c1_hot(expert_id)
+        if not hot:
+            return 0
+        self._c1_unbind_slot(slot_idx)
+        slot = self.slots[slot_idx]
+        projs = {"gate_proj": slot.gate_proj.weight, "up_proj": slot.up_proj.weight,
+                 "down_proj": slot.down_proj.weight}
+        hotset, nbytes = set(), 0
+        with torch.no_grad(), torch.cuda.stream(self.dma_stream):
+            for pname, bi in ((p, b) for (p, b, _r) in self._c1_exp_blocks(expert_id)):
+                if bi not in hot.get(pname, ()):
+                    continue
+                key = f"model.layers.{self.layer_idx}.mlp.experts.{expert_id}.{pname}.weight"
+                t = self.handles[self.weight_map[key]].get_tensor(key)
+                R = t.shape[0]
+                r0, rows = bi * 128, min(128, R - bi * 128)
+                if rows <= 0:
+                    continue
+                w = projs[pname]
+                w[r0:r0 + rows].copy_(t[r0:r0 + rows], non_blocking=True)
+                hotset.add((pname, bi))
+                nbytes += rows * t.shape[1] * 2
+        if not hotset:
+            return 0
+        self.slot_col_state[slot_idx] = {"expert": expert_id, "hot": hotset}
+        self._c1_staged[expert_id] = slot_idx
+        self.slot_lru.append(slot_idx)
+        self._prefetched[expert_id] = self._prefetched.get(expert_id, 0) + nbytes
+        self.prefetch_bytes_total += nbytes
+        return nbytes
+
+    def _c1_complete(self, expert_id, slot_idx):
+        """DMA cold blocks into staged slot, bind, LRU-touch. Returns cold bytes."""
+        st = self.slot_col_state.pop(slot_idx, None)
+        hot = st["hot"] if st else set()
+        self._c1_staged.pop(expert_id, None)
+        slot = self.slots[slot_idx]
+        projs = {"gate_proj": slot.gate_proj.weight, "up_proj": slot.up_proj.weight,
+                 "down_proj": slot.down_proj.weight}
+        nbytes = 0
+        t0 = time.perf_counter()
+        with torch.no_grad(), torch.cuda.stream(self.dma_stream):
+            for pname, bi in ((p, b) for (p, b, _r) in self._c1_exp_blocks(expert_id)):
+                if (pname, bi) in hot:
+                    continue
+                key = f"model.layers.{self.layer_idx}.mlp.experts.{expert_id}.{pname}.weight"
+                t = self.handles[self.weight_map[key]].get_tensor(key)
+                R = t.shape[0]
+                r0, rows = bi * 128, min(128, R - bi * 128)
+                if rows <= 0:
+                    continue
+                projs[pname][r0:r0 + rows].copy_(t[r0:r0 + rows], non_blocking=True)
+                nbytes += rows * t.shape[1] * 2
+        torch.cuda.current_stream(self.device).wait_stream(self.dma_stream)
+        self.col_complete_ms += (time.perf_counter() - t0) * 1000.0
+        if slot_idx in self.slot_lru:
+            self.slot_lru.remove(slot_idx)
+        self.slot_to_expert[slot_idx] = expert_id
+        self.expert_to_slot[expert_id] = slot_idx
+        self.slot_lru.append(slot_idx)
+        self.misses += 1
+        self.dma_bytes += nbytes
+        return nbytes
+
+    def _c1_prefetch_stage(self, new_ids, conf):
+        """Stage hot blocks for predicted experts (cap: half of capacity)."""
+        cap = max(1, self.capacity // 2)
+        staged = sum(1 for s in self.slot_col_state)
+        for exp_id in new_ids:
+            if staged >= cap:
+                break
+            slot_idx = self.slot_lru.pop(0)
+            nb = self._c1_stage_hot(exp_id, slot_idx)
+            if nb > 0:
+                staged += 1
+                self._prefmeta[exp_id] = [conf, 0]
+                self.zssr_predictions += 1
+            else:
+                self.slot_lru.append(slot_idx)  # nothing staged; slot back
+        return [e for e in new_ids if e in self._c1_staged]
 
     def warm_up_slots(self, initial_experts: List[int]):
         """Pre-populates dynamic slots with initial experts."""
@@ -944,6 +1086,10 @@ class DeepSeekColossusMoEWrapper(nn.Module):
                 self._prefmeta[exp_id] = [conf, 0]
             self.zssr_predictions += len(new_ids)
             return pred
+        if self.col_prefetch and not self.cpu_layer:
+            # C-1: stage hot columns only (raw blocks, ~1/3 bytes of whole).
+            # Verify/counting reuses the generic Phase-1 block in forward().
+            return self._c1_prefetch_stage(new_ids, conf)
         if self.coalesced:
             ev_s = self._dma_begin() if self.device.type == "cuda" else None
         for exp_id in new_ids:
@@ -1142,10 +1288,20 @@ class DeepSeekColossusMoEWrapper(nn.Module):
                     self._load_experts_ans(missing_experts)
                 else:
                     for exp_id in missing_experts:
-                        self.misses += 1
-                        slot_idx = self.slot_lru.pop(0)
-                        self._load_expert_to_slot(exp_id, slot_idx)
-                        self.slot_lru.append(slot_idx)
+                        if self.col_prefetch and exp_id in self._c1_staged:
+                            # C-1: staged hot verified -> complete cold blocks only.
+                            # Useful/correct counted by generic Phase-1 verify above.
+                            slot_idx = self._c1_staged[exp_id]
+                            if slot_idx in self.slot_lru:
+                                self.slot_lru.remove(slot_idx)
+                            self._c1_complete(exp_id, slot_idx)
+                        else:
+                            self.misses += 1
+                            slot_idx = self.slot_lru.pop(0)
+                            if self.col_prefetch:
+                                self._c1_unbind_slot(slot_idx)
+                            self._load_expert_to_slot(exp_id, slot_idx)
+                            self.slot_lru.append(slot_idx)
                     torch.cuda.current_stream(self.device).wait_stream(self.dma_stream)
 
 
@@ -1178,6 +1334,8 @@ class DeepSeekColossusMoEWrapper(nn.Module):
                 # On-demand load for multi-token prefill where needed_experts > capacity
                 self.misses += 1
                 slot_idx = self.slot_lru.pop(0)
+                if self.col_prefetch:
+                    self._c1_unbind_slot(slot_idx)
                 self._load_expert_to_slot(i, slot_idx)
                 self.slot_lru.append(slot_idx)
                 torch.cuda.current_stream(self.device).wait_stream(self.dma_stream)
@@ -1363,6 +1521,18 @@ def serve_deepseek(args):
                     w.cpu_pool = cpu_pool
                     n += 1
             print(f"  CPU expert layers: {n} (mode={'pool' if cpu_pool else 'sequential'}, threads={args.cpu_threads}, cache={args.cpu_cache}/layer)")
+
+    # C-1: hot-column prefetch (needs probe + geometry + energy tables; no ANS/CPU).
+    if args.col_prefetch:
+        assert args.zssr_prefetch, "--col_prefetch needs --zssr_prefetch"
+        assert args.block_index and args.calib, "--col_prefetch needs --block_index + --calib"
+        assert not args.ans_store, "--col_prefetch incompatible with --ans_store"
+        assert not args.cpu_layers, "--col_prefetch incompatible with --cpu_layers"
+        for w in colossus_wrappers:
+            w.col_prefetch = True
+            w.block_index_dir = args.block_index
+            w.calib_dir = args.calib
+        print(f"  C-1 hot-column prefetch: block_index={args.block_index} calib={args.calib}")
     print(f"    GPU 0 Allocated (with C={args.capacity} slots): {torch.cuda.memory_allocated(dev0) / (1024**3):.2f} GB")
     if args.num_gpus > 1:
         print(f"    GPU 1 Allocated (with C={args.capacity_gpu1} slots): {torch.cuda.memory_allocated(dev1) / (1024**3):.2f} GB")
@@ -1992,6 +2162,9 @@ def serve_deepseek(args):
         "svb_probes": svb_probes,
         "svb_K": int(args.svb_K),
         "routing_log_steps": len(colossus_wrappers[0].routing_log or []),
+        # C-1 column prefetch
+        "col_prefetch": bool(args.col_prefetch),
+        "col_complete_ms": sum(w.col_complete_ms for w in colossus_wrappers),
         # Path 3-1 flip audit
         "exactness_mode": args.exactness_mode,
         "cpu_layers": args.cpu_layers,
@@ -2069,6 +2242,13 @@ if __name__ == "__main__":
                         help="SVB-0b: comma list of Pass-A token positions to probe, e.g. '2,6,10'")
     parser.add_argument("--svb_K", type=int, default=8,
                         help="SVB-0b: shared-only draft steps per probe")
+    # C-1 hot-column prefetch (default OFF)
+    parser.add_argument("--col_prefetch", action="store_true", default=False,
+                        help="C-1: prefetch calib-hot blocks only; demand completes cold")
+    parser.add_argument("--block_index", type=str, default=None,
+                        help="C-1: dir with block_index.json (block geometry)")
+    parser.add_argument("--calib", type=str, default=None,
+                        help="C-1: dir with calib.json (static top-block energy sets)")
     # Path 3-1 (all default OFF; bitwise default preserves existing behavior)
     parser.add_argument("--exactness_mode", choices=["bitwise", "ulp1"], default="bitwise",
                         help="bitwise: GPU-only (assert-grade exact); ulp1: allow CPU expert path (<=1-ulp, logged)")
