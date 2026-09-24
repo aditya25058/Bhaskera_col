@@ -440,10 +440,11 @@ class DeepSeekColossusMoEWrapper(nn.Module):
             with open(os.path.join(store_dir, "block_index.json")) as f:
                 idx = json.load(f)
             table = {}
-            for k in idx:
+            for k, m in idx.items():
                 try:
                     L, E, bi, pname = k.split("/")
-                    table.setdefault((int(L), int(E)), []).append((pname, int(bi)))
+                    table.setdefault((int(L), int(E)), []).append(
+                        (pname, int(bi), int(m.get("rows", 128))))
                 except Exception:
                     continue
             for v in table.values():
@@ -491,13 +492,13 @@ class DeepSeekColossusMoEWrapper(nn.Module):
                  "down_proj": slot.down_proj.weight}
         hotset, nbytes = set(), 0
         with torch.no_grad(), torch.cuda.stream(self.dma_stream):
-            for pname, bi in ((p, b) for (p, b, _r) in self._c1_exp_blocks(expert_id)):
+            for pname, bi, blk_rows in self._c1_exp_blocks(expert_id):
                 if bi not in hot.get(pname, ()):
                     continue
                 key = f"model.layers.{self.layer_idx}.mlp.experts.{expert_id}.{pname}.weight"
                 t = self.handles[self.weight_map[key]].get_tensor(key)
                 R = t.shape[0]
-                r0, rows = bi * 128, min(128, R - bi * 128)
+                r0, rows = bi * 128, min(blk_rows, R - bi * 128)
                 if rows <= 0:
                     continue
                 w = projs[pname]
@@ -524,13 +525,13 @@ class DeepSeekColossusMoEWrapper(nn.Module):
         nbytes = 0
         t0 = time.perf_counter()
         with torch.no_grad(), torch.cuda.stream(self.dma_stream):
-            for pname, bi in ((p, b) for (p, b, _r) in self._c1_exp_blocks(expert_id)):
+            for pname, bi, blk_rows in self._c1_exp_blocks(expert_id):
                 if (pname, bi) in hot:
                     continue
                 key = f"model.layers.{self.layer_idx}.mlp.experts.{expert_id}.{pname}.weight"
                 t = self.handles[self.weight_map[key]].get_tensor(key)
                 R = t.shape[0]
-                r0, rows = bi * 128, min(128, R - bi * 128)
+                r0, rows = bi * 128, min(blk_rows, R - bi * 128)
                 if rows <= 0:
                     continue
                 projs[pname][r0:r0 + rows].copy_(t[r0:r0 + rows], non_blocking=True)
