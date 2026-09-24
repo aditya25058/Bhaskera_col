@@ -376,6 +376,10 @@ class DeepSeekColossusMoEWrapper(nn.Module):
         self.hostreg_pinned_gb = 0.0
         self.top_k = int(getattr(cfg, "num_experts_per_tok", 6))
         self.n_routed = int(getattr(cfg, "n_routed_experts", 160))
+        # SVB Phase 0: shared-only draft mode (zero DMA: skip routed experts) +
+        # routing log (per-forward union of needed experts; decode only).
+        self.shared_only = False
+        self.routing_log = None  # None | list of (layer_idx, [expert ids])
 
         # Resident modules on GPU
         self.gate = moe_module.gate
@@ -955,6 +959,10 @@ class DeepSeekColossusMoEWrapper(nn.Module):
         topk_indices, topk_weights, _ = self.gate(hidden_states)
         needed_experts = topk_indices.unique().tolist()
 
+        # SVB Phase 0a: log per-layer routing union (decode only; gated by caller).
+        if self.routing_log is not None:
+            self.routing_log.append((self.layer_idx, needed_experts))
+
         # Phase 1A: column P/R measurement (no movement, no slot changes)
         if self.col_measure:
             try:
@@ -987,6 +995,10 @@ class DeepSeekColossusMoEWrapper(nn.Module):
 
         # 2. Compute shared experts (permanently resident)
         shared_out = self.shared_experts(identity)
+
+        # SVB Phase 0b: shared-only draft mode — zero DMA, no slot mutation.
+        if self.shared_only:
+            return shared_out
 
         # 3. Dynamic Slot Management & Expert Streaming
         # Fast path for single-token decode (needed_experts <= capacity): batch-stream all missing experts
@@ -1406,6 +1418,9 @@ def serve_deepseek(args):
     last_dby = sum(w.demand_bytes_m for w in colossus_wrappers)
 
     for step in range(args.max_new_tokens - 1):
+        if step == 0 and args.log_routing:
+            for w in colossus_wrappers:
+                w.routing_log = []
         torch.cuda.synchronize(dev0)
         torch.cuda.synchronize(dev1)
         t_step_start = time.perf_counter()
@@ -1489,6 +1504,70 @@ def serve_deepseek(args):
             "step_demand_dma_ms": step_dms,
             "token": tok_str,
         })
+
+    # SVB Phase 0: stop routing log at end of Pass-A decode (probes run after).
+    for w in colossus_wrappers:
+        if w.routing_log is not None:
+            w.routing_log = list(w.routing_log)  # freeze
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # SVB Phase 0b: shared-only draft probes (greedy prefix-match vs Pass A).
+    # Each probe: fresh KV, full-model prefill of Pass-A prefix, then K
+    # shared-only (zero-DMA) greedy steps. No state leaks into Pass A.
+    # ─────────────────────────────────────────────────────────────────────────
+    svb_probes = []
+    probe_positions = ([int(x) for x in args.svb_probe_positions.split(",") if x.strip()]
+                       if args.svb_probe_positions else [])
+    if probe_positions:
+        from transformers.cache_utils import DynamicCache as _DC
+        n_gen = generated_ids.shape[1] - prompt_len  # Pass-A new tokens
+        ref_toks = generated_ids[0, prompt_len:].tolist()
+        for p in probe_positions:
+            if p < 1 or p >= n_gen:
+                print(f"  [svb-probe] skip p={p} (out of range 1..{n_gen - 1})")
+                continue
+            prefix = generated_ids[:, :prompt_len + p]
+            p_attn = torch.ones_like(prefix) if attn_mask is not None else None
+            probe_kv = _DC()
+            with torch.no_grad():
+                o = model(input_ids=prefix, attention_mask=p_attn,
+                          past_key_values=probe_kv, use_cache=True)
+                pkv = getattr(o, "past_key_values", None)
+                ntok = o.logits[:, -1, :].argmax(dim=-1, keepdim=True).to(dev0)
+            for w in colossus_wrappers:
+                w.shared_only = True
+            drafts, dms = [], []
+            with torch.no_grad():
+                cur = ntok
+                for _ in range(args.svb_K):
+                    torch.cuda.synchronize(dev0)
+                    t0 = time.perf_counter()
+                    o = model(input_ids=cur, past_key_values=pkv, use_cache=True)
+                    torch.cuda.synchronize(dev0)
+                    dms.append((time.perf_counter() - t0) * 1000.0)
+                    cur = o.logits[:, -1, :].argmax(dim=-1, keepdim=True).to(dev0)
+                    pkv = getattr(o, "past_key_values", None)
+                    drafts.append(int(cur[0, 0].item()))
+            for w in colossus_wrappers:
+                w.shared_only = False
+            # drafts[0] is shared-only's prediction for position p+1 (ntok is the
+            # full-model token at p, i.e. the accepted prefix). Compare aligned.
+            truth = ref_toks[p + 1:p + 1 + args.svb_K]
+            match = 0
+            for d, t in zip(drafts, truth):
+                if d == t:
+                    match += 1
+                else:
+                    break
+            svb_probes.append({"pos": p, "K": args.svb_K, "match": match,
+                               "n_compared": len(truth),
+                               "draft_ms_per_step": sum(dms) / max(1, len(dms)),
+                               "drafts": drafts, "truth": truth})
+            print(f"  [svb-probe] pos={p:2d} match={match}/{len(truth)} "
+                  f"draft={sum(dms) / max(1, len(dms)):6.1f}ms/step "
+                  f"drafts={drafts} truth={truth}")
+            sys.stdout.flush()
+            del probe_kv, pkv
 
 
 
@@ -1728,7 +1807,18 @@ def serve_deepseek(args):
         "prefault_pages": pf_pages,
         "generated_text": gen_text,
         "generated_texts": gen_texts,
+        # SVB Phase 0
+        "svb_probes": svb_probes,
+        "svb_K": int(args.svb_K),
+        "routing_log_steps": (len(colossus_wrappers[0].routing_log) // max(1, len(colossus_wrappers))
+                              if colossus_wrappers[0].routing_log else 0),
     }
+
+    if args.log_routing:
+        with open(args.log_routing, "w") as f:
+            json.dump([{"layer": lyr, "experts": exps}
+                       for w in colossus_wrappers for (lyr, exps) in (w.routing_log or [])], f)
+        print(f"Saved routing log to: {args.log_routing}")
 
     if args.output_json:
         with open(args.output_json, "w") as f:
@@ -1777,6 +1867,13 @@ if __name__ == "__main__":
                         help="Phase 1A: measure ZSSR column P/R vs ground truth (no movement change)")
     parser.add_argument("--col_topk_max", type=int, default=1024)
     parser.add_argument("--col_pred_experts", type=int, default=8)
+    # SVB Phase 0 (measurement only; default OFF; no behavior change)
+    parser.add_argument("--log_routing", type=str, default=None,
+                        help="SVB-0a: dump per-layer per-step routing unions to JSON")
+    parser.add_argument("--svb_probe_positions", type=str, default=None,
+                        help="SVB-0b: comma list of Pass-A token positions to probe, e.g. '2,6,10'")
+    parser.add_argument("--svb_K", type=int, default=8,
+                        help="SVB-0b: shared-only draft steps per probe")
 
 
     parser.add_argument("--use_cache", action="store_true", default=True)
