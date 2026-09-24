@@ -144,6 +144,14 @@ Net diff: **−1016 lines** across `rudra/serve_deepseek_colossus.py`, `src/bhas
 
 **Artifacts (server):** `deepseek_c1_smoke.json`, `deepseek_c1_conf07.json`. Flags: `--col_prefetch/--block_index/--calib` (all default OFF; asserts probe+geometry+energy present, rejects ANS/CPU combos).
 
+## 12. H1 (dead) + H2a (viable): exact sparsity vs exact partitioning (2026-09-24)
+
+**H1 — top-K-only vs full expert, bitwise (`rudra/test_h1_sparsity.py`):** 0/50 matches at every K<100% (75/50/25/10%); error scales with omitted fraction. Exact sparsity is FALSE for SiLU dense experts — "hot" ≠ "zero." Bonus kill: even K=100% in a different summation order matches only 13/50 (1-ulp reassociation breaks bitwise before any approximation enters). H1 closed in one CPU-only run.
+
+**H2a — intermediate-dim recalibration + split bound (`rudra/calib_col_intermediate.py`):** per-expert energy E[i] = ‖gate[i]‖²+‖up[i]‖²+‖down[:,i]‖² over all 9440 experts (668 s, CPU-only) → `models/DeepSeek-Coder-V2-CALIBCOL/calib_col.json` (top-512/1536 hot sets). Split protocol (y_hot + y_cold in native suborders vs full): 1/200 bitwise, worst diff 7.8e-3 (4 ulp — regrouping bound, wider than Path 3's 1 ulp; needs end-to-end flip audit, same ulp1 contract).
+
+**Standing:** H2 (y_hot GPU + y_cold CPU, exact accumulation) is viable pending H2b flip audit. Both halves already built (C-1 partial residency, 3-1 CPU executor); remaining work is the split protocol + combine, plus down-column geometry (done here).
+
 ## 10. Path 3-0/3-1 — CPU expert compute + ulp1 exactness gate (2026-09-24, commits `d0fcc91`, `cc57cc9`)
 
 **Ceiling:** 6 experts × 47.2 MB × 59 layers ≈ 16.7 GB RAM-read/token; box measured 57–102 GB/s achievable (below 320 GB/s STREAM hope — cause undetermined, no resctrl cap; 4 GB swap in use). Only ~5% of wire speed needed to beat the 1585 ms/token baseline.
