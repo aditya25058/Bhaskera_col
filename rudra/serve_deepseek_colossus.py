@@ -1037,6 +1037,7 @@ class DeepSeekColossusMoEWrapper(nn.Module):
             for k in range(TI.shape[1]):
                 groups.setdefault(int(TI[b, k]), []).append((b, k))
         out = torch.zeros_like(flat)
+        t_shuttle = (time.perf_counter() - t0) * 1000.0
         if self.cpu_pool is not None:
             # 3-2: concurrent experts (bench-proven 3.1 ms/layer); pool shared
             # across layers/steps, one thread per expert (global threads=1).
@@ -1044,10 +1045,16 @@ class DeepSeekColossusMoEWrapper(nn.Module):
                 self._cpu_one_expert, flat,
                 torch.tensor([bb for bb, _ in poses]), e))
                 for e, poses in groups.items()]
-            for poses, fut in jobs:
-                for (b, k), yrow in zip(poses, fut.result()):
+            t1 = time.perf_counter()
+            results = [(poses, fut.result()) for poses, fut in jobs]
+            t_wait = (time.perf_counter() - t1) * 1000.0
+            t2 = time.perf_counter()
+            for poses, ye in results:
+                for (b, k), yrow in zip(poses, ye):
                     out[b] += yrow * TW[b, k]
+            t_combine = (time.perf_counter() - t2) * 1000.0
         else:
+            t_wait = t_combine = 0.0
             for e, poses in groups.items():
                 ye = self._cpu_one_expert(
                     flat, torch.tensor([b for b, _ in poses]), e)
@@ -1056,6 +1063,9 @@ class DeepSeekColossusMoEWrapper(nn.Module):
         ret = shared_out + out.reshape(orig_shape).to(shared_out.device, dtype=shared_out.dtype)
         self.cpu_ms += (time.perf_counter() - t0) * 1000.0
         self.cpu_n += 1
+        self._cpu_t_shuttle = getattr(self, "_cpu_t_shuttle", 0.0) + t_shuttle
+        self._cpu_t_wait = getattr(self, "_cpu_t_wait", 0.0) + t_wait
+        self._cpu_t_combine = getattr(self, "_cpu_t_combine", 0.0) + t_combine
         return ret
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -1984,6 +1994,9 @@ def serve_deepseek(args):
         "cpu_layers": args.cpu_layers,
         "cpu_ms_per_layer_step": (sum(w.cpu_ms for w in colossus_wrappers) /
                                   max(1, sum(w.cpu_n for w in colossus_wrappers))),
+        "cpu_shuttle_ms": sum(getattr(w, "_cpu_t_shuttle", 0.0) for w in colossus_wrappers) / max(1, sum(w.cpu_n for w in colossus_wrappers)),
+        "cpu_wait_ms": sum(getattr(w, "_cpu_t_wait", 0.0) for w in colossus_wrappers) / max(1, sum(w.cpu_n for w in colossus_wrappers)),
+        "cpu_combine_ms": sum(getattr(w, "_cpu_t_combine", 0.0) for w in colossus_wrappers) / max(1, sum(w.cpu_n for w in colossus_wrappers)),
         "flip_audit": audit,
     }
 
