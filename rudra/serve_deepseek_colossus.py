@@ -380,6 +380,13 @@ class DeepSeekColossusMoEWrapper(nn.Module):
         # routing log (per-forward union of needed experts; decode only).
         self.shared_only = False
         self.routing_log = None  # None | list of (layer_idx, [expert ids])
+        # Path 3-1: CPU expert execution (ulp1 mode only; bitwise default ignores).
+        self.cpu_layer = False
+        self._cpu_cache = {}     # expert_id -> {gate,up,down} CPU mmap tensors
+        self._cpu_fifo = []
+        self.cpu_cache_cap = 128
+        self.cpu_ms = 0.0
+        self.cpu_n = 0
 
         # Resident modules on GPU
         self.gate = moe_module.gate
@@ -950,6 +957,92 @@ class DeepSeekColossusMoEWrapper(nn.Module):
         self.zssr_predictions += len(new_ids)
         return pred
 
+    def _cpu_weights(self, expert_id: int):
+        """FIFO-capped CPU weight cache (mmap tensors, zero copy from page cache)."""
+        w = self._cpu_cache.get(expert_id)
+        if w is None:
+            pfx = f"model.layers.{self.layer_idx}.mlp.experts.{expert_id}"
+            w = {
+                "gate": self.handles[self.weight_map[f"{pfx}.gate_proj.weight"]].get_tensor(f"{pfx}.gate_proj.weight"),
+                "up": self.handles[self.weight_map[f"{pfx}.up_proj.weight"]].get_tensor(f"{pfx}.up_proj.weight"),
+                "down": self.handles[self.weight_map[f"{pfx}.down_proj.weight"]].get_tensor(f"{pfx}.down_proj.weight"),
+            }
+            self._cpu_cache[expert_id] = w
+            self._cpu_fifo.append(expert_id)
+            if len(self._cpu_fifo) > self.cpu_cache_cap:
+                self._cpu_cache.pop(self._cpu_fifo.pop(0), None)
+        return w
+
+    def _cpu_moe_forward(self, hidden_states, shared_out, topk_indices, topk_weights, orig_shape):
+        """Routed experts on CPU (oneDNN BF16 GEMV); shared/add stay GPU-side."""
+        t0 = time.perf_counter()
+        x_cpu = hidden_states.detach().to("cpu")
+        flat = x_cpu.reshape(-1, x_cpu.shape[-1])
+        TI = topk_indices.cpu()
+        TW = topk_weights.cpu()
+        groups = {}
+        for b in range(TI.shape[0]):
+            for k in range(TI.shape[1]):
+                groups.setdefault(int(TI[b, k]), []).append((b, k))
+        out = torch.zeros_like(flat)
+        for e, poses in groups.items():
+            w = self._cpu_weights(e)
+            rows = torch.tensor([b for b, _ in poses])
+            xe = flat[rows]
+            with torch.no_grad():
+                ye = torch.nn.functional.linear(
+                    torch.nn.functional.silu(torch.nn.functional.linear(xe, w["gate"])) *
+                    torch.nn.functional.linear(xe, w["up"]), w["down"])
+            for (b, k), yrow in zip(poses, ye):
+                out[b] += yrow * TW[b, k]
+        ret = shared_out + out.reshape(orig_shape).to(shared_out.device, dtype=shared_out.dtype)
+        self.cpu_ms += (time.perf_counter() - t0) * 1000.0
+        self.cpu_n += 1
+        return ret
+
+    def _cpu_weights(self, expert_id: int):
+        """FIFO-capped CPU weight cache (mmap tensors, zero copy from page cache)."""
+        w = self._cpu_cache.get(expert_id)
+        if w is None:
+            pfx = f"model.layers.{self.layer_idx}.mlp.experts.{expert_id}"
+            w = {
+                "gate": self.handles[self.weight_map[f"{pfx}.gate_proj.weight"]].get_tensor(f"{pfx}.gate_proj.weight"),
+                "up": self.handles[self.weight_map[f"{pfx}.up_proj.weight"]].get_tensor(f"{pfx}.up_proj.weight"),
+                "down": self.handles[self.weight_map[f"{pfx}.down_proj.weight"]].get_tensor(f"{pfx}.down_proj.weight"),
+            }
+            self._cpu_cache[expert_id] = w
+            self._cpu_fifo.append(expert_id)
+            if len(self._cpu_fifo) > self.cpu_cache_cap:
+                self._cpu_cache.pop(self._cpu_fifo.pop(0), None)
+        return w
+
+    def _cpu_moe_forward(self, hidden_states, shared_out, topk_indices, topk_weights, orig_shape):
+        """Routed experts on CPU (oneDNN BF16 GEMV); shared/residual stay GPU-side."""
+        t0 = time.perf_counter()
+        x_cpu = hidden_states.detach().to("cpu")
+        flat = x_cpu.reshape(-1, x_cpu.shape[-1])
+        TI = topk_indices.cpu()
+        TW = topk_weights.cpu()
+        groups = {}
+        for b in range(TI.shape[0]):
+            for k in range(TI.shape[1]):
+                groups.setdefault(int(TI[b, k]), []).append((b, k))
+        out = torch.zeros_like(flat)
+        for e, poses in groups.items():
+            w = self._cpu_weights(e)
+            rows = torch.tensor([b for b, _ in poses])
+            xe = flat[rows]
+            with torch.no_grad():
+                ye = torch.nn.functional.linear(
+                    torch.nn.functional.silu(torch.nn.functional.linear(xe, w["gate"])) *
+                    torch.nn.functional.linear(xe, w["up"]), w["down"])
+            for (b, k), yrow in zip(poses, ye):
+                out[b] += yrow * TW[b, k]
+        ret = shared_out + out.reshape(orig_shape).to(shared_out.device, dtype=shared_out.dtype)
+        self.cpu_ms += (time.perf_counter() - t0) * 1000.0
+        self.cpu_n += 1
+        return ret
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         identity = hidden_states
         orig_shape = hidden_states.shape
@@ -1000,6 +1093,12 @@ class DeepSeekColossusMoEWrapper(nn.Module):
         # SVB Phase 0b: shared-only draft mode — zero DMA, no slot mutation.
         if self.shared_only:
             return shared_out
+
+        # Path 3-1: CPU expert execution (ulp1 mode). Weights stay in host RAM
+        # (mmap tensors, page-cache hot); hidden states shuttle GPU<->CPU (~7KB).
+        if self.cpu_layer:
+            return self._cpu_moe_forward(hidden_states, shared_out,
+                                         topk_indices, topk_weights, orig_shape)
 
         # 3. Dynamic Slot Management & Expert Streaming
         # Fast path for single-token decode (needed_experts <= capacity): batch-stream all missing experts
@@ -1217,6 +1316,22 @@ def serve_deepseek(args):
     if args.num_gpus > 1:
         torch.cuda.synchronize(dev1)
     print(f"  Installed {len(colossus_wrappers)} COLOSSUS wrappers in {time.time() - t0:.2f}s.")
+
+    # Path 3-1: CPU expert layers (ulp1 mode only; bitwise default = GPU-only).
+    if args.cpu_layers:
+        if args.exactness_mode != "ulp1":
+            print(f"  [warn] --cpu_layers ignored in bitwise mode (use --exactness_mode ulp1)")
+        else:
+            sel = {w.layer_idx for w in colossus_wrappers} if args.cpu_layers == "all" \
+                else {int(x) for x in args.cpu_layers.split(",") if x.strip()}
+            n = 0
+            for w in colossus_wrappers:
+                if w.layer_idx in sel:
+                    w.cpu_layer = True
+                    w.cpu_cache_cap = args.cpu_cache
+                    n += 1
+            torch.set_num_threads(args.cpu_threads)
+            print(f"  CPU expert layers: {n} (threads={args.cpu_threads}, cache={args.cpu_cache}/layer)")
     print(f"    GPU 0 Allocated (with C={args.capacity} slots): {torch.cuda.memory_allocated(dev0) / (1024**3):.2f} GB")
     if args.num_gpus > 1:
         print(f"    GPU 1 Allocated (with C={args.capacity_gpu1} slots): {torch.cuda.memory_allocated(dev1) / (1024**3):.2f} GB")
@@ -1388,6 +1503,28 @@ def serve_deepseek(args):
         next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True).to(dev0)  # [B, 1]
         past_key_values = getattr(out, "past_key_values", None)
 
+    # 3-1 flip audit: teacher-forced protocol (B==1 only). teacher[pos-1] is the
+    # reference token at 1-based generated position pos. own argmax + fp32 margin
+    # recorded at every position; teacher token fed back (isolates per-position
+    # noise from cascade effects).
+    teacher = None
+    audit = []
+    if args.teacher_tokens:
+        assert B == 1, "--teacher_tokens requires batch size 1"
+        with open(args.teacher_tokens) as f:
+            teacher = json.load(f)
+        assert len(teacher) >= args.max_new_tokens, \
+            f"teacher has {len(teacher)} tokens, need >= {args.max_new_tokens}"
+    if B == 1 and (args.audit_logits or teacher is not None):
+        tv, ti = logits[0, -1, :].float().topk(2)
+        own = int(ti[0])
+        entry = {"pos": 1, "own": own, "margin": float(tv[0] - tv[1])}
+        if teacher is not None:
+            entry["ref"] = teacher[0]
+            entry["match"] = (own == teacher[0])
+            next_token = torch.tensor([[teacher[0]]], device=dev0)
+        audit.append(entry)
+
 
     torch.cuda.synchronize(dev0)
     torch.cuda.synchronize(dev1)
@@ -1435,6 +1572,18 @@ def serve_deepseek(args):
             next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True).to(dev0)  # [B, 1]
             if args.use_cache:
                 past_key_values = getattr(out, "past_key_values", None)
+            # 3-1 flip audit: pos is 1-based generated position (loop step s -> pos s+2)
+            if B == 1 and (args.audit_logits or teacher is not None):
+                pos = step + 2
+                if (teacher is None) or (pos - 1 < len(teacher)):
+                    tv, ti = logits[0, -1, :].float().topk(2)
+                    own = int(ti[0])
+                    entry = {"pos": pos, "own": own, "margin": float(tv[0] - tv[1])}
+                    if teacher is not None:
+                        entry["ref"] = teacher[pos - 1]
+                        entry["match"] = (own == teacher[pos - 1])
+                        next_token = torch.tensor([[teacher[pos - 1]]], device=dev0)
+                    audit.append(entry)
 
         torch.cuda.synchronize(dev0)
         torch.cuda.synchronize(dev1)
@@ -1812,7 +1961,19 @@ def serve_deepseek(args):
         "svb_probes": svb_probes,
         "svb_K": int(args.svb_K),
         "routing_log_steps": len(colossus_wrappers[0].routing_log or []),
+        # Path 3-1 flip audit
+        "exactness_mode": args.exactness_mode,
+        "cpu_layers": args.cpu_layers,
+        "cpu_ms_per_layer_step": (sum(w.cpu_ms for w in colossus_wrappers) /
+                                  max(1, sum(w.cpu_n for w in colossus_wrappers))),
+        "flip_audit": audit,
     }
+
+    if args.audit_logits:
+        with open(args.audit_logits, "w") as f:
+            json.dump({"mode": args.exactness_mode, "cpu_layers": args.cpu_layers,
+                       "audit": audit}, f)
+        print(f"Saved flip audit ({len(audit)} positions) to: {args.audit_logits}")
 
     if args.log_routing:
         with open(args.log_routing, "w") as f:
@@ -1874,6 +2035,18 @@ if __name__ == "__main__":
                         help="SVB-0b: comma list of Pass-A token positions to probe, e.g. '2,6,10'")
     parser.add_argument("--svb_K", type=int, default=8,
                         help="SVB-0b: shared-only draft steps per probe")
+    # Path 3-1 (all default OFF; bitwise default preserves existing behavior)
+    parser.add_argument("--exactness_mode", choices=["bitwise", "ulp1"], default="bitwise",
+                        help="bitwise: GPU-only (assert-grade exact); ulp1: allow CPU expert path (<=1-ulp, logged)")
+    parser.add_argument("--cpu_layers", type=str, default="",
+                        help="3-1: MoE layers to run on CPU in ulp1 mode ('all' or comma list, e.g. '1,5')")
+    parser.add_argument("--cpu_threads", type=int, default=6)
+    parser.add_argument("--cpu_cache", type=int, default=128,
+                        help="3-1: per-layer FIFO CPU weight cache (experts)")
+    parser.add_argument("--audit_logits", type=str, default=None,
+                        help="3-1: dump per-position {own, margin} (+ref/match in teacher mode) to JSON")
+    parser.add_argument("--teacher_tokens", type=str, default=None,
+                        help="3-1: JSON int list; teacher-forced flip protocol (B=1 only)")
 
 
     parser.add_argument("--use_cache", action="store_true", default=True)
