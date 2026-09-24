@@ -100,6 +100,38 @@ def bench_gemv(model_dir, n_inputs=100, seed=0):
     return dt, n_eq, maxdiff
 
 
+def bench_compiled(model_dir, repeats=100):
+    """3-2 Option A: torch.compile SwiGLU (static [1,H] shape, pre-warmed)."""
+    import torch.nn.functional as F
+    w = load_expert(model_dir)
+    H = w["gate_proj"].shape[1]
+    torch.set_num_threads(6)
+    try:
+        @torch.compile(mode="max-autotune")
+        def compiled_expert(x, wg, wu, wd):
+            return F.linear(F.silu(F.linear(x, wg)) * F.linear(x, wu), wd)
+        x = torch.randn(1, H, dtype=torch.bfloat16)
+        for _ in range(3):  # warmup (compile + autotune)
+            compiled_expert(x, w["gate_proj"], w["up_proj"], w["down_proj"])
+        t0 = time.perf_counter()
+        with torch.no_grad():
+            for _ in range(repeats):
+                compiled_expert(x, w["gate_proj"], w["up_proj"], w["down_proj"])
+        dt = (time.perf_counter() - t0) / repeats
+        print(f"  [compiled] max-autotune: {dt * 1000:.2f} ms/expert")
+    except Exception as e:
+        print(f"  [compiled] FAILED: {type(e).__name__}: {str(e)[:200]}")
+        return None
+    # eager reference, same conditions
+    t0 = time.perf_counter()
+    with torch.no_grad():
+        for _ in range(repeats):
+            expert_fwd(x, w)
+    dt_eager = (time.perf_counter() - t0) / repeats
+    print(f"  [compiled] eager baseline : {dt_eager * 1000:.2f} ms/expert")
+    return dt
+
+
 def bench_parallel(model_dir, n_experts=6, layer=1, repeats=10):
     from concurrent.futures import ThreadPoolExecutor
     torch.set_num_threads(1)  # one thread per expert worker; 6 workers
@@ -126,7 +158,7 @@ def bench_parallel(model_dir, n_experts=6, layer=1, repeats=10):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=["bw", "gemv", "parallel", "all"], default="all")
+    ap.add_argument("--mode", choices=["bw", "gemv", "parallel", "compiled", "all"], default="all")
     ap.add_argument("--model", default="models/DeepSeek-Coder-V2-Instruct")
     ap.add_argument("--n_inputs", type=int, default=100)
     args = ap.parse_args()
@@ -151,6 +183,8 @@ def main():
         bench_gemv(args.model, args.n_inputs)
     if args.mode in ("parallel", "all"):
         bench_parallel(args.model)
+    if args.mode in ("compiled",):
+        bench_compiled(args.model)
 
 
 if __name__ == "__main__":
