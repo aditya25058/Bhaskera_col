@@ -129,3 +129,22 @@ Net diff: **−1016 lines** across `rudra/serve_deepseek_colossus.py`, `src/bhas
 **Conclusion:** batching correlates on position, speculation correlates on sequence; DeepSeek-V2 routing correlates on neither across positions. Oracle ceiling for K=8 SVB = 8/6.65 ≈ **1.2×**, below break-even with draft overhead; realistic acceptance (2–3 tokens) → 0.3–0.45×, a loss. This binds the **entire speculative family** (EAGLE, Medusa, MoE-SpeQ, SP-MoE) on offloaded MoE with this routing pattern — verification always pays the consecutive-token union. SP-MoE/MoE-SpeQ tested coarser models (Phi-MoE/Mixtral) with stickier routing; the incompatibility is structural to fine-grained top-6/160 routing, not draft quality. No integration pursued — clean kill.
 
 **Artifacts (server):** `deepseek_svb0_{b1,b8}.json`, `routing_{b1,b8}.json`. Harness retained as opt-in flags (`--log_routing`, `--svb_probe_positions`, `--svb_K`) for future draft-policy tests. Standing envelope updated: B=1 ~0.3–0.6 tok/s (host-dependent), B=8 shared 5.36 tok/s agg.
+
+## 10. Path 3-0/3-1 — CPU expert compute + ulp1 exactness gate (2026-09-24, commits `d0fcc91`, `cc57cc9`)
+
+**Ceiling:** 6 experts × 47.2 MB × 59 layers ≈ 16.7 GB RAM-read/token; box measured 57–102 GB/s achievable (below 320 GB/s STREAM hope — cause undetermined, no resctrl cap; 4 GB swap in use). Only ~5% of wire speed needed to beat the 1585 ms/token baseline.
+
+| Measurement | Result |
+|---|---|
+| Single-expert SwiGLU GEMV (oneDNN BF16) | 2.81 ms (1 thread) → **0.70 ms** (6 threads, 67 GB/s util) |
+| 6-expert parallel layer (ThreadPool) | **3.1 ms/layer** vs 30 ms kill criterion — PASS 10× |
+| `torch.equal` CPU-vs-GPU ×100 inputs | **34/100 pass**, max\|diff\| = 1.95e-3 (1 BF16 ulp — reduction-order reassociation, both sides FP32-accumulate) |
+| Flip protocol, 500-token greedy (teacher-forced both paths) | **independent flips 1/500 = 0.20%** (< 1% gate); the single flip at pos 141 had cpu_margin = 0.0000 (exact tie) vs gpu_margin = 0.1250 — a tie-break, the most benign kind |
+| Free-run divergence | first div pos 141, **499/500 match**, no cascade |
+| CPU free-run throughput (eager Python loop, `--exactness_mode ulp1 --cpu_layers all`) | **1.36–1.55 tok/s** (9.5 ms/layer-step) — first B=1 gain in 40 experiments, 2.4–2.7× baseline |
+
+**Ruling:** ulp1 mode accepted — reassociation is not approximation, bound measured (≤1 ulp), flip rate 0.2% at a tie position. `--exactness_mode` flag preserves the contract: `bitwise` default (GPU-only, untouched) vs `ulp1` (CPU path, flip metrics logged). FP32-weights fallback not needed. Teacher harness validated (teacher-forced GPU reproduces baseline 500/500).
+
+**Artifacts (server):** `deepseek_flip_{A,B,Cgpu,Ccpu}.json`, `flip_audit_{gpu,cpu,Cgpu,Ccpu}.json`, `flip_teacher.json`. Harness: `rudra/bench_cpu_expert_30.py`, serve flags `--exactness_mode/--cpu_layers/--cpu_threads/--cpu_cache/--audit_logits/--teacher_tokens`.
+
+**Open threads:** step-latency decay within long runs (fast start → 3–6 s steps; page-cache churn of the 471 GB model on the 503 GB box + swap use — affects both paths); CPU per-layer 9.5 ms vs 3.1 ms bench (Python-loop overhead → torch.compile candidate for 3-2).
