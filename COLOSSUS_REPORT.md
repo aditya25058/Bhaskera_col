@@ -152,6 +152,23 @@ Net diff: **−1016 lines** across `rudra/serve_deepseek_colossus.py`, `src/bhas
 
 **Standing:** H2 (y_hot GPU + y_cold CPU, exact accumulation) is viable pending H2b flip audit. Both halves already built (C-1 partial residency, 3-1 CPU executor); remaining work is the split protocol + combine, plus down-column geometry (done here).
 
+## 13. H2b — true column executor: architecture proven, economics negative (2026-09-24)
+
+**Built:** hot-third col slots (`FastColSlot`, uniform 512/1536 from `calib_col.json`), raw hot-row/col DMA on miss, CPU cold-complement (cached views), single-worker overlap (GPU-hot ∥ CPU-cold), ulp1 combine. All behind `--h2b` (asserts ulp1, rejects ANS/CPU/prefetch/warm combos).
+
+| Config | tps | hits/miss (16tok) | DMA | VRAM | Exact |
+|---|---|---|---|---|---|
+| H2b B=1 cap12 | 0.395 | 673/6367 | 93 GB | 39.4 GB | True |
+| H2b B=1 cap36 | 0.415 | 1448/5592 | 82 GB | 60.1 GB | True |
+| H2b B=8 cap36 | 3.21 agg | 1071/4550 | 67 GB | 60.1 GB | (coherent) |
+| whole-expert CPU B=1 / B=8 | 1.55 / 10.10 | — | — | 60 GB | ulp1 |
+
+**Why it loses:** per-miss fixed costs (3-copy hot DMA dance + view management + cold dispatch + combine ≈ 2.9 s/step) exceed the 3× byte savings. Coverage tripling doesn't settle misses because the per-step union-6 **churns across steps** (GPU B=8 reference also misses ~300/354 sustained — my "near-100% hits" prediction was wrong; the B=8 win was always constant-bytes-per-step, never residency). Same fragmentation moral as C-1, one level up: columns save bytes, interconnect charges per transfer.
+
+**Verdict:** mechanism PROVEN (exact split compute, both halves, overlap — the architecture the doc describes, running), performance NEGATIVE at B=1 and B=8 on this host. H2b stays opt-in; whole-expert paths stand. The 500-tok flip audit is moot for deployment (perf kills it first); 16-tok exact-True establishes mechanism exactness.
+
+**Artifacts (server):** `deepseek_h2b_smoke.json`, `deepseek_h2b_cov.json`, `deepseek_h2b_b8.json`.
+
 ## 10. Path 3-0/3-1 — CPU expert compute + ulp1 exactness gate (2026-09-24, commits `d0fcc91`, `cc57cc9`)
 
 **Ceiling:** 6 experts × 47.2 MB × 59 layers ≈ 16.7 GB RAM-read/token; box measured 57–102 GB/s achievable (below 320 GB/s STREAM hope — cause undetermined, no resctrl cap; 4 GB swap in use). Only ~5% of wire speed needed to beat the 1585 ms/token baseline.
