@@ -376,6 +376,7 @@ class DeepSeekColossusMoEWrapper(nn.Module):
         prefetch_topk: int = 8,
         coalesced_dma: bool = False,
         prefetch_conf: float = 0.0,
+        lookahead_depth: int = 0,
         pinned_staging: bool = False,
         host_register: bool = False,
         model_dir: str = None,
@@ -402,6 +403,10 @@ class DeepSeekColossusMoEWrapper(nn.Module):
         self.prefetch_topk = int(prefetch_topk)
         self.coalesced = bool(coalesced_dma)
         self.prefetch_conf = float(prefetch_conf)
+        self.lookahead_depth = int(lookahead_depth)
+        self.zssr_lookahead_probes = 0
+        self.lookahead_hit = {}       # depth -> covered actual experts
+        self.lookahead_actual = {}    # depth -> actual experts
         self.pinned_staging = bool(pinned_staging)
         self.host_register = bool(host_register)
         self.model_dir = model_dir
@@ -1231,7 +1236,41 @@ class DeepSeekColossusMoEWrapper(nn.Module):
                     if K <= len(act_cols):
                         self.col_actual_at[K] = self.col_actual_at.get(K, 0) + K
 
+    # Lookahead plan registry shared across layers (predictions for layer L+k
+    # are made by layer L's wrapper, verified by layer L+k's wrapper).
+    _lookahead_pending = {}
+
     @torch.no_grad()
+    def zssr_lookahead(self, hidden_in: torch.Tensor, routers, max_depth: int):
+        """Multi-layer probe: predict experts for layers L+1..L+D from entrance hidden.
+
+        routers: {layer_idx: gate_weight tensor (resident)}. Pure scoring, no DMA.
+        Stores {target_layer: pred_list} in self._lookahead_pending for recall
+        verification when those layers execute. Returns the plan.
+        """
+        plan = {}
+        if max_depth <= 0:
+            return plan
+        try:
+            h = hidden_in[:, -1, :].to(dtype=torch.float32, device=self.device)
+            with torch.no_grad():
+                for d in range(1, max_depth + 1):
+                    tgt = self.layer_idx + d
+                    W = routers.get(tgt)
+                    if W is None:
+                        continue
+                    scores = torch.softmax((h @ W.detach().float().t()).squeeze(0), dim=-1)
+                    k = min(self.prefetch_topk, scores.numel())
+                    topv, topi = torch.topk(scores, k=k)
+                    conf = topv[0].item()
+                    if conf >= self.prefetch_conf:
+                        plan[tgt] = (self.layer_idx, topi.tolist(), conf)
+        except Exception:
+            return {}
+        type(self)._lookahead_pending.update(plan)
+        self.zssr_lookahead_probes += len(plan)
+        return plan
+
     def zssr_prefetch(self, hidden_in: torch.Tensor):
         """Phase 1 probe (called at layer entrance, pre-attention).
 
@@ -1337,6 +1376,14 @@ class DeepSeekColossusMoEWrapper(nn.Module):
                     self.prefetch_useful_bytes += self._prefetched.pop(exp_id)
                     if exp_id in self._prefmeta:
                         self._prefmeta[exp_id][1] = 1
+        # Lookahead recall: predictions made for THIS layer by earlier layers.
+        _lp = type(self)._lookahead_pending.pop(self.layer_idx, None)
+        if _lp is not None:
+            _pl, _pred, _conf = _lp
+            _d = self.layer_idx - _pl
+            _act = set(needed_experts)
+            self.lookahead_hit[_d] = self.lookahead_hit.get(_d, 0) + len(set(_pred) & _act)
+            self.lookahead_actual[_d] = self.lookahead_actual.get(_d, 0) + len(_act)
 
         # 2. Compute shared experts (permanently resident)
         shared_out = self.shared_experts(identity)
@@ -1553,6 +1600,7 @@ def serve_deepseek(args):
             prefetch_topk=args.prefetch_topk,
             coalesced_dma=args.coalesced_dma,
             prefetch_conf=args.prefetch_conf,
+            lookahead_depth=args.lookahead_depth,
             pinned_staging=args.pinned_staging,
             host_register=args.host_register,
             model_dir=MODEL_PATH,
@@ -1615,7 +1663,7 @@ def serve_deepseek(args):
               f"({dt_w / max(1, len(DeepSeekColossusMoEWrapper._shard_registered)):.2f}s/shard)")
         sys.stdout.flush()
 
-    if args.zssr_prefetch or args.col_measure:
+    if args.zssr_prefetch or args.col_measure or args.lookahead_depth > 0:
         # Layer-entrance hooks: ALWAYS stash pre-attention hidden (1A measurement);
         # prefetch DMA only when --zssr-prefetch. Registered AFTER P2P hooks.
         print(f"  Installing layer-entrance hooks (stash h_pre"
@@ -1629,10 +1677,14 @@ def serve_deepseek(args):
                         wrapper._h_pre = hidden_in.detach()
                         if wrapper.zssr_enabled:
                             wrapper.zssr_prefetch(hidden_in)
+                        if wrapper.lookahead_depth > 0:
+                            wrapper.zssr_lookahead(hidden_in, layer_routers, wrapper.lookahead_depth)
                 except Exception as e:
                     print(f"  [warn] entrance hook L{wrapper.layer_idx}: {e}")
                 return None
             return _hook
+        # Router weights for cross-layer lookahead (resident gate weights, shared refs)
+        layer_routers = {w.layer_idx: w.gate.weight for w in colossus_wrappers}
         for l_idx in range(1, cfg.num_hidden_layers):
             model.model.layers[l_idx].register_forward_pre_hook(
                 _make_zssr_hook(colossus_wrappers[l_idx - 1]))
@@ -1694,6 +1746,7 @@ def serve_deepseek(args):
     print(f"  Prompt Length: {prompt_len} tokens (padded), {prompt_real} real")
 
     # Reset cache metrics before generation
+    DeepSeekColossusMoEWrapper._lookahead_pending = {}
     for w in colossus_wrappers:
         w.hits = 0
         w.misses = 0
@@ -1702,6 +1755,9 @@ def serve_deepseek(args):
         w.zssr_correct = 0
         w.zssr_suppressed = 0
         w._prefmeta = {}
+        w.zssr_lookahead_probes = 0
+        w.lookahead_hit = {}
+        w.lookahead_actual = {}
         w.prefetch_bytes_total = 0
         w.prefetch_useful_bytes = 0
         w.demand_bytes_m = 0
@@ -1927,6 +1983,17 @@ def serve_deepseek(args):
     total_zp = sum(w.zssr_predictions for w in colossus_wrappers)
     total_zc = sum(w.zssr_correct for w in colossus_wrappers)
     total_zs = sum(getattr(w, "zssr_suppressed", 0) for w in colossus_wrappers)
+    # Lookahead recall per depth (measurement only; no movement change yet)
+    la_probes = sum(w.zssr_lookahead_probes for w in colossus_wrappers)
+    la_recall = {}
+    for _d in sorted({d for w in colossus_wrappers for d in w.lookahead_actual}):
+        _h = sum(w.lookahead_hit.get(_d, 0) for w in colossus_wrappers)
+        _a = sum(w.lookahead_actual.get(_d, 0) for w in colossus_wrappers)
+        la_recall[_d] = (_h / _a) if _a else 0.0
+    if args.lookahead_depth > 0:
+        print(f"  Lookahead recall by depth : " + " ".join(
+            f"d{d}={la_recall[d] * 100:.1f}%" for d in sorted(la_recall)) +
+              f" ({la_probes} probes)")
     total_pf = sum(w.prefetch_bytes_total for w in colossus_wrappers) / (1024**2)
     total_pfu = sum(w.prefetch_useful_bytes for w in colossus_wrappers) / (1024**2)
     total_ans_pref_mb = sum(w.ans_pref_bytes_m for w in colossus_wrappers) / (1024**2)
@@ -2083,6 +2150,9 @@ def serve_deepseek(args):
         "zssr_predictions": total_zp,
         "zssr_correct": total_zc,
         "zssr_recall_pct": recall,
+        "lookahead_depth": int(args.lookahead_depth),
+        "lookahead_probes": la_probes,
+        "lookahead_recall_by_depth": {str(d): la_recall[d] for d in la_recall},
         "zssr_suppressed": total_zs,
         "conf_mean_hit": _mch,
         "conf_mean_miss": _mcm,
@@ -2135,6 +2205,8 @@ if __name__ == "__main__":
                         help="Top-K experts to prefetch per layer entrance (K=6 routing + margin)")
     parser.add_argument("--prefetch_conf", type=float, default=0.0,
                         help="1B': admit probes only if top-1 confidence >= thr (0.0=admit all)")
+    parser.add_argument("--lookahead_depth", type=int, default=0,
+                        help="Probe L+1..L+D at each layer entrance; measures recall per depth (0=off)")
     parser.add_argument("--coalesced-dma", dest="coalesced_dma", action="store_true", default=False,
                         help="Single timing group per layer prefetch burst (few large DMAs)")
     parser.add_argument("--pinned_staging", action="store_true", default=False,
