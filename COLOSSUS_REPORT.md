@@ -128,7 +128,7 @@ Net diff: **−1016 lines** across `rudra/serve_deepseek_colossus.py`, `src/bhas
 
 **Conclusion:** batching correlates on position, speculation correlates on sequence; DeepSeek-V2 routing correlates on neither across positions. Oracle ceiling for K=8 SVB = 8/6.65 ≈ **1.2×**, below break-even with draft overhead; realistic acceptance (2–3 tokens) → 0.3–0.45×, a loss. This binds the **entire speculative family** (EAGLE, Medusa, MoE-SpeQ, SP-MoE) on offloaded MoE with this routing pattern — verification always pays the consecutive-token union. SP-MoE/MoE-SpeQ tested coarser models (Phi-MoE/Mixtral) with stickier routing; the incompatibility is structural to fine-grained top-6/160 routing, not draft quality. No integration pursued — clean kill.
 
-**Artifacts (server):** `deepseek_svb0_{b1,b8}.json`, `routing_{b1,b8}.json`. Harness retained as opt-in flags (`--log_routing`, `--svb_probe_positions`, `--svb_K`) for future draft-policy tests. Standing envelope updated: B=1 ~0.3–0.6 tok/s (host-dependent), B=8 shared 5.36 tok/s agg.
+**Artifacts (server):** `deepseek_svb0_{b1,b8}.json`, `routing_{b1,b8}.json`. Harness retained as opt-in flags (`--log_routing`, `--svb_probe_positions`, `--svb_K`) for future draft-policy tests. Standing envelope (1×H100, exact): B=1 GPU 0.42–0.63 tok/s · B=1 CPU (ulp1) 1.36–1.55 · B=8 GPU shared 5.36 agg · **B=8 CPU shared 10.10 agg** (`deepseek_cpu_b8.json` — composition confirmed, ~6.5× over B=1 CPU).
 
 ## 10. Path 3-0/3-1 — CPU expert compute + ulp1 exactness gate (2026-09-24, commits `d0fcc91`, `cc57cc9`)
 
