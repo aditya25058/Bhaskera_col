@@ -1857,8 +1857,23 @@ def serve_deepseek(args):
     past_key_values = DynamicCache() if args.use_cache else None
 
     with torch.no_grad():
-        out = model(input_ids=generated_ids, attention_mask=attn_mask, past_key_values=past_key_values, use_cache=args.use_cache)
-        logits = out.logits  # [B, prompt_len, vocab_size]
+        if args.prefill_chunk > 0 and generated_ids.shape[1] > args.prefill_chunk:
+            # Chunked prefill: bound activation memory for long/batch prompts.
+            # Mask covers cache+chunk (all ones: no padding); positions come from
+            # past length inside the model (verify vs single-shot before trusting).
+            logits = None
+            seqlen = generated_ids.shape[1]
+            for s in range(0, seqlen, args.prefill_chunk):
+                chunk = generated_ids[:, s:s + args.prefill_chunk]
+                cmask = torch.ones((B, s + chunk.shape[1]), dtype=torch.long,
+                                   device=generated_ids.device)
+                out = model(input_ids=chunk, attention_mask=cmask,
+                            past_key_values=past_key_values, use_cache=args.use_cache)
+                logits = out.logits
+                past_key_values = getattr(out, "past_key_values", None)
+        else:
+            out = model(input_ids=generated_ids, attention_mask=attn_mask, past_key_values=past_key_values, use_cache=args.use_cache)
+            logits = out.logits  # [B, prompt_len, vocab_size]
         next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True).to(dev0)  # [B, 1]
         past_key_values = getattr(out, "past_key_values", None)
 
@@ -2430,6 +2445,8 @@ if __name__ == "__main__":
                         help="3-1: dump per-position {own, margin} (+ref/match in teacher mode) to JSON")
     parser.add_argument("--teacher_tokens", type=str, default=None,
                         help="3-1: JSON int list; teacher-forced flip protocol (B=1 only)")
+    parser.add_argument("--prefill_chunk", type=int, default=0,
+                        help="Chunked prefill size (0=single shot; 64 bounds activation memory)")
 
 
     parser.add_argument("--use_cache", action="store_true", default=True)
