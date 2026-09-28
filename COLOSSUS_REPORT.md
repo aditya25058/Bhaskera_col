@@ -132,6 +132,8 @@ Net diff: **−1016 lines** across `rudra/serve_deepseek_colossus.py`, `src/bhas
 
 **Prefill autopsy (healthy):** 4.6/5.8/7.7 s at B=8/16/32 (10.5→24.8 tok/s) — scales with batch, not a bottleneck.
 
+**Length scaling (KV wall, not prefill):** B=32×200 → 20.30 agg (`deepseek_gpu_b32_long.json`); B=64×64 → 38.14 (`deepseek_gpu_b64_64.json`); B=64×200 OOMs. VRAM 60→85.8 GB over 200 tokens at B=32 (KV+activations) — length is capped by KV memory (~110 GB projected at B=64×200 > 93 GB), while per-step speed is flat (first20 1815 ms → last20 1626 ms). Chunked prefill (`--prefill_chunk`, verified bit-exact `True`) unblocks activation spikes up to the KV limit. 38–39 tok/s is the box ceiling for shared batch; longer gens don't raise it.
+
 **Fused-kernel sizing (not recommended):** coalesced staging ≈ 2–5%/token; full step capture blocked by dynamic hit/miss control flow. CPU gap fully accounted; GPU gap is launch/sync only.
 
 **Host bandwidth (measured, quiet window load 0.02):** OpenMP STREAM-class triad **92 GB/s/socket**, symmetric — not 320 (hardware reality, no latent bandwidth; GEMV util 67–92 GB/s ≈ 100% of achievable). The CPU path is bandwidth-optimal for this box.
