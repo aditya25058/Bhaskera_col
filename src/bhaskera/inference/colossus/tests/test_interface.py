@@ -153,6 +153,37 @@ def test_missing_gate_raises():
         MoELayerSpec.from_block(m)
 
 
+def test_normalize_activation():
+    from bhaskera.inference.colossus.interface import normalize_activation
+    assert normalize_activation("silu") == "silu"
+    assert normalize_activation("SiGLU") == "silu"
+    assert normalize_activation("gelu_new") == "gelu"
+    assert normalize_activation("relu") == "relu"
+    assert normalize_activation(None) == "silu"
+    assert normalize_activation("weird") == "silu"
+
+
+def test_spec_activation_from_config():
+    import types
+    b = FakeDeepSeekBlock()
+    b.config = types.SimpleNamespace(hidden_act="gelu")
+    s = MoELayerSpec.from_block(b)
+    assert s.activation == "gelu"
+    s2 = MoELayerSpec.from_block(FakeMixtralBlock())
+    assert s2.activation == "silu"
+
+
+def test_fastslot_gelu_matches_manual():
+    from bhaskera.inference.colossus.placement import FastSlot, apply_gate
+    torch.manual_seed(9)
+    slot = FastSlot(16, 24, torch.device("cpu"), torch.float32, "gelu")
+    x = torch.randn(2, 16)
+    ref = slot.down_proj(F.gelu(slot.gate_proj(x)) * slot.up_proj(x))
+    assert torch.equal(slot(x), ref)
+    g, u = torch.randn(2, 5), torch.randn(2, 5)
+    assert torch.equal(apply_gate(g, u, "relu"), F.relu(g) * u)
+
+
 class FakeLayerMlp(nn.Module):
     def __init__(self, block):
         super().__init__()

@@ -26,6 +26,22 @@ import torch.nn.functional as F
 GATE_DEEPSEEK_3TUPLE = "deepseek_3tuple"
 GATE_LOGITS = "logits"
 
+# Expert activation fns by config/hidden_act names. SwiGLU variants share the
+# silu-gated form; plain FFNs use the elementwise one.
+ACT_SILU = ("silu", "swiglu", "sigmoid")
+ACT_GELU = ("gelu", "gelu_new", "gelu_pytorch_tanh")
+ACT_RELU = ("relu",)
+
+
+def normalize_activation(name: Any) -> str:
+    """Canonical activation id from a config string (default: silu)."""
+    low = str(name or "silu").lower()
+    if any(k in low for k in ACT_GELU):
+        return "gelu"
+    if any(k in low for k in ACT_RELU):
+        return "relu"
+    return "silu"
+
 # Expert-container attribute names across architectures.
 EXPERT_CONTAINERS = ("experts", "local_experts", "routed_experts")
 
@@ -136,6 +152,7 @@ class MoELayerSpec:
     inter: int
     dtype: torch.dtype
     container_attr: str = "experts"
+    activation: str = "silu"
 
     @classmethod
     def from_block(cls, moe_block: Any, top_k: Optional[int] = None) -> "MoELayerSpec":
@@ -160,7 +177,10 @@ class MoELayerSpec:
         return cls(experts=experts, gate=gate, gate_style=style, shared=shared,
                    top_k=top_k, n_routed=len(experts),
                    hidden=g0.weight.shape[1], inter=g0.weight.shape[0],
-                   dtype=g0.weight.dtype, container_attr=container_attr)
+                   dtype=g0.weight.dtype, container_attr=container_attr,
+                   activation=normalize_activation(
+                       getattr(getattr(moe_block, "config", None),
+                               "hidden_act", "silu")))
 
     def route(self, hidden: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Unified routing -> (topk_idx, topk_weight), rank mirrors input.
