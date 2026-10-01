@@ -138,7 +138,7 @@ Net diff: **−1016 lines** across `rudra/serve_deepseek_colossus.py`, `src/bhas
 
 ## 14. Bhaskera-infer parity (chunk 2c proof, 2026-10-01)
 
-236B DeepSeek-Coder-V2 served through `bhaskera.launcher.infer --offload-tier slots` (profile-driven port, zero model names): **0.6 tok/s decode, hits 693 / misses 6629 / DMA 298 GB / 60.09 GB VRAM, correct quicksort text** — counters, VRAM, and rate all identical to the research scaffold. Two port bugs found by the gate itself: rank-flattened gate input (DeepSeek gate needs 3D) and per-miss `safe_open` opens (+40 s; fixed with persistent handles). Remaining wall delta is one-time load/materialize (untimed by both harnesses' decode metrics).
+236B DeepSeek-Coder-V2 served through `bhaskera.launcher.infer --offload-tier slots` (profile-driven port, zero model names): **0.6 tok/s decode, hits 693 / misses 6629 / DMA 298 GB / 60.09 GB VRAM, correct quicksort text** — counters, VRAM, and rate all identical to the research scaffold. **B=64 shared through the same CLI: 39.4 tok/s agg** (704 output tokens, 60.77 GB) — meets the 38.6 research headline. Two port bugs found by the gate itself: rank-flattened gate input (DeepSeek gate needs 3D) and per-miss `safe_open` opens (+40 s; fixed with persistent handles). Remaining wall delta is one-time load/materialize (untimed by both harnesses' decode metrics).
 
 **Host bandwidth (measured, quiet window load 0.02):** OpenMP STREAM-class triad **92 GB/s/socket**, symmetric — not 320 (hardware reality, no latent bandwidth; GEMV util 67–92 GB/s ≈ 100% of achievable). The CPU path is bandwidth-optimal for this box.
 
