@@ -130,14 +130,12 @@ def set_module_tensor(model: torch.nn.Module, dotted: str, value: torch.Tensor,
     mod = model
     for p in parts[:-1]:
         mod = getattr(mod, p)
-    param = getattr(mod, parts[-1])
     v = value
     if dtype is not None or device is not None:
         v = v.to(device=device or v.device, dtype=dtype or v.dtype)
-    if isinstance(param, torch.nn.Parameter):
-        param.data = v
-    else:
-        setattr(mod, parts[-1], v)
+    # Fresh Parameter (never .data-assign: meta->device is rejected, and
+    # replacement keeps inference graphs clean; no optim state exists here).
+    setattr(mod, parts[-1], torch.nn.Parameter(v, requires_grad=False))
 
 
 def materialize(model: torch.nn.Module, keys: List[str], handles: ShardHandles,
