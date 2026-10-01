@@ -247,7 +247,9 @@ def main(argv: List[str] = None) -> None:
     # Models larger than HBM: meta-load, mmap residency, tiered execution.
     # Bypasses engine.generate (which assumes the model fits).
     if args.offload_tier != "off":
+        import os
         import torch
+        os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
         from bhaskera.introspect import introspect_model
         from bhaskera.inference.colossus.loading import ShardHandles
         from bhaskera.inference.colossus.serve import serve_huge_moe
