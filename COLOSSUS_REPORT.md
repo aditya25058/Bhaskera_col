@@ -181,6 +181,12 @@ Net diff: **−1016 lines** across `rudra/serve_deepseek_colossus.py`, `src/bhas
 
 **Artifacts (server):** `deepseek_h2b_smoke.json`, `deepseek_h2b_cov.json`, `deepseek_h2b_b8.json`.
 
+## 15. Phase B (mock-first): remote-backed serving without full download
+
+**Design:** `RemoteShardHandles` mirrors the `ShardHandles` surface over HTTP Range + persistent content-addressed cache (verify-once, LRU byte-cap eviction, offline named errors, cold/warm split stats). Executors untouched by construction. Full spec in `docs/remote_handles_spec.md` (research branch only; PRs frozen and unaffected).
+
+**Mock gates (localhost Range server, CPU-only, no network):** remote bytes == local bytes over all keys; warm pass performs **zero HTTP** (manifest+cache persist across instances); eviction under a 256-byte cap stays exact via refetch; offline+uncached raises the named hard error. **66/66 suite green.** Live-Hub validation held until mock path is reviewed; 17 GB stays a worked example with the `fetched/unique/total` headline metric.
+
 ## 10. Path 3-0/3-1 — CPU expert compute + ulp1 exactness gate (2026-09-24, commits `d0fcc91`, `cc57cc9`)
 
 **Ceiling:** 6 experts × 47.2 MB × 59 layers ≈ 16.7 GB RAM-read/token; box measured 57–102 GB/s achievable (below 320 GB/s STREAM hope — cause undetermined, no resctrl cap; 4 GB swap in use). Only ~5% of wire speed needed to beat the 1585 ms/token baseline.
