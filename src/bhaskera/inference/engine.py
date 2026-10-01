@@ -164,6 +164,7 @@ class _HFBackend:
         model_kwargs: dict = dict(
             torch_dtype=self._dtype or "auto",
             trust_remote_code=cfg.model.trust_remote_code,
+            low_cpu_mem_usage=True,
         )
         # Multi-GPU: device_map=auto lets HF shard across all visible GPUs
         if device.type == "cuda" and torch.cuda.device_count() > 1:
@@ -191,6 +192,30 @@ class _HFBackend:
         # ── ModelProfile ─────────────────────────────────────────────
         from bhaskera.introspect import introspect_model
         self._profile = introspect_model(self._model)
+
+        # ── COLOSSUS hook (opt-in, MoE only) ─────────────────────────
+        # Shadow mode: observe-only, zero numerical impact.
+        # Active mode (offload_enabled): profiles prompt, offloads cold
+        # expert weights to CPU before generate(), restores after.
+        self._colossus = None
+        self._colossus_state = {"mode": "off", "reason": "disabled in config"}
+        _cc = getattr(infer_cfg, "colossus", None)
+        if _cc is not None and getattr(_cc, "enabled", False):
+            if getattr(self._profile, "is_moe", False):
+                try:
+                    from bhaskera.inference.colossus.hook import ColossusMoEHook
+                    hook = ColossusMoEHook.build(self._model, self._profile, _cc)
+                    hook.attach(self._model, self._profile)
+                    self._colossus = hook
+                    self._colossus_state = hook.stats()
+                    _mode = self._colossus_state.get('mode', 'shadow')
+                    logger.info(f"[Engine] COLOSSUS {_mode}-mode hook attached ✓")
+                except Exception as e:
+                    self._colossus_state = {"mode": "off", "reason": str(e)}
+                    logger.warning(f"[Engine] COLOSSUS disabled ({e}); dense path unchanged")
+            else:
+                self._colossus_state = {"mode": "off", "reason": "dense model, MoE hook N/A"}
+                logger.info("[Engine] COLOSSUS off — dense model")
 
         # ── KV Cache ─────────────────────────────────────────────────
         self._kv_cache = self._build_kv_cache()
@@ -342,6 +367,18 @@ class _HFBackend:
             if self._device.type in ("cuda", "cpu")
             else torch.autocast("cpu", dtype=self._dtype)
         )
+        # ── COLOSSUS active-mode: offload cold experts before generate ─
+        _colossus_hook = getattr(self, "_colossus", None)
+        if _colossus_hook is not None:
+            _colossus_hook.maybe_offload(self._model, input_ids)
+            # Record VRAM after offload so stats show the actual savings
+            if torch.cuda.is_available():
+                vram_after = torch.cuda.memory_allocated() / (1024 ** 3)
+                import logging as _lg
+                _lg.getLogger(__name__).info(
+                    f"[Engine] VRAM after COLOSSUS offload: {vram_after:.2f} GB"
+                )
+
         with ctx:
             if self._spec_dec is not None:
                 output_ids = self._generate_speculative(
@@ -350,6 +387,10 @@ class _HFBackend:
                 )
             else:
                 output_ids = self._model.generate(**gen_kwargs)
+
+        # ── COLOSSUS active-mode: restore experts after generate ─────
+        if _colossus_hook is not None:
+            _colossus_hook.maybe_restore(self._model)
 
         # Decode — thinking models need skip_special_tokens=False to preserve <think> tags
         skip_sp = not getattr(self, "_is_thinking", False)
@@ -405,6 +446,14 @@ class _HFBackend:
         if hasattr(self._kv_cache, "compression_stats"):
             return self._kv_cache.compression_stats()
         return {"bytes": self._kv_cache.memory_bytes()}
+
+    def colossus_status(self) -> dict:
+        """Hook state: shadow-mode stats or active-mode with VRAM savings."""
+        state = dict(getattr(self, "_colossus_state", {"mode": "off"}))
+        hook = getattr(self, "_colossus", None)
+        if hook is not None:
+            state.update(hook.stats())
+        return state
 
 
 # ---------------------------------------------------------------------------
@@ -525,6 +574,13 @@ class InferenceEngine:
         if hasattr(self._backend, "kv_cache_stats"):
             return self._backend.kv_cache_stats()
         return None
+
+    def colossus_status(self) -> Optional[dict]:
+        if not self._loaded:
+            return None
+        if hasattr(self._backend, "colossus_status"):
+            return self._backend.colossus_status()
+        return {"mode": "off", "reason": "vLLM backend has no COLOSSUS hook"}
 
     # ------------------------------------------------------------------
     # Param2-Thinking interface

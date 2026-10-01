@@ -98,6 +98,20 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Include the prompt in the output")
     p.add_argument("--torch-compile",  action="store_true")
     p.add_argument("--verbose", "-v",  action="store_true")
+    # COLOSSUS SA-FFN
+    p.add_argument("--missing-col-ratio", type=float, default=None,
+                   help="Missing column fraction for SA-FFN (e.g. 0.50, 0.25, 0.10)")
+
+    # COLOSSUS huge-model tiers (models larger than HBM; default off).
+    # Flag defaults are None so YAML config values apply when flags are absent.
+    p.add_argument("--offload-tier", default=None, choices=["off", "slots", "cpu"],
+                   help="Tiered MoE execution: slots (bitwise, GPU) | cpu (ulp1, oneDNN)")
+    p.add_argument("--capacity", type=int, default=None,
+                   help="Dynamic expert slots per MoE layer (tiered paths)")
+    p.add_argument("--prefill-chunk", type=int, default=None,
+                   help="Chunked prefill size (0=single shot; bounds activation memory)")
+    p.add_argument("--exactness-mode", default=None, choices=["bitwise", "ulp1"],
+                   help="bitwise: GPU-only exact; ulp1: allow CPU placement")
 
     return p
 
@@ -143,6 +157,10 @@ def _build_config(args: argparse.Namespace):
         infer.speculative.enabled = True
     if args.num_draft_tokens is not None:
         infer.speculative.num_draft_tokens = args.num_draft_tokens
+
+    if args.missing_col_ratio is not None:
+        if hasattr(infer, "colossus"):
+            infer.colossus.missing_col_ratio = args.missing_col_ratio
 
     return cfg
 
@@ -228,6 +246,74 @@ def main(argv: List[str] = None) -> None:
     # ── Config ───────────────────────────────────────────────────────
     cfg = _build_config(args)
 
+    # ── COLOSSUS huge-model tier ─────────────────────────────────────
+    # Models larger than HBM: meta-load, mmap residency, tiered execution.
+    # Bypasses engine.generate (which assumes the model fits).
+    # Resolution: explicit flags > YAML colossus.* > off/defaults.
+    _col = cfg.inference.colossus if hasattr(cfg.inference, "colossus") else None
+    _tier = args.offload_tier or (getattr(_col, "placement", "off") if _col else "off")
+    _cap = args.capacity if args.capacity is not None else (
+        getattr(_col, "capacity", 12) if _col else 12)
+    _chunk = args.prefill_chunk if args.prefill_chunk is not None else (
+        getattr(_col, "prefill_chunk", 0) if _col else 0)
+    _mode = args.exactness_mode or (getattr(_col, "exactness_mode", "bitwise")
+                                    if _col else "bitwise")
+    if _tier != "off":
+        import os
+        import torch
+        os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+        if _tier == "cpu" and _mode != "ulp1":
+            parser.error("--offload-tier cpu needs --exactness-mode ulp1")
+        from bhaskera.introspect import introspect_model
+        from bhaskera.inference.colossus.loading import ShardHandles
+        from bhaskera.inference.colossus.serve import serve_huge_moe
+
+        model_dir = args.model
+        if not model_dir or not Path(model_dir).is_dir():
+            parser.error("--offload-tier needs --model <local sharded dir with "
+                         "model.safetensors.index.json>")
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        logger.info(f"Loading tokenizer + meta model from {model_dir} ...")
+        from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+        from accelerate import init_empty_weights
+        tokenizer = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
+        hf_cfg = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
+        with init_empty_weights():
+            model = AutoModelForCausalLM.from_config(
+                hf_cfg, trust_remote_code=True)
+        profile = introspect_model(model)
+        logger.info(f"Profile: {profile.num_experts} experts/layer, "
+                    f"top-{profile.experts_per_token}, "
+                    f"layer={getattr(profile.decoder_layer_cls, '__name__', '?')}")
+        handles = ShardHandles.open(model_dir)
+        t0 = time.perf_counter()
+        res = serve_huge_moe(
+            model, tokenizer, profile, handles, device, prompts,
+            max_new_tokens=args.max_new_tokens or infer.max_new_tokens,
+            capacity=_cap, placement=_tier,
+            prefill_chunk=_chunk)
+        elapsed = time.perf_counter() - t0
+        outputs = res["texts"]
+        total_output_tokens = sum(_count_output_tokens(o, tokenizer) for o in outputs)
+        raw_outputs = []
+        for i, (prompt, output) in enumerate(zip(prompts, outputs)):
+            print(_render_output(i, len(prompts), prompt, output, False, args.show_thinking))
+            raw_outputs.append(output)
+        print(f"\n{SEP}")
+        print(f"Generated {len(prompts)} response(s) | {total_output_tokens} tokens | "
+              f"{elapsed:.2f}s | \033[1;32m{res['batch_decode_tps']:.1f} tok/s agg\033[0m")
+        print(f"COLOSSUS tier={res['placement']} C={res['capacity']} | "
+              f"hits={res['total_hits']} misses={res['total_misses']} | "
+              f"DMA={res['total_dma_mb']:.1f} MB | prefill={res['prefill_s']:.1f}s | "
+              f"Peak VRAM: {res['peak_vram_gb']:.2f} GB")
+        if args.output_file:
+            out_path = Path(args.output_file)
+            with open(out_path, "w") as f:
+                for raw in raw_outputs:
+                    f.write(raw.replace("\n", "\\n") + "\n")
+            logger.info(f"Raw outputs written to {args.output_file}")
+        return
+
     # ── Engine ───────────────────────────────────────────────────────
     from bhaskera.inference import InferenceEngine
     engine = InferenceEngine(cfg)
@@ -307,6 +393,58 @@ def main(argv: List[str] = None) -> None:
     elif infer.kv_cache == "turboquant":
         # Cache exists but was bypassed (e.g. Param2) — still note it
         print(f"TurboQuant: active (model uses internal cache)")
+
+    # Peak VRAM
+    try:
+        import torch
+        if torch.cuda.is_available():
+            peak_vram_gb = torch.cuda.max_memory_allocated() / (1024 ** 3)
+            print(f"Peak VRAM: {peak_vram_gb:.2f} GB")
+    except Exception:
+        pass
+
+    # COLOSSUS MoE offload / dynamic cache stats
+    cstats = engine.colossus_status()
+    if cstats and cstats.get("mode") != "off":
+        print(
+            f"COLOSSUS MoE: mode={cstats.get('mode')} | "
+            f"layers={cstats.get('layers_hooked')} | "
+            f"steps={cstats.get('shadow_steps')} | "
+            f"hits={cstats.get('hits_count', 0)} | "
+            f"misses={cstats.get('misses_count', 0)}"
+        )
+        dc = cstats.get("dynamic_cache")
+        if dc:
+            print("=" * 80)
+            print(f"COLOSSUS DYNAMIC CACHE SUMMARY (Capacity C={dc['capacity']} of 64 Experts across {dc['layers_wrapped']} Layers):")
+            print(f"  Hit Rate     : {dc['hit_rate_pct']:.1f}% ({dc['hits']} hits / {dc['misses']} demand misses)")
+            print(f"  ZSSR Recall@6: {dc['recall_pct']:.1f}%")
+            print(f"  PCIe DMA     : {dc['prefetch_mb']:.1f} MB Prefetched | {dc['demand_mb']:.1f} MB Demand Fetched")
+            tot_pcie_s = dc.get("pcie_time_s", 0.0)
+            dem_stall_s = dc.get("demand_stall_s", 0.0)
+            pref_stall_s = dc.get("prefetch_stall_s", 0.0)
+            hidden_s = max(0.0, tot_pcie_s - dem_stall_s - pref_stall_s)
+            overlap_pct = (hidden_s / tot_pcie_s * 100.0) if tot_pcie_s > 0 else 0.0
+            print(f"  PCIe DMA Time: {tot_pcie_s:.2f}s total | Demand Stall: {dem_stall_s:.2f}s | Prefetch Stall: {pref_stall_s:.2f}s | Hidden: {hidden_s:.2f}s ({overlap_pct:.1f}% Overlap)")
+            if "missing_col_mean" in dc:
+                dma_mb_tok = dc.get("dma_bytes_per_tok", 0.0) / (1024 * 1024)
+                print(f"  Col Missing  : mean={dc['missing_col_mean']:.1f}% | p50={dc['missing_col_p50']:.1f}% | p90={dc['missing_col_p90']:.1f}% | p95={dc['missing_col_p95']:.1f}% | max={dc['missing_col_max']:.1f}% | DMA: {dma_mb_tok:.2f} MB/tok")
+            print("-" * 80)
+            print(f"{'Layer':>6} | {'C':>3} | {'Hit Rate':>9} | {'Hits':>6} | {'Misses':>6} | {'Prefetch MB':>12} | {'Demand MB':>10} | {'Recall@6':>9} | {'DemStall':>8}")
+            print("-" * 80)
+            for m in dc.get("layers", []):
+                print(f"{m['layer_idx']:6d} | {m['capacity']:3d} | {m['hit_rate_pct']:8.1f}% | {m['hits']:6d} | {m['misses']:6d} | {m['prefetch_mb']:11.1f} | {m['demand_mb']:9.1f} | {m['recall_pct']:8.1f}% | {m.get('demand_stall_s', 0.0):7.2f}s")
+            print("=" * 80)
+        else:
+            # Legacy offload stats
+            offload = cstats.get("offload", {})
+            if offload.get("mode") == "active":
+                print(
+                    f"COLOSSUS offload: "
+                    f"{offload.get('vram_saved_gb', 0):.2f} GB freed | "
+                    f"{offload.get('offload_ratio', 0)*100:.0f}% experts offloaded | "
+                    f"{offload.get('experts_offloaded', 0)} experts on CPU"
+                )
 
     # Thinking model note
     if is_thinking and not args.show_thinking:

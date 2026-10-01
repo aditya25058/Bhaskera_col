@@ -63,6 +63,38 @@ class SpeculativeConfig:
 
 
 @dataclass
+class ColossusConfig:
+    """COLOSSUS + ZSSR column-level MoE offload (default-off)."""
+
+    enabled: bool = False
+    # Scoring replica: "int8" (H100, 19.3GB Qwen3) | "int4_row" (24GB, 9.7GB, -2pts).
+    replica: str = "int8"
+    # Fixed-packet budget preset: "tiered_fwd" (50x5+25x3=325) | "uniform40" (40x8=320).
+    budget: str = "tiered_fwd"
+    top_k_experts: int = 8
+    lru_slots_per_expert: int = 32
+    # Active-mode expert offloading: move cold expert weights to CPU before
+    # generation.  Requires enabled=True.  When False, COLOSSUS runs in
+    # shadow-mode (observe-only, no VRAM savings).
+    offload_enabled: bool = False
+    # Number of hot experts to keep on GPU per layer during offloading.
+    # Should be >= the model's top-k routing (6 for Param2, 8 for Qwen3).
+    hot_expert_topk: int = 8
+    # Tiered huge-model execution (models larger than HBM; default off).
+    # placement: "off" | "slots" (bitwise GPU residency) | "cpu" (ulp1 oneDNN).
+    placement: str = "off"
+    capacity: int = 12
+    exactness_mode: str = "bitwise"
+    prefill_chunk: int = 0
+    # ZSSR prefetch (prediction moves data only; router keeps the decision).
+    prefetch: bool = False
+    prefetch_topk: int = 8
+    prefetch_conf: float = 0.0
+    cpu_threads: int = 6
+    audit_logits: str = ""
+
+
+@dataclass
 class InferenceConfig:
     max_new_tokens: int = 512
     temperature: float = 1.0
@@ -75,6 +107,7 @@ class InferenceConfig:
     torch_compile: bool = False
     turboquant: TurboQuantConfig = field(default_factory=TurboQuantConfig)
     speculative: SpeculativeConfig = field(default_factory=SpeculativeConfig)
+    colossus: ColossusConfig = field(default_factory=ColossusConfig)
 
 
 @dataclass
@@ -278,6 +311,7 @@ def _dict_to_config(raw: dict) -> Config:
     infer_raw   = _get(raw, "inference", default={}) or {}
     tq_raw      = _get(raw, "inference", "turboquant", default={}) or {}
     spec_raw    = _get(raw, "inference", "speculative", default={}) or {}
+    col_raw     = _get(raw, "inference", "colossus", default={}) or {}
 
     mon_raw     = _get(raw, "monitoring", default={}) or {}
     prom_raw    = _get(raw, "monitoring", "prometheus", default={}) or {}
@@ -407,6 +441,24 @@ def _dict_to_config(raw: dict) -> Config:
                 enabled=bool(spec_raw.get("enabled", False)),
                 draft_model_name=str(spec_raw.get("draft_model_name", "")),
                 num_draft_tokens=int(spec_raw.get("num_draft_tokens", 5)),
+            ),
+            colossus=ColossusConfig(
+                enabled=bool(col_raw.get("enabled", False)),
+                replica=str(col_raw.get("replica", "int8")),
+                budget=str(col_raw.get("budget", "tiered_fwd")),
+                top_k_experts=int(col_raw.get("top_k_experts", 8)),
+                lru_slots_per_expert=int(col_raw.get("lru_slots_per_expert", 32)),
+                offload_enabled=bool(col_raw.get("offload_enabled", False)),
+                hot_expert_topk=int(col_raw.get("hot_expert_topk", 8)),
+                placement=str(col_raw.get("placement", "off")),
+                capacity=int(col_raw.get("capacity", 12)),
+                exactness_mode=str(col_raw.get("exactness_mode", "bitwise")),
+                prefill_chunk=int(col_raw.get("prefill_chunk", 0)),
+                prefetch=bool(col_raw.get("prefetch", False)),
+                prefetch_topk=int(col_raw.get("prefetch_topk", 8)),
+                prefetch_conf=float(col_raw.get("prefetch_conf", 0.0)),
+                cpu_threads=int(col_raw.get("cpu_threads", 6)),
+                audit_logits=str(col_raw.get("audit_logits", "")),
             ),
         ),
         monitoring=MonitoringConfig(
