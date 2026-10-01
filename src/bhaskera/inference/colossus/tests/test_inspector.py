@@ -27,10 +27,10 @@ class FakeProfile:
     has_aux_loss = True
 
 
-def _fake_dir(tmp_path):
+def _fake_dir(tmp_path, tag="m"):
     from safetensors.torch import save_file
-    d = tmp_path / "m"
-    d.mkdir()
+    d = tmp_path / tag
+    d.mkdir(exist_ok=True)
     wm, sh = {}, {}
     # embed [vocab 16, H 8]; experts gate [I 6, H 8], down [H 8, I 6]
     sh["model.embed_tokens.weight"] = torch.randn(16, 8, dtype=torch.bfloat16)
@@ -72,7 +72,7 @@ def test_describe_model(tmp_path):
 
 
 def test_describe_dense_and_noprofile(tmp_path):
-    d = describe_model(_fake_dir(tmp_path), None)
+    d = describe_model(_fake_dir(tmp_path, "a"), None)
     assert d["moe"] is None
     assert d["capabilities"]["tiered_execution"] is False
 
@@ -85,12 +85,12 @@ def test_describe_dense_and_noprofile(tmp_path):
         num_hidden_layers = 12
         has_aux_loss = False
 
-    d2 = describe_model(_fake_dir(tmp_path), Dense())
+    d2 = describe_model(_fake_dir(tmp_path, "b"), Dense())
     assert d2["capabilities"]["tiered_execution"] is False
     assert any("not MoE" in r for r in d2["capabilities"]["reasons"])
 
 
 def test_write_roundtrip(tmp_path):
     p = str(tmp_path / "desc.json")
-    d = write_inspect_json(_fake_dir(tmp_path), p, FakeProfile())
+    d = write_inspect_json(_fake_dir(tmp_path, "c"), p, FakeProfile())
     assert json.load(open(p)) == d
