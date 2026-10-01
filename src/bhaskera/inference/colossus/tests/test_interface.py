@@ -67,6 +67,11 @@ class FakeDeepSeekBlock(nn.Module):
                 out[n] += self.experts[e](flat[n]) * w[n, k]
         return self.shared_experts(x) + out.view(*x.shape)
 
+    def moe_infer(self, x, idx, w):
+        return torch.stack([self.experts[int(i)](x[n]) * w[n, k]
+                            for n, row in enumerate(idx)
+                            for k, i in enumerate(row)]).sum(0)
+
 
 class FakeMixtralGate(nn.Module):
     """Returns raw logits like Mixtral/Qwen routers."""
