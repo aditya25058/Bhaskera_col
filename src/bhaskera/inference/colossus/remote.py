@@ -46,10 +46,12 @@ class RangeFetcher:
         except Exception as e:
             raise IOError(f"range fetch {url} [{start},{end}) failed: "
                           f"{type(e).__name__}: {e}") from e
+        want = end - start
+        if len(data) != want:
+            raise IOError(f"range fetch {url}: short read {len(data)}/{want} "
+                          f"(status {r.status})")
         self.requests += 1
         self.bytes += len(data)
-        if len(data) != end - start and r.status == 206:
-            raise IOError(f"range fetch {url}: short read {len(data)}/{end - start}")
         return data
 
 
@@ -149,8 +151,10 @@ class RemoteShardHandles:
         if key not in self.weight_map:
             raise KeyError(f"unknown weight key: {key}")
         info = self.header(key)
+        b, e = info["data_offsets"]
+        expect = e - b  # exact byte span (also guards partial files)
         p = self._key_path(key)
-        if os.path.exists(p):
+        if os.path.exists(p) and os.path.getsize(p) == expect:
             with open(p, "rb") as f:
                 raw = f.read()
             self.disk_bytes += len(raw)
@@ -159,6 +163,12 @@ class RemoteShardHandles:
             return torch.frombuffer(bytearray(raw),
                                     dtype=_safetensors_dtype(info.get("dtype", "BF16"))
                                     ).reshape(info["shape"])
+        elif os.path.exists(p):
+            # partial file from an interrupted fetch: drop and refetch
+            try:
+                os.remove(p)
+            except FileNotFoundError:
+                pass
         # cold: fetch exact data span, verify once, store
         self.misses += 1
         shard = self.weight_map[key]
