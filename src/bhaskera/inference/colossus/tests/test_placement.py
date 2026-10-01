@@ -12,7 +12,7 @@ import torch
 import torch.nn.functional as F
 
 from bhaskera.inference.colossus.interface import MoELayerSpec
-from bhaskera.inference.colossus.placement import TieredMoEWrapper
+from bhaskera.inference.colossus.placement import TieredMoEWrapper, wrap_moe_layers
 from bhaskera.inference.colossus.tests.test_interface import (
     FakeDeepSeekBlock,
     FakeMixtralBlock,
@@ -113,3 +113,79 @@ def test_prefetch_admission_and_suppress():
     w2 = _make(block, zssr_prefetch=True, prefetch_topk=4, prefetch_conf=0.0)
     pred = w2.zssr_prefetch(x)
     assert len(pred) > 0 and w2.zssr_predictions > 0
+
+
+class FakeDecoderLayer(nn.Module):
+    def __init__(self, block):
+        super().__init__()
+        self.attn = nn.Identity()
+        self.mlp = block
+
+    def forward(self, x):
+        return self.mlp(self.attn(x)) + x
+
+
+class FakeMoEModel(nn.Module):
+    def __init__(self, n_layers=2):
+        super().__init__()
+        for i in range(n_layers):
+            setattr(self, f"layer{i}", FakeDecoderLayer(FakeDeepSeekBlock()))
+
+
+class FakeProfile:
+    decoder_layer_cls = FakeDecoderLayer
+
+
+class DictHandles:
+    """ShardHandles-shaped stub: weight_map + get_tensor from a table."""
+
+    def __init__(self, table):
+        self.table = table
+        self.weight_map = {k: "shard0" for k in table}
+
+    def get_tensor(self, key):
+        return self.table[key]
+
+
+def _wrapped_model(n_layers=2):
+    model = FakeMoEModel(n_layers)
+    table = {}
+    for name, mod in model.named_modules():
+        # expert weight dotted paths, e.g. layer0.mlp.experts.3.gate_proj.weight
+        if isinstance(mod, torch.nn.Linear) and ".experts." in name:
+            table[name] = mod.weight.detach().clone()
+    handles = DictHandles(table)
+    wrappers = wrap_moe_layers(model, FakeProfile(), handles,
+                               torch.device("cpu"), capacity=8,
+                               dma_stream=None)
+    return model, wrappers, table
+
+
+def test_wrap_replaces_all_moe_blocks():
+    model, wrappers, _ = _wrapped_model()
+    assert len(wrappers) == 2
+    assert isinstance(model.layer0.mlp, TieredMoEWrapper)
+    assert isinstance(model.layer1.mlp, TieredMoEWrapper)
+    assert wrappers[0].layer_idx == 0 and wrappers[1].layer_idx == 1
+
+
+def test_wrapped_model_matches_native():
+    torch.manual_seed(7)
+    ref = FakeMoEModel()
+    model = FakeMoEModel()
+    model.load_state_dict(ref.state_dict())
+    table = {}
+    for name, mod in model.named_modules():
+        if isinstance(mod, torch.nn.Linear) and ".experts." in name:
+            table[name] = mod.weight.detach().clone()
+    handles = DictHandles(table)
+    wrappers = wrap_moe_layers(model, FakeProfile(), handles,
+                               torch.device("cpu"), capacity=8,
+                               dma_stream=None)
+    x = torch.randn(1, 2, 16)
+    with torch.no_grad():
+        y_run, y_ref = model(x), ref(x)
+    # slot DMA path from identical values: tight tolerance (same math,
+    # expert-grouped summation order differs from native token order).
+    assert torch.allclose(y_run, y_ref, atol=1e-4)
+    assert sum(w.misses for w in wrappers) > 0
