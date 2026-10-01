@@ -35,11 +35,11 @@ class FakeDeepSeekGate(nn.Module):
 
     def __init__(self, hidden=16, n_exp=8, top_k=2):
         super().__init__()
-        self.w = nn.Linear(hidden, n_exp, bias=False)
+        self.weight = nn.Parameter(torch.randn(n_exp, hidden))
         self.top_k = top_k
 
     def forward(self, x):
-        s = F.softmax(self.w(x.float()), dim=-1)
+        s = F.softmax(F.linear(x.float(), self.weight), dim=-1)
         w, idx = torch.topk(s, k=self.top_k, dim=-1)
         w = w / w.sum(-1, keepdim=True)
         return idx, w.to(x.dtype), None
