@@ -18,7 +18,7 @@ import json
 import os
 import urllib.request
 from collections import OrderedDict
-from typing Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import torch
 
