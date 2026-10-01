@@ -102,13 +102,16 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--missing-col-ratio", type=float, default=None,
                    help="Missing column fraction for SA-FFN (e.g. 0.50, 0.25, 0.10)")
 
-    # COLOSSUS huge-model tiers (models larger than HBM; default off)
-    p.add_argument("--offload-tier", default="off", choices=["off", "slots", "cpu"],
+    # COLOSSUS huge-model tiers (models larger than HBM; default off).
+    # Flag defaults are None so YAML config values apply when flags are absent.
+    p.add_argument("--offload-tier", default=None, choices=["off", "slots", "cpu"],
                    help="Tiered MoE execution: slots (bitwise, GPU) | cpu (ulp1, oneDNN)")
-    p.add_argument("--capacity", type=int, default=12,
+    p.add_argument("--capacity", type=int, default=None,
                    help="Dynamic expert slots per MoE layer (tiered paths)")
-    p.add_argument("--prefill-chunk", type=int, default=0,
+    p.add_argument("--prefill-chunk", type=int, default=None,
                    help="Chunked prefill size (0=single shot; bounds activation memory)")
+    p.add_argument("--exactness-mode", default=None, choices=["bitwise", "ulp1"],
+                   help="bitwise: GPU-only exact; ulp1: allow CPU placement")
 
     return p
 
@@ -246,10 +249,21 @@ def main(argv: List[str] = None) -> None:
     # ── COLOSSUS huge-model tier ─────────────────────────────────────
     # Models larger than HBM: meta-load, mmap residency, tiered execution.
     # Bypasses engine.generate (which assumes the model fits).
-    if args.offload_tier != "off":
+    # Resolution: explicit flags > YAML colossus.* > off/defaults.
+    _col = cfg.inference.colossus if hasattr(cfg.inference, "colossus") else None
+    _tier = args.offload_tier or (getattr(_col, "placement", "off") if _col else "off")
+    _cap = args.capacity if args.capacity is not None else (
+        getattr(_col, "capacity", 12) if _col else 12)
+    _chunk = args.prefill_chunk if args.prefill_chunk is not None else (
+        getattr(_col, "prefill_chunk", 0) if _col else 0)
+    _mode = args.exactness_mode or (getattr(_col, "exactness_mode", "bitwise")
+                                    if _col else "bitwise")
+    if _tier != "off":
         import os
         import torch
         os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+        if _tier == "cpu" and _mode != "ulp1":
+            parser.error("--offload-tier cpu needs --exactness-mode ulp1")
         from bhaskera.introspect import introspect_model
         from bhaskera.inference.colossus.loading import ShardHandles
         from bhaskera.inference.colossus.serve import serve_huge_moe
@@ -276,8 +290,8 @@ def main(argv: List[str] = None) -> None:
         res = serve_huge_moe(
             model, tokenizer, profile, handles, device, prompts,
             max_new_tokens=args.max_new_tokens or infer.max_new_tokens,
-            capacity=args.capacity, placement=args.offload_tier,
-            prefill_chunk=args.prefill_chunk)
+            capacity=_cap, placement=_tier,
+            prefill_chunk=_chunk)
         elapsed = time.perf_counter() - t0
         outputs = res["texts"]
         total_output_tokens = sum(_count_output_tokens(o, tokenizer) for o in outputs)

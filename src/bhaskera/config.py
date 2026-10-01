@@ -80,6 +80,18 @@ class ColossusConfig:
     # Number of hot experts to keep on GPU per layer during offloading.
     # Should be >= the model's top-k routing (6 for Param2, 8 for Qwen3).
     hot_expert_topk: int = 8
+    # Tiered huge-model execution (models larger than HBM; default off).
+    # placement: "off" | "slots" (bitwise GPU residency) | "cpu" (ulp1 oneDNN).
+    placement: str = "off"
+    capacity: int = 12
+    exactness_mode: str = "bitwise"
+    prefill_chunk: int = 0
+    # ZSSR prefetch (prediction moves data only; router keeps the decision).
+    prefetch: bool = False
+    prefetch_topk: int = 8
+    prefetch_conf: float = 0.0
+    cpu_threads: int = 6
+    audit_logits: str = ""
 
 
 @dataclass
@@ -438,6 +450,15 @@ def _dict_to_config(raw: dict) -> Config:
                 lru_slots_per_expert=int(col_raw.get("lru_slots_per_expert", 32)),
                 offload_enabled=bool(col_raw.get("offload_enabled", False)),
                 hot_expert_topk=int(col_raw.get("hot_expert_topk", 8)),
+                placement=str(col_raw.get("placement", "off")),
+                capacity=int(col_raw.get("capacity", 12)),
+                exactness_mode=str(col_raw.get("exactness_mode", "bitwise")),
+                prefill_chunk=int(col_raw.get("prefill_chunk", 0)),
+                prefetch=bool(col_raw.get("prefetch", False)),
+                prefetch_topk=int(col_raw.get("prefetch_topk", 8)),
+                prefetch_conf=float(col_raw.get("prefetch_conf", 0.0)),
+                cpu_threads=int(col_raw.get("cpu_threads", 6)),
+                audit_logits=str(col_raw.get("audit_logits", "")),
             ),
         ),
         monitoring=MonitoringConfig(

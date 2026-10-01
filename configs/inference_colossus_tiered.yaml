@@ -1,0 +1,46 @@
+# Bhaskera inference config — huge-MoE tiered serving (COLOSSUS).
+# ─────────────────────────────────────────────────────────────────
+# Serves models larger than HBM (e.g. DeepSeek-Coder-V2 236B / 471 GB BF16)
+# on a single GPU via tiered exact execution. Proven envelopes (1xH100):
+#   B=1 slots 0.6 tok/s bitwise · B=1 cpu 1.55 ulp1 · B=8 10.1 · B=64 38.6
+#
+# DECISION GUIDE (which placement; set ONE):
+#   fit-in-VRAM dense MoE ...... do NOT use tiers (plain bhaskera-infer + vLLM)
+#   200B+ MoE, exact required ... placement: slots   (bitwise torch.equal)
+#   200B+ MoE, 1.5 tok/s B=1 .... placement: cpu      (ulp1, needs exactness_mode)
+#   shared batch (eval/bulk) .... placement: slots + batch_size 8..64
+#   diverse batch ............... placement: cpu      (no eviction death)
+#   quantization acceptable ..... use KTransformers/llama.cpp instead (faster)
+#
+# RATIO METRIC: model_gb / resident_gb (236B: 471/60 = 8:1 slots).
+# See COLOSSUS_REPORT.md for the full account book (40 experiments).
+#
+# Run with:
+#   bhaskera-infer --config configs/inference_colossus_tiered.yaml \
+#                  --prompt "def quicksort(arr):"
+#   # or override: --offload-tier cpu --exactness-mode ulp1 --capacity 12
+
+model:
+  # Local sharded dir with model.safetensors.index.json (tiers need the index).
+  name: /models/DeepSeek-Coder-V2-Instruct
+  dtype: bfloat16
+  trust_remote_code: true
+
+inference:
+  max_new_tokens: 16
+  temperature: 0.0
+  top_p: 1.0
+  top_k: 0
+  do_sample: false
+  batch_size: 1
+  device: auto
+  colossus:
+    placement: slots        # off | slots (bitwise) | cpu (ulp1)
+    capacity: 12            # expert slots/layer; 36 triples coverage (same HBM in H2b)
+    exactness_mode: bitwise # bitwise (GPU-only) | ulp1 (allow CPU placement)
+    prefill_chunk: 0        # 0=single shot; 64 bounds activation memory
+    prefetch: false         # ZSSR prefetch (prediction moves data only)
+    prefetch_topk: 8
+    prefetch_conf: 0.0
+    cpu_threads: 6
+    audit_logits: ""        # path to dump per-position flip audit (B=1)
