@@ -120,14 +120,27 @@ class ShardHandles:
         return sorted(set(self.weight_map.values()))
 
 
+def set_module_tensor(model: torch.nn.Module, dotted: str, value: torch.Tensor) -> None:
+    """Version-proof replacement for transformers' removed
+    set_module_tensor_to_device: walk dotted path, replace param in-place."""
+    parts = dotted.split(".")
+    mod = model
+    for p in parts[:-1]:
+        mod = getattr(mod, p)
+    param = getattr(mod, parts[-1])
+    if isinstance(param, torch.nn.Parameter):
+        param.data = value.to(param.device, dtype=param.dtype)
+    else:
+        setattr(mod, parts[-1], value)
+
+
 def materialize(model: torch.nn.Module, keys: List[str], handles: ShardHandles,
                 device: torch.device, dtype: torch.dtype = torch.bfloat16) -> int:
     """Copy resident keys into the (meta/empty) model on device. Returns bytes."""
-    from transformers.modeling_utils import set_module_tensor_to_device
     nbytes = 0
     with torch.no_grad():
         for k in keys:
             t = handles.get_tensor(k)
             nbytes += t.nbytes
-            set_module_tensor_to_device(model, k, device, value=t.to(dtype))
+            set_module_tensor(model, k, t.to(device=device, dtype=dtype))
     return nbytes
