@@ -203,3 +203,49 @@ class RemoteShardHandles:
                 "hit_rate": (self.hits / total) if total else 0.0,
                 "cache_bytes": self._used_bytes,
                 "cache_cap_bytes": self.cache_cap_bytes}
+
+    @classmethod
+    def from_hub(cls, repo_id: str, revision: str = "main",
+                 cache_dir: Optional[str] = None,
+                 cache_cap_gb: float = 200.0,
+                 token: Optional[str] = None) -> "RemoteShardHandles":
+        """Build from a Hub repo: list shards, fetch headers, weight map.
+
+        No file is downloaded in full; only 8B + JSON headers per shard
+        travel here. Tensor bytes follow on demand via get_tensor().
+        """
+        from huggingface_hub import HfApi, hf_hub_url
+        api = HfApi(token=token)
+        files = sorted(f for f in api.list_repo_files(repo_id, revision=revision)
+                       if f.endswith(".safetensors"))
+        if not files:
+            raise ValueError(f"no safetensors shards in {repo_id}@{revision}")
+
+        class _HubFetch(RangeFetcher):
+            def get(self, path, start, end):
+                url = hf_hub_url(repo_id, path, revision=revision)
+                req = urllib.request.Request(
+                    url, headers={"Range": f"bytes={start}-{end - 1}"})
+                try:
+                    r = urllib.request.urlopen(req, timeout=120)
+                    if r.status not in (200, 206):
+                        raise IOError(f"HTTP {r.status}")
+                    data = r.read()
+                except Exception as e:
+                    raise IOError(f"hub range fetch {path} [{start},{end}): "
+                                  f"{type(e).__name__}: {e}") from e
+                self.requests += 1
+                self.bytes += len(data)
+                return data
+
+        fetcher = _HubFetch("")
+        weight_map: Dict[str, str] = {}
+        tmp = cls(weight_map, fetcher,
+                  cache_dir or f"/tmp/remote_cache_{repo_id.replace('/', '_')}",
+                  cache_cap_gb)
+        for fn in files:
+            header = tmp._shard_header(fn)
+            for k in header:
+                if k != "__metadata__":
+                    weight_map[k] = fn
+        return tmp
