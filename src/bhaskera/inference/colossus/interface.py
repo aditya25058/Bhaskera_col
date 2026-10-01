@@ -26,6 +26,71 @@ import torch.nn.functional as F
 GATE_DEEPSEEK_3TUPLE = "deepseek_3tuple"
 GATE_LOGITS = "logits"
 
+# Expert-container attribute names across architectures.
+EXPERT_CONTAINERS = ("experts", "local_experts", "routed_experts")
+
+# Projection-role hints over parameter leaf names, in priority order.
+# SwiGLU: gate/up/down (DeepSeek/Qwen/Llama-MoE), w1/w3/w2 (Mixtral).
+ROLE_HINTS = {
+    "gate": ("gate_proj", "gate", "w1", "wi"),
+    "up": ("up_proj", "up", "w3", "w0"),
+    "down": ("down_proj", "down", "w2", "wo"),
+}
+
+
+def experts_of(moe_block: Any) -> Tuple[str, Sequence[nn.Module]]:
+    """(container_attr, expert_modules) trying known container names."""
+    for attr in EXPERT_CONTAINERS:
+        if hasattr(moe_block, attr):
+            return attr, list(getattr(moe_block, attr))
+    raise AttributeError(
+        f"MoE block {type(moe_block).__name__} has no expert container "
+        f"(tried {EXPERT_CONTAINERS})")
+
+
+# MoE-block attribute names on decoder layers across architectures.
+MOE_BLOCK_ATTRS = ("mlp", "block_sparse_moe", "moe", "sparse_moe")
+
+
+def find_moe_block(decoder_layer: Any) -> Optional[Tuple[str, Any]]:
+    """(attr, block) for the first attr holding an experts container; None."""
+    for attr in MOE_BLOCK_ATTRS:
+        block = getattr(decoder_layer, attr, None)
+        if block is None:
+            continue
+        try:
+            experts_of(block)
+            return attr, block
+        except AttributeError:
+            continue
+    return None
+
+
+def expert_weight_keys(expert_dotted: str, weight_keys) -> dict:
+    """{gate|up|down: full key} for one expert's dotted path.
+
+    Prefers ".weight"-suffixed entries on ambiguity; raises KeyError listing
+    what was found when a role is missing (explicit > silent miss).
+    """
+    prefix = expert_dotted + "."
+    cands: dict = {}
+    for k in weight_keys:
+        if not k.startswith(prefix):
+            continue
+        role = classify_role(k[len(prefix):])
+        if role is None:
+            continue
+        cands.setdefault(role, []).append(k)
+    out = {}
+    for role, ks in cands.items():
+        w = [k for k in ks if k.endswith(".weight")] or sorted(ks)
+        out[role] = w[0]
+    missing = {"gate", "up", "down"} - set(out)
+    if missing:
+        raise KeyError(f"expert {expert_dotted}: missing roles {sorted(missing)} "
+                       f"(saw {sorted(cands)})")
+    return out
+
 
 def find_proj(expert: nn.Module, *name_hints: str) -> nn.Linear:
     """Locate a projection Linear inside an expert by name hints.
@@ -49,6 +114,15 @@ def detect_gate_style(moe_block: Any) -> str:
     return GATE_LOGITS
 
 
+def classify_role(relname: str) -> Optional[str]:
+    """Map an expert-relative param name to gate/up/down (None if unknown)."""
+    low = relname.lower()
+    for role, hints in ROLE_HINTS.items():
+        if any(h in low for h in hints):
+            return role
+    return None
+
+
 @dataclass
 class MoELayerSpec:
     """Uniform, model-agnostic view of one MoE layer."""
@@ -61,10 +135,11 @@ class MoELayerSpec:
     hidden: int
     inter: int
     dtype: torch.dtype
+    container_attr: str = "experts"
 
     @classmethod
     def from_block(cls, moe_block: Any, top_k: Optional[int] = None) -> "MoELayerSpec":
-        experts = list(moe_block.experts)
+        container_attr, experts = experts_of(moe_block)
         gate = getattr(moe_block, "gate", None)
         if gate is None:
             raise AttributeError("MoE block has no gate/router module")
@@ -85,7 +160,7 @@ class MoELayerSpec:
         return cls(experts=experts, gate=gate, gate_style=style, shared=shared,
                    top_k=top_k, n_routed=len(experts),
                    hidden=g0.weight.shape[1], inter=g0.weight.shape[0],
-                   dtype=g0.weight.dtype)
+                   dtype=g0.weight.dtype, container_attr=container_attr)
 
     def route(self, hidden_2d: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Unified routing -> (topk_idx [N,K] long, topk_weight [N,K])."""

@@ -15,6 +15,10 @@ from bhaskera.inference.colossus.interface import (
     GATE_DEEPSEEK_3TUPLE,
     GATE_LOGITS,
     MoELayerSpec,
+    classify_role,
+    expert_weight_keys,
+    experts_of,
+    find_moe_block,
     find_proj,
 )
 
@@ -137,3 +141,60 @@ def test_missing_gate_raises():
     m.experts = nn.ModuleList([FakeExpert()])
     with pytest.raises(AttributeError):
         MoELayerSpec.from_block(m)
+
+
+class FakeLayerMlp(nn.Module):
+    def __init__(self, block):
+        super().__init__()
+        self.mlp = block
+
+
+class FakeLayerSparse(nn.Module):
+    def __init__(self, block):
+        super().__init__()
+        self.attn = nn.Linear(4, 4)
+        self.block_sparse_moe = block
+
+
+def test_find_moe_block():
+    assert find_moe_block(FakeLayerMlp(FakeDeepSeekBlock()))[0] == "mlp"
+    assert find_moe_block(FakeLayerSparse(FakeMixtralBlock()))[0] == "block_sparse_moe"
+    assert find_moe_block(nn.Linear(2, 2)) is None
+
+
+def test_experts_of_local_container():
+    m = nn.Module()
+    m.local_experts = nn.ModuleList([FakeExpert(), FakeExpert()])
+    attr, mods = experts_of(m)
+    assert attr == "local_experts" and len(mods) == 2
+    with pytest.raises(AttributeError):
+        experts_of(nn.Linear(2, 2))
+
+
+def test_classify_role():
+    assert classify_role("gate_proj.weight") == "gate"
+    assert classify_role("up_proj.weight") == "up"
+    assert classify_role("down_proj.weight") == "down"
+    assert classify_role("w1.weight") == "gate"
+    assert classify_role("w3.weight") == "up"
+    assert classify_role("w2.weight") == "down"
+    assert classify_role("bias") is None
+
+
+def test_expert_weight_keys():
+    keys = [
+        "model.layers.5.mlp.experts.3.gate_proj.weight",
+        "model.layers.5.mlp.experts.3.up_proj.weight",
+        "model.layers.5.mlp.experts.3.down_proj.weight",
+        "model.layers.5.mlp.experts.3.gate_proj.bias",
+        "model.layers.5.mlp.experts.4.gate_proj.weight",
+        "model.layers.5.mlp.gate.weight",
+    ]
+    out = expert_weight_keys("model.layers.5.mlp.experts.3", keys)
+    assert out == {
+        "gate": "model.layers.5.mlp.experts.3.gate_proj.weight",
+        "up": "model.layers.5.mlp.experts.3.up_proj.weight",
+        "down": "model.layers.5.mlp.experts.3.down_proj.weight",
+    }
+    with pytest.raises(KeyError):
+        expert_weight_keys("model.layers.5.mlp.experts.9", keys)
