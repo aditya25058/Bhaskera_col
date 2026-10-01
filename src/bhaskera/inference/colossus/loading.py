@@ -19,7 +19,7 @@ import json
 import mmap
 import os
 import re
-from typing Dict, List, Tuple
+from typing import Dict, List, Tuple
 
 import torch
 
