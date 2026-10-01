@@ -14,6 +14,45 @@ import torch
 from .loading import ShardHandles, materialize, split_routed
 from .placement import TieredMoEWrapper, wrap_moe_layers
 
+_compat_installed = False
+
+
+def install_cache_compat() -> None:
+    """Polyfills for modeling code written against older transformers cache APIs.
+
+    Some custom modeling files (e.g. DeepSeek-V2) call
+    `DynamicCache.get_usable_length` and expect a non-None causal 4D mask.
+    Both shims are idempotent and model-agnostic in form.
+    """
+    global _compat_installed
+    if _compat_installed:
+        return
+    import torch as _torch
+    from transformers.cache_utils import DynamicCache as _DC
+    from transformers.modeling_attn_mask_utils import AttentionMaskConverter as _AMC
+
+    def _get_usable_length(self, *args, **kwargs):
+        layer_idx = 0
+        if len(args) > 1 and isinstance(args[1], int):
+            layer_idx = args[1]
+        elif "layer_idx" in kwargs:
+            layer_idx = kwargs["layer_idx"]
+        return self.get_seq_length(layer_idx)
+
+    _DC.get_usable_length = _get_usable_length
+    _orig = _AMC.to_causal_4d
+
+    def _patched_to_causal_4d(self, batch_size, query_length, key_value_length,
+                              dtype, device="cpu"):
+        mask = _orig(self, batch_size, query_length, key_value_length, dtype, device)
+        if mask is None:
+            mask = _torch.zeros((batch_size, 1, query_length, key_value_length),
+                                dtype=dtype, device=device)
+        return mask
+
+    _AMC.to_causal_4d = _patched_to_causal_4d
+    _compat_installed = True
+
 
 def prepare_model(model: torch.nn.Module, profile: Any, handles: ShardHandles,
                   device: torch.device, capacity: int,
@@ -58,6 +97,7 @@ def serve_huge_moe(model, tokenizer, profile, handles: ShardHandles,
     """Greedy lockstep serve with ledger. Returns results dict."""
     from transformers.cache_utils import DynamicCache
 
+    install_cache_compat()
     wrappers = prepare_model(model, profile, handles, device, capacity,
                              placement=placement,
                              dma_stream=(torch.cuda.Stream(device=device)
