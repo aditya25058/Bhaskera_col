@@ -29,13 +29,14 @@ def fake_model_dir(tmp_path):
     d.mkdir()
     g = torch.randn(4, 8, dtype=torch.bfloat16)
     wm, shard0, shard1 = {}, {}, {}
-    shard0["model.layers.0.self_attn.q_proj.weight"] = g
-    shard0["model.layers.1.mlp.experts.0.gate_proj.weight"] = g
-    shard0["model.layers.1.mlp.experts.3.up_proj.weight"] = g
-    shard0["model.layers.1.mlp.shared_experts.gate_proj.weight"] = g
-    shard1["model.layers.1.mlp.experts.1.down_proj.weight"] = g
-    shard1["model.layers.2.mlp.local_experts.0.gate_proj.weight"] = g
-    shard1["model.embed_tokens.weight"] = g
+    # NOTE: distinct clones per entry (safetensors rejects shared storage).
+    shard0["model.layers.0.self_attn.q_proj.weight"] = g.clone()
+    shard0["model.layers.1.mlp.experts.0.gate_proj.weight"] = g.clone()
+    shard0["model.layers.1.mlp.experts.3.up_proj.weight"] = g.clone()
+    shard0["model.layers.1.mlp.shared_experts.gate_proj.weight"] = g.clone()
+    shard1["model.layers.1.mlp.experts.1.down_proj.weight"] = g.clone()
+    shard1["model.layers.2.mlp.local_experts.0.gate_proj.weight"] = g.clone()
+    shard1["model.embed_tokens.weight"] = g.clone()
     shard1["a.weight"] = torch.randn(4, 8, dtype=torch.bfloat16)
     save_file(shard0, str(d / "model-00001-of-00002.safetensors"))
     save_file(shard1, str(d / "model-00002-of-00002.safetensors"))
@@ -67,11 +68,17 @@ def test_split_routed(fake_model_dir):
 
 
 def test_shard_views_exact(fake_model_dir):
+    from safetensors import safe_open
     d, g = fake_model_dir
     h = ShardHandles.open(d)
     assert len(h.shards()) == 2
-    t = h.get_tensor("model.layers.1.mlp.experts.0.gate_proj.weight")
-    assert torch.equal(t, g)
+    key = "model.layers.1.mlp.experts.0.gate_proj.weight"
+    t = h.get_tensor(key)
+    with safe_open(os.path.join(d, "model-00001-of-00002.safetensors"),
+                   framework="pt", device="cpu") as fh:
+        ref = fh.get_tensor(key)
+    assert torch.equal(t.cpu(), ref.cpu())
+    assert t.shape == (4, 8)
 
 
 def test_materialize_into_empty_model(fake_model_dir):
