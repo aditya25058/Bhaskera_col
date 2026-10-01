@@ -21,18 +21,34 @@ from .interface import MoELayerSpec
 
 
 class FastSlot(nn.Module):
-    """HBM slot holding one whole expert (gate/up [I,H], down [H,I])."""
+    """HBM slot holding one whole expert (gate/up [I,H], down [H,I]).
+
+    Gated SwiGLU-family form; activation from spec (silu/gelu/relu).
+    Non-gated (up+down only) experts are outside this contract.
+    """
 
     def __init__(self, hidden: int, inter: int, device: torch.device,
-                 dtype: torch.dtype = torch.bfloat16):
+                 dtype: torch.dtype = torch.bfloat16,
+                 activation: str = "silu"):
         super().__init__()
         self.gate_proj = nn.Linear(hidden, inter, bias=False, device=device, dtype=dtype)
         self.up_proj = nn.Linear(hidden, inter, bias=False, device=device, dtype=dtype)
         self.down_proj = nn.Linear(inter, hidden, bias=False, device=device, dtype=dtype)
+        self.activation = activation
         self.requires_grad_(False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+        return self.down_proj(apply_gate(self.gate_proj(x), self.up_proj(x),
+                                         self.activation))
+
+
+def apply_gate(g: torch.Tensor, u: torch.Tensor, activation: str) -> torch.Tensor:
+    """Gated activation shared by slot and CPU paths (one definition)."""
+    if activation == "gelu":
+        return F.gelu(g) * u
+    if activation == "relu":
+        return F.relu(g) * u
+    return F.silu(g) * u
 
 
 class TieredMoEWrapper(nn.Module):
@@ -82,7 +98,7 @@ class TieredMoEWrapper(nn.Module):
         self.gate = spec.gate
         self.shared_experts = spec.shared
         self.slots: List[nn.Module] = nn.ModuleList([
-            FastSlot(spec.hidden, spec.inter, device, spec.dtype)
+            FastSlot(spec.hidden, spec.inter, device, spec.dtype, spec.activation)
             for _ in range(capacity)
         ])
         self.slot_to_expert: Dict[int, int] = {}
@@ -191,13 +207,15 @@ class TieredMoEWrapper(nn.Module):
             for k in range(TI.shape[1]):
                 groups.setdefault(int(TI[b, k]), []).append((b, k))
         out = torch.zeros_like(flat)
+        act = self.spec.activation
         for e, poses in groups.items():
             w = self._cpu_weights(e)
             rows = torch.tensor([b for b, _ in poses])
             xe = flat[rows]
             with torch.no_grad():
-                ye = F.linear(F.silu(F.linear(xe, w["gate"])) *
-                              F.linear(xe, w["up"]), w["down"])
+                ye = F.linear(apply_gate(F.linear(xe, w["gate"]),
+                                         F.linear(xe, w["up"]), act),
+                              w["down"])
             for (b, k), yrow in zip(poses, ye):
                 out[b] += yrow * TW[b, k]
         ret = shared_out + out.reshape(orig_shape).to(
