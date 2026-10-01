@@ -211,6 +211,10 @@ class TieredMoEWrapper(nn.Module):
         identity = hidden_states
         orig_shape = hidden_states.shape
         topk_indices, topk_weights = self.spec.route(hidden_states)
+        # Dispatch math is 2D [N, K] regardless of gate rank conventions.
+        K = topk_indices.shape[-1]
+        topk_indices = topk_indices.reshape(-1, K)
+        topk_weights = topk_weights.reshape(-1, K)
         needed_experts = topk_indices.unique().tolist()
         if self.routing_log is not None:
             self.routing_log.append((self.layer_idx, needed_experts))
