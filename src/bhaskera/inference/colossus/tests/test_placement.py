@@ -132,6 +132,11 @@ class FakeMoEModel(nn.Module):
         for i in range(n_layers):
             setattr(self, f"layer{i}", FakeDecoderLayer(FakeDeepSeekBlock()))
 
+    def forward(self, x):
+        for i in range(2):
+            x = getattr(self, f"layer{i}")(x)
+        return x
+
 
 class FakeProfile:
     decoder_layer_cls = FakeDecoderLayer
