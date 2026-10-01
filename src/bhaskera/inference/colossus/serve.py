@@ -7,7 +7,7 @@ Model-agnostic: no names, no templates, no architecture branches.
 from __future__ import annotations
 
 import time
-from typing Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
 
