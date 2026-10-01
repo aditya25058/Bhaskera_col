@@ -11,6 +11,7 @@ from .interface import GATE_DEEPSEEK_3TUPLE, GATE_LOGITS, MoELayerSpec, find_pro
 from .interface import classify_role, expert_weight_keys, experts_of, find_moe_block
 from .loading import ShardHandles, ShardMap, is_routed_expert_key, materialize, split_routed
 from .placement import FastSlot, TieredMoEWrapper, wrap_moe_layers
+from .inspector import describe_model, inspect_weights, write_inspect_json
 from .serve import install_cache_compat, prepare_model, serve_huge_moe
 
 __all__ = [
@@ -30,6 +31,9 @@ __all__ = [
     "FastSlot",
     "TieredMoEWrapper",
     "wrap_moe_layers",
+    "describe_model",
+    "inspect_weights",
+    "write_inspect_json",
     "install_cache_compat",
     "prepare_model",
     "serve_huge_moe",
