@@ -129,7 +129,13 @@ class ShardHandles:
         return sm.view_tensor(key), sm.header[key]
 
     def header(self, key: str) -> dict:
-        return self.header_view(key)[1]
+        """Header info only (no tensor materialization)."""
+        shard = self.weight_map[key]
+        sm = self._maps.get(shard)
+        if sm is None:
+            sm = ShardMap.get(os.path.join(self.model_dir, shard))
+            self._maps[shard] = sm
+        return sm.header[key]
 
     def shards(self) -> List[str]:
         return sorted(set(self.weight_map.values()))
