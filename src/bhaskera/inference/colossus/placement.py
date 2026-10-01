@@ -183,8 +183,9 @@ class TieredMoEWrapper(nn.Module):
         t0 = time.perf_counter()
         x_cpu = hidden_states.detach().to("cpu")
         flat = x_cpu.reshape(-1, x_cpu.shape[-1])
-        TI = topk_indices.cpu()
-        TW = topk_weights.cpu()
+        K = topk_indices.shape[-1]
+        TI = topk_indices.reshape(-1, K).cpu()
+        TW = topk_weights.reshape(-1, K).cpu()
         groups: Dict[int, list] = {}
         for b in range(TI.shape[0]):
             for k in range(TI.shape[1]):
@@ -209,8 +210,7 @@ class TieredMoEWrapper(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         identity = hidden_states
         orig_shape = hidden_states.shape
-        topk_indices, topk_weights = self.spec.route(
-            hidden_states.reshape(-1, hidden_states.shape[-1]))
+        topk_indices, topk_weights = self.spec.route(hidden_states)
         needed_experts = topk_indices.unique().tolist()
         if self.routing_log is not None:
             self.routing_log.append((self.layer_idx, needed_experts))

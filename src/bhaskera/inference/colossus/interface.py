@@ -162,19 +162,26 @@ class MoELayerSpec:
                    hidden=g0.weight.shape[1], inter=g0.weight.shape[0],
                    dtype=g0.weight.dtype, container_attr=container_attr)
 
-    def route(self, hidden_2d: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Unified routing -> (topk_idx [N,K] long, topk_weight [N,K])."""
+    def route(self, hidden: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Unified routing -> (topk_idx, topk_weight), rank mirrors input.
+
+        DeepSeek-style gates consume the tensor as given (often 3D); logits
+        gates flatten, top-k, then restore the leading shape.
+        """
         if self.gate_style == GATE_DEEPSEEK_3TUPLE:
-            out = self.gate(hidden_2d)
+            out = self.gate(hidden)
             idx, w = out[0], out[1]
-            return idx.long(), w.to(hidden_2d.dtype)
-        logits = self.gate(hidden_2d)
+            return idx.long(), w.to(hidden.dtype)
+        lead = hidden.shape[:-1]
+        flat = hidden.reshape(-1, hidden.shape[-1])
+        logits = self.gate(flat)
         if logits.dim() > 2:
             logits = logits.view(-1, logits.shape[-1])
         scores = F.softmax(logits.float(), dim=-1)
         w, idx = torch.topk(scores, k=self.top_k, dim=-1)
         w = w / w.sum(dim=-1, keepdim=True).clamp(min=1e-9)
-        return idx.long(), w.to(hidden_2d.dtype)
+        return (idx.long().view(*lead, self.top_k),
+                w.to(hidden.dtype).view(*lead, self.top_k))
 
     def router_weight(self) -> Optional[torch.Tensor]:
         """Detached fp32 router matrix for ZSSR probing (None if absent)."""
