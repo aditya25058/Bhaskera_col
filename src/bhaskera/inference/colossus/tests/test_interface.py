@@ -57,10 +57,15 @@ class FakeDeepSeekBlock(nn.Module):
         self.shared_experts = FakeExpert(hidden)
         self.num_experts_per_tok = top_k
 
-    def moe_infer(self, x, idx, w):
-        return torch.stack([self.experts[int(i)](x[n]) * w[n, k]
-                            for n, row in enumerate(idx)
-                            for k, i in enumerate(row)]).sum(0)
+    def forward(self, x):
+        idx, w, _ = self.gate(x.view(-1, x.shape[-1]))
+        flat = x.reshape(-1, x.shape[-1])
+        out = torch.zeros_like(flat)
+        for n in range(idx.shape[0]):
+            for k in range(idx.shape[1]):
+                e = int(idx[n, k])
+                out[n] += self.experts[e](flat[n]) * w[n, k]
+        return self.shared_experts(x) + out.view(*x.shape)
 
 
 class FakeMixtralGate(nn.Module):
