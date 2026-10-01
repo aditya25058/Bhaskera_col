@@ -143,7 +143,7 @@ def test_eviction_stays_exact(served_shard, tmp_path):
 
 
 def test_offline_uncached_raises(served_shard, tmp_path):
-    _, wm, _ = served_shard
+    base_url, wm, _ = served_shard
     r = _remote("http://127.0.0.1:9", wm, str(tmp_path / "c4"))  # dead port
     k = list(wm)[0]
     with pytest.raises(IOError):
