@@ -248,4 +248,6 @@ class RemoteShardHandles:
             for k in header:
                 if k != "__metadata__":
                     weight_map[k] = fn
+        # __init__ copied the (then-empty) map; rebind the filled one.
+        tmp.weight_map = weight_map
         return tmp
