@@ -136,6 +136,10 @@ Net diff: **−1016 lines** across `rudra/serve_deepseek_colossus.py`, `src/bhas
 
 **Fused-kernel sizing (not recommended):** coalesced staging ≈ 2–5%/token; full step capture blocked by dynamic hit/miss control flow. CPU gap fully accounted; GPU gap is launch/sync only.
 
+## 14. Bhaskera-infer parity (chunk 2c proof, 2026-10-01)
+
+236B DeepSeek-Coder-V2 served through `bhaskera.launcher.infer --offload-tier slots` (profile-driven port, zero model names): **0.6 tok/s decode, hits 693 / misses 6629 / DMA 298 GB / 60.09 GB VRAM, correct quicksort text** — counters, VRAM, and rate all identical to the research scaffold. Two port bugs found by the gate itself: rank-flattened gate input (DeepSeek gate needs 3D) and per-miss `safe_open` opens (+40 s; fixed with persistent handles). Remaining wall delta is one-time load/materialize (untimed by both harnesses' decode metrics).
+
 **Host bandwidth (measured, quiet window load 0.02):** OpenMP STREAM-class triad **92 GB/s/socket**, symmetric — not 320 (hardware reality, no latent bandwidth; GEMV util 67–92 GB/s ≈ 100% of achievable). The CPU path is bandwidth-optimal for this box.
 
 ## 11. C-1 — Hot-column prefetch: columns as the risk unit (2026-09-24, commits `4d127a8`, `ae2ed3a`)
