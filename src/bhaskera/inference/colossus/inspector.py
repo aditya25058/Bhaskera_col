@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import os
-from typing Any, Dict, Optional
+from typing import Any, Dict, Optional
 
 from .loading import ShardHandles, is_routed_expert_key, split_routed
 from .interface import classify_role
