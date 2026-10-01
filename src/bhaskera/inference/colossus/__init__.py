@@ -26,6 +26,7 @@ from __future__ import annotations
 
 from .columns import columns_batched, columns_loop, stack_expert_weights
 from .directory import ColumnDirectory, plan_fixed_packets
+from .interface import GATE_DEEPSEEK_3TUPLE, GATE_LOGITS, MoELayerSpec, find_proj
 from .sa_ffn import dense_expert_forward, sa_expert_forward, verify_lossless
 from .predictor import ZSSRPredictor, quantize_int8
 
@@ -37,6 +38,10 @@ __all__ = [
     "stack_expert_weights",
     "ColumnDirectory",
     "plan_fixed_packets",
+    "MoELayerSpec",
+    "find_proj",
+    "GATE_DEEPSEEK_3TUPLE",
+    "GATE_LOGITS",
     "dense_expert_forward",
     "sa_expert_forward",
     "verify_lossless",
