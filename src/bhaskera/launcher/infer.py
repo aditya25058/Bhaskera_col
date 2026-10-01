@@ -102,6 +102,14 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--missing-col-ratio", type=float, default=None,
                    help="Missing column fraction for SA-FFN (e.g. 0.50, 0.25, 0.10)")
 
+    # COLOSSUS huge-model tiers (models larger than HBM; default off)
+    p.add_argument("--offload-tier", default="off", choices=["off", "slots", "cpu"],
+                   help="Tiered MoE execution: slots (bitwise, GPU) | cpu (ulp1, oneDNN)")
+    p.add_argument("--capacity", type=int, default=12,
+                   help="Dynamic expert slots per MoE layer (tiered paths)")
+    p.add_argument("--prefill-chunk", type=int, default=0,
+                   help="Chunked prefill size (0=single shot; bounds activation memory)")
+
     return p
 
 
@@ -234,6 +242,61 @@ def main(argv: List[str] = None) -> None:
 
     # ── Config ───────────────────────────────────────────────────────
     cfg = _build_config(args)
+
+    # ── COLOSSUS huge-model tier ─────────────────────────────────────
+    # Models larger than HBM: meta-load, mmap residency, tiered execution.
+    # Bypasses engine.generate (which assumes the model fits).
+    if args.offload_tier != "off":
+        import torch
+        from bhaskera.introspect import introspect_model
+        from bhaskera.inference.colossus.loading import ShardHandles
+        from bhaskera.inference.colossus.serve import serve_huge_moe
+
+        model_dir = args.model
+        if not model_dir or not Path(model_dir).is_dir():
+            parser.error("--offload-tier needs --model <local sharded dir with "
+                         "model.safetensors.index.json>")
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        logger.info(f"Loading tokenizer + meta model from {model_dir} ...")
+        from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+        from accelerate import init_empty_weights
+        tokenizer = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
+        hf_cfg = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
+        with init_empty_weights():
+            model = AutoModelForCausalLM.from_config(
+                hf_cfg, trust_remote_code=True)
+        profile = introspect_model(model)
+        logger.info(f"Profile: {profile.num_experts} experts/layer, "
+                    f"top-{profile.experts_per_token}, "
+                    f"layer={getattr(profile.decoder_layer_cls, '__name__', '?')}")
+        handles = ShardHandles.open(model_dir)
+        t0 = time.perf_counter()
+        res = serve_huge_moe(
+            model, tokenizer, profile, handles, device, prompts,
+            max_new_tokens=args.max_new_tokens or infer.max_new_tokens,
+            capacity=args.capacity, placement=args.offload_tier,
+            prefill_chunk=args.prefill_chunk)
+        elapsed = time.perf_counter() - t0
+        outputs = res["texts"]
+        total_output_tokens = sum(_count_output_tokens(o, tokenizer) for o in outputs)
+        raw_outputs = []
+        for i, (prompt, output) in enumerate(zip(prompts, outputs)):
+            print(_render_output(i, len(prompts), prompt, output, False, args.show_thinking))
+            raw_outputs.append(output)
+        print(f"\n{SEP}")
+        print(f"Generated {len(prompts)} response(s) | {total_output_tokens} tokens | "
+              f"{elapsed:.2f}s | \033[1;32m{res['batch_decode_tps']:.1f} tok/s agg\033[0m")
+        print(f"COLOSSUS tier={res['placement']} C={res['capacity']} | "
+              f"hits={res['total_hits']} misses={res['total_misses']} | "
+              f"DMA={res['total_dma_mb']:.1f} MB | prefill={res['prefill_s']:.1f}s | "
+              f"Peak VRAM: {res['peak_vram_gb']:.2f} GB")
+        if args.output_file:
+            out_path = Path(args.output_file)
+            with open(out_path, "w") as f:
+                for raw in raw_outputs:
+                    f.write(raw.replace("\n", "\\n") + "\n")
+            logger.info(f"Raw outputs written to {args.output_file}")
+        return
 
     # ── Engine ───────────────────────────────────────────────────────
     from bhaskera.inference import InferenceEngine

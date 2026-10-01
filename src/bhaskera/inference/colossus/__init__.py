@@ -30,6 +30,7 @@ from .interface import GATE_DEEPSEEK_3TUPLE, GATE_LOGITS, MoELayerSpec, find_pro
 from .interface import classify_role, expert_weight_keys, experts_of, find_moe_block
 from .loading import ShardHandles, ShardMap, is_routed_expert_key, materialize, split_routed
 from .placement import FastSlot, TieredMoEWrapper, wrap_moe_layers
+from .serve import prepare_model, serve_huge_moe
 from .sa_ffn import dense_expert_forward, sa_expert_forward, verify_lossless
 from .predictor import ZSSRPredictor, quantize_int8
 
@@ -54,7 +55,9 @@ __all__ = [
     "split_routed",
     "FastSlot",
     "TieredMoEWrapper",
-    "wrap_moe_layers",    "GATE_DEEPSEEK_3TUPLE",
+    "wrap_moe_layers",
+    "prepare_model",
+    "serve_huge_moe",    "GATE_DEEPSEEK_3TUPLE",
     "GATE_LOGITS",
     "dense_expert_forward",
     "sa_expert_forward",
