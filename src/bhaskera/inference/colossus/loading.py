@@ -117,11 +117,19 @@ class ShardHandles:
         try:
             return self._safe_handle(shard).get_tensor(key)
         except Exception:
-            sm = self._maps.get(shard)
-            if sm is None:
-                sm = ShardMap.get(os.path.join(self.model_dir, shard))
-                self._maps[shard] = sm
-            return sm.view_tensor(key)
+            return self.header_view(key)[0]
+
+    def header_view(self, key: str):
+        """(tensor view, info dict) for a key without persistent handles."""
+        shard = self.weight_map[key]
+        sm = self._maps.get(shard)
+        if sm is None:
+            sm = ShardMap.get(os.path.join(self.model_dir, shard))
+            self._maps[shard] = sm
+        return sm.view_tensor(key), sm.header[key]
+
+    def header(self, key: str) -> dict:
+        return self.header_view(key)[1]
 
     def shards(self) -> List[str]:
         return sorted(set(self.weight_map.values()))
