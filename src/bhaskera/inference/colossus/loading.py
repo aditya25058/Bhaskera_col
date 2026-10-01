@@ -19,7 +19,7 @@ import json
 import mmap
 import os
 import re
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Tuple
 
 import torch
 
@@ -93,6 +93,7 @@ class ShardHandles:
         self.model_dir = model_dir
         self.weight_map = weight_map
         self._maps: Dict[str, ShardMap] = {}
+        self._safe: Dict[str, Any] = {}  # shard -> persistent safe_open handle
 
     @classmethod
     def open(cls, model_dir: str) -> "ShardHandles":
@@ -101,19 +102,25 @@ class ShardHandles:
             weight_map = json.load(f)["weight_map"]
         return cls(model_dir, weight_map)
 
+    def _safe_handle(self, shard: str):
+        """Persistent safe_open per shard (open once; per-call open costs ms)."""
+        h = self._safe.get(shard)
+        if h is None:
+            from safetensors import safe_open
+            h = safe_open(os.path.join(self.model_dir, shard),
+                          framework="pt", device="cpu")
+            self._safe[shard] = h
+        return h
+
     def get_tensor(self, key: str) -> torch.Tensor:
         shard = self.weight_map[key]
-        sm = self._maps.get(shard)
-        if sm is None:
-            sm = ShardMap.get(os.path.join(self.model_dir, shard))
-            self._maps[shard] = sm
-        # Prefer safetensors' own parsing when available (exact dtype/shape).
         try:
-            from safetensors import safe_open
-            with safe_open(os.path.join(self.model_dir, shard),
-                           framework="pt", device="cpu") as fh:
-                return fh.get_tensor(key)
+            return self._safe_handle(shard).get_tensor(key)
         except Exception:
+            sm = self._maps.get(shard)
+            if sm is None:
+                sm = ShardMap.get(os.path.join(self.model_dir, shard))
+                self._maps[shard] = sm
             return sm.view_tensor(key)
 
     def shards(self) -> List[str]:
