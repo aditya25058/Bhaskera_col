@@ -102,6 +102,19 @@ class ShardHandles:
             weight_map = json.load(f)["weight_map"]
         return cls(model_dir, weight_map)
 
+    @classmethod
+    def open_partial(cls, model_dir: str) -> "ShardHandles":
+        """Index-less: scan *.safetensors headers (partial checkouts welcome)."""
+        import glob
+        weight_map: Dict[str, str] = {}
+        for path in sorted(glob.glob(os.path.join(model_dir, "*.safetensors"))):
+            fn = os.path.basename(path)
+            sm = ShardMap.get(path)
+            for k in sm.header:
+                if k != "__metadata__":
+                    weight_map[k] = fn
+        return cls(model_dir, weight_map)
+
     def _safe_handle(self, shard: str):
         """Persistent safe_open per shard (open once; per-call open costs ms)."""
         h = self._safe.get(shard)
