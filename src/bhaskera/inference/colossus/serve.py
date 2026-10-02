@@ -93,6 +93,7 @@ def serve_huge_moe(model, tokenizer, profile, handles: ShardHandles,
                    placement: str = "slots", prefill_chunk: int = 0,
                    use_cache: bool = True, zssr: bool = False,
                    prefetch_topk: int = 8, prefetch_conf: float = 0.0,
+                   log_routing: Optional[str] = None,
                    ) -> Dict[str, Any]:
     """Greedy lockstep serve with ledger. Returns results dict."""
     from transformers.cache_utils import DynamicCache
@@ -146,6 +147,9 @@ def serve_huge_moe(model, tokenizer, profile, handles: ShardHandles,
     eos_id = tokenizer.eos_token_id
     new_counts = [1] * B
     latencies: List[float] = []
+    if log_routing:
+        for w in wrappers:
+            w.routing_log = []
     for step in range(max_new_tokens - 1):
         if device.type == "cuda":
             torch.cuda.synchronize(device)
@@ -184,6 +188,15 @@ def serve_huge_moe(model, tokenizer, profile, handles: ShardHandles,
     agg_tokens = sum(new_counts)
     peak = (torch.cuda.max_memory_allocated(device) / (1024 ** 3)
             if device.type == "cuda" else 0.0)
+    routing_steps = 0
+    if log_routing:
+        import json as _json
+        entries = [{"layer": lyr, "experts": exps}
+                   for w in wrappers for (lyr, exps) in (w.routing_log or [])]
+        with open(log_routing, "w") as f:
+            _json.dump(entries, f)
+        routing_steps = (len(wrappers[0].routing_log or [])
+                         if wrappers else 0)
     return {
         "texts": texts,
         "batch_size": B,
@@ -198,4 +211,5 @@ def serve_huge_moe(model, tokenizer, profile, handles: ShardHandles,
         "peak_vram_gb": peak,
         "placement": placement,
         "capacity": capacity,
+        "routing_log_steps": routing_steps,
     }

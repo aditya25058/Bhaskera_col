@@ -123,6 +123,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--local-mirror", default=None, metavar="DIR",
                    help="Partial local checkout: serve local-first, remote fills "
                         "the rest (TieredHandles; no index.json needed)")
+    p.add_argument("--log-routing", default=None, metavar="PATH",
+                   help="Dump per-layer per-step routing unions to JSON")
     p.add_argument("--remote-token", default=None, metavar="TOKEN",
                    help="Hub token for gated repos (or HF_TOKEN env)")
 
@@ -325,7 +327,7 @@ def main(argv: List[str] = None) -> None:
             model, tokenizer, profile, handles, device, prompts,
             max_new_tokens=args.max_new_tokens or infer.max_new_tokens,
             capacity=_cap, placement=_tier,
-            prefill_chunk=_chunk)
+            prefill_chunk=_chunk, log_routing=args.log_routing)
         elapsed = time.perf_counter() - t0
         outputs = res["texts"]
         total_output_tokens = sum(_count_output_tokens(o, tokenizer) for o in outputs)
