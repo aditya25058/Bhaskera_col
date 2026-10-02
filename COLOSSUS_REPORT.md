@@ -187,6 +187,8 @@ Net diff: **−1016 lines** across `rudra/serve_deepseek_colossus.py`, `src/bhas
 
 **Mock gates (localhost Range server, CPU-only, no network):** remote bytes == local bytes over all keys; warm pass performs **zero HTTP** (manifest+cache persist across instances); eviction under a 256-byte cap stays exact via refetch; offline+uncached raises the named hard error. **66/66 suite green.** Live-Hub validation held until mock path is reviewed; 17 GB stays a worked example with the `fetched/unique/total` headline metric.
 
+**Correction (from banked routing logs — the proof constraining the marketing):** single-step union (~354 experts ≈ 16 GB) is NOT run-level fetch. Decode-only union over a 27-token run = 5610 experts ≈ 247 GB + 24 GB resident (**271 of 471 GB**); B=8×8 shared = 103+24 GB. Routing churn (Jaccard 0.041) means cold fetch scales with run length. The honest remote value: no 471 GB upfront blob (stream into persistent cache, stop/resume free), cross-session cache persistence, smaller unions for shared batches, prefetch overlap — NOT a fixed small total. Live-gated DeepSeek validation pending a working Hub token (four 401s to date; Qwen public-repo path fully validated instead).
+
 ## 10. Path 3-0/3-1 — CPU expert compute + ulp1 exactness gate (2026-09-24, commits `d0fcc91`, `cc57cc9`)
 
 **Ceiling:** 6 experts × 47.2 MB × 59 layers ≈ 16.7 GB RAM-read/token; box measured 57–102 GB/s achievable (below 320 GB/s STREAM hope — cause undetermined, no resctrl cap; 4 GB swap in use). Only ~5% of wire speed needed to beat the 1585 ms/token baseline.
