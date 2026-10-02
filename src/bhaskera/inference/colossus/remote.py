@@ -214,6 +214,8 @@ class RemoteShardHandles:
                 "cache_bytes": self._used_bytes,
                 "cache_cap_bytes": self.cache_cap_bytes}
 
+    # -- TieredHandles is defined below (local-first composition). --
+
     @classmethod
     def from_hub(cls, repo_id: str, revision: str = "main",
                  cache_dir: Optional[str] = None,
@@ -263,3 +265,52 @@ class RemoteShardHandles:
         # __init__ copied the (then-empty) map; rebind the filled one.
         tmp.weight_map = weight_map
         return tmp
+
+
+class TieredHandles:
+    """Local-first composition: best of both paths (research branch).
+
+    Reads try local `ShardHandles` first (full speed, zero network), then
+    fall through to `RemoteShardHandles` (reach without full download).
+    Primary use: partial local checkouts (e.g. non-routed weights + some
+    experts on disk) with remote fill for the rest; fetched tensors persist
+    in the remote cache, so repeated runs converge to local speed.
+    Same surface as both backends; executors unchanged.
+    """
+
+    def __init__(self, local: Any, remote: RemoteShardHandles):
+        self.local = local
+        self.remote = remote
+        local_keys = set(local.weight_map.keys())
+        remote_keys = set(remote.weight_map.keys())
+        merged = dict(remote.weight_map)
+        merged.update(local.weight_map)
+        self.weight_map = merged
+        self._local_keys = local_keys
+        self.local_hits = 0
+        self.remote_hits = 0
+
+    def shards(self) -> List[str]:
+        return sorted(set(self.local.shards()) | set(self.remote.shards()))
+
+    def header(self, key: str) -> dict:
+        if key in self._local_keys:
+            return self.local.header(key)
+        return self.remote.header(key)
+
+    def get_tensor(self, key: str) -> torch.Tensor:
+        if key in self._local_keys:
+            try:
+                t = self.local.get_tensor(key)
+                self.local_hits += 1
+                return t
+            except Exception:
+                pass
+        self.remote_hits += 1
+        return self.remote.get_tensor(key)
+
+    def stats(self) -> Dict[str, Any]:
+        s = dict(self.remote.stats())
+        s["local_hits"] = self.local_hits
+        s["remote_hits"] = self.remote_hits
+        return s

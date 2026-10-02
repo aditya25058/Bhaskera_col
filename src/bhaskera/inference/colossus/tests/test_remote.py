@@ -17,7 +17,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import pytest
 import torch
 
-from bhaskera.inference.colossus.remote import RangeFetcher, RemoteShardHandles
+from bhaskera.inference.colossus.loading import ShardHandles
+from bhaskera.inference.colossus.remote import (
+    RangeFetcher,
+    RemoteShardHandles,
+    TieredHandles,
+)
 
 
 class RangeHandler(BaseHTTPRequestHandler):
@@ -152,3 +157,51 @@ def test_offline_uncached_raises(served_shard, tmp_path):
     r2 = _remote(base_url, wm, str(tmp_path / "c5"))
     r2.get_tensor(k)
     assert r2.stats()["misses"] == 1
+
+
+class PartialLocal:
+    """ShardHandles-shaped stub exposing only a subset of keys (simulates a
+    partial checkout: some tensors on disk, the rest remote-only)."""
+
+    def __init__(self, full: ShardHandles, keep):
+        self._full = full
+        self.weight_map = {k: v for k, v in full.weight_map.items() if k in keep}
+
+    def shards(self):
+        return sorted(set(self.weight_map.values()))
+
+    def header(self, key):
+        return self._full.header(key)
+
+    def get_tensor(self, key):
+        return self._full.get_tensor(key)
+
+
+def test_tiered_local_first_no_remote(served_shard, tmp_path):
+    base_url, wm, srvdir = served_shard
+    local = ShardHandles.open(srvdir)
+    keep = [list(wm)[0]]
+    r = RemoteShardHandles(dict(wm), RangeFetcher(base_url),
+                           str(tmp_path / "ct1"))
+    t = TieredHandles(PartialLocal(local, keep), r)
+    a = t.get_tensor(keep[0])
+    b = local.get_tensor(keep[0])
+    assert torch.equal(a.cpu(), b.cpu())
+    assert r.fetcher.requests == 0, "local-first must not touch network"
+    assert t.stats()["local_hits"] == 1
+
+
+def test_tiered_remote_fill_exact(served_shard, tmp_path):
+    base_url, wm, srvdir = served_shard
+    local = ShardHandles.open(srvdir)
+    keep = [list(wm)[0]]
+    r = RemoteShardHandles(dict(wm), RangeFetcher(base_url),
+                           str(tmp_path / "ct2"))
+    t = TieredHandles(PartialLocal(local, keep), r)
+    missing = [k for k in wm if k != keep[0]]
+    for k in missing:
+        assert torch.equal(t.get_tensor(k).cpu(), local.get_tensor(k).cpu()), k
+    s = t.stats()
+    assert s["remote_hits"] == len(missing)
+    # full union accounted across tiers
+    assert set(t.weight_map) == set(wm)

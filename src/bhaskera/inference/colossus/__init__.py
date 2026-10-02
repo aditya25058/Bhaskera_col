@@ -16,7 +16,7 @@ from .sa_ffn import dense_expert_forward, sa_expert_forward, verify_lossless
 from .predictor import ZSSRPredictor, quantize_int8
 from .loading import ShardHandles, ShardMap, is_routed_expert_key, materialize, split_routed
 from .placement import FastSlot, TieredMoEWrapper, apply_gate, wrap_moe_layers
-from .remote import RangeFetcher, RemoteShardHandles
+from .remote import RangeFetcher, RemoteShardHandles, TieredHandles
 from .inspector import describe_model, inspect_weights, write_inspect_json
 from .serve import install_cache_compat, prepare_model, serve_huge_moe
 
@@ -50,6 +50,7 @@ __all__ = [
     "apply_gate",
     "RangeFetcher",
     "RemoteShardHandles",
+    "TieredHandles",
     "wrap_moe_layers",
     "describe_model",
     "inspect_weights",
