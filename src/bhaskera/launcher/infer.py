@@ -120,6 +120,8 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Persistent local tensor cache for --remote-repo")
     p.add_argument("--remote-cap-gb", type=float, default=200.0,
                    help="Remote cache byte cap (LRU, GB)")
+    p.add_argument("--remote-token", default=None, metavar="TOKEN",
+                   help="Hub token for gated repos (or HF_TOKEN env)")
 
     return p
 
@@ -299,9 +301,11 @@ def main(argv: List[str] = None) -> None:
                     f"layer={getattr(profile.decoder_layer_cls, '__name__', '?')}")
         if remote:
             from bhaskera.inference.colossus.remote import RemoteShardHandles
+            import os as _os
             handles = RemoteShardHandles.from_hub(
                 remote, cache_dir=args.remote_cache,
-                cache_cap_gb=args.remote_cap_gb)
+                cache_cap_gb=args.remote_cap_gb,
+                token=args.remote_token or _os.environ.get("HF_TOKEN"))
         else:
             handles = ShardHandles.open(model_dir)
         t0 = time.perf_counter()

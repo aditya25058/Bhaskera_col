@@ -234,8 +234,10 @@ class RemoteShardHandles:
         class _HubFetch(RangeFetcher):
             def get(self, path, start, end):
                 url = hf_hub_url(repo_id, path, revision=revision)
-                req = urllib.request.Request(
-                    url, headers={"Range": f"bytes={start}-{end - 1}"})
+                headers = {"Range": f"bytes={start}-{end - 1}"}
+                if token:
+                    headers["Authorization"] = f"Bearer {token}"
+                req = urllib.request.Request(url, headers=headers)
                 try:
                     r = urllib.request.urlopen(req, timeout=120)
                     if r.status not in (200, 206):
