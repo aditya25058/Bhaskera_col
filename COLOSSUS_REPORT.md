@@ -181,6 +181,21 @@ Net diff: **−1016 lines** across `rudra/serve_deepseek_colossus.py`, `src/bhas
 
 **Artifacts (server):** `deepseek_h2b_smoke.json`, `deepseek_h2b_cov.json`, `deepseek_h2b_b8.json`.
 
+## 16. Multi-model: Lite dense-vs-offload + routing generality (2026-10-01)
+
+**DeepSeek-V2-Lite 16B (27 layers, 64 experts, top-6) via identical CLI, zero code changes:**
+
+| Path | tps | VRAM | Text |
+|---|---|---|---|
+| Dense (manual loop; `generate()` broken in both venvs — version skew) | 17.76 | 30.3 GB | `pivot = arr[0]` |
+| Offload slots C=12 | 2.0–5.1 (host variance) | 9.61 GB | `pivot = arr[0]` (identical) |
+
+Offload trades 3–9× speed for 3× memory on a model that fits — optional here, the only option at 236B. Bitwise agreement across paths on shared text.
+
+**Routing generality (Exp 39 within family):** Lite consecutive-Jaccard **0.103** (vs 0.041 @236B), K=8 union 5.18× → SVB oracle ceiling 1.54×. Same structural pattern (disjoint consecutive routing), slightly stickier at small scale. Speculative family stays closed family-wide.
+
+**Integration note:** `generate()`-based dense paths fail on both transformers 4.57 and 5.12 against these modeling files (`seen_tokens`, mask size) — custom-model `generate` is fragile to version drift while the manual prefill/decode loop (as in `serve.py`) is robust. Upstream `engine.generate` needs the same compat attention before it can serve custom MoE modeling files.
+
 ## 15. Phase B (mock-first): remote-backed serving without full download
 
 **Design:** `RemoteShardHandles` mirrors the `ShardHandles` surface over HTTP Range + persistent content-addressed cache (verify-once, LRU byte-cap eviction, offline named errors, cold/warm split stats). Executors untouched by construction. Full spec in `docs/remote_handles_spec.md` (research branch only; PRs frozen and unaffected).
