@@ -125,6 +125,14 @@ def _build_parser() -> argparse.ArgumentParser:
                         "the rest (TieredHandles; no index.json needed)")
     p.add_argument("--log-routing", default=None, metavar="PATH",
                    help="Dump per-layer per-step routing unions to JSON")
+    # Planner (inspect + probe + feasibility; serves nothing)
+    p.add_argument("--plan", action="store_true",
+                   help="Print ranked serving plans instead of serving")
+    p.add_argument("--plan-batch", type=int, default=1)
+    p.add_argument("--plan-gen", type=int, default=16)
+    p.add_argument("--plan-diverse", action="store_true",
+                   help="Diverse (non-shared) batch workload assumption")
+    p.add_argument("--plan-fidelity", default="bitwise", choices=["bitwise", "ulp1"])
     p.add_argument("--remote-token", default=None, metavar="TOKEN",
                    help="Hub token for gated repos (or HF_TOKEN env)")
 
@@ -260,6 +268,52 @@ def main(argv: List[str] = None) -> None:
 
     # ── Config ───────────────────────────────────────────────────────
     cfg = _build_config(args)
+
+    # ── Planner ────────────────────────────────────────────────────
+    # Model + hardware discovery -> feasibility -> ranked plan table.
+    # No weights loaded, no serving; planner answers precede execution.
+    if args.plan:
+        from bhaskera.inference.colossus.feasibility import plan, render_table
+        from bhaskera.inference.colossus.hwprobe import probe as hw_probe
+        from bhaskera.inference.colossus.inspector import describe_model
+        from bhaskera.introspect import introspect_model
+        src = args.remote_repo or args.model
+        if not src:
+            parser.error("--plan needs --model <dir> or --remote-repo <id>")
+        if args.remote_repo:
+            from bhaskera.inference.colossus.remote import RemoteShardHandles
+            import os as _os
+            handles = RemoteShardHandles.from_hub(
+                args.remote_repo,
+                cache_dir=args.remote_cache or "/tmp/plan_cache",
+                token=args.remote_token or _os.environ.get("HF_TOKEN"))
+            from transformers import AutoConfig
+            hf_cfg = AutoConfig.from_pretrained(src, trust_remote_code=True)
+            from accelerate import init_empty_weights
+            with init_empty_weights():
+                from transformers import AutoModelForCausalLM
+                _model = AutoModelForCausalLM.from_config(
+                    hf_cfg, trust_remote_code=True)
+            profile = introspect_model(_model)
+            desc = describe_model("", profile, name=args.remote_repo, handles=handles)
+        else:
+            if not Path(src).is_dir():
+                parser.error(f"model dir not found: {src}")
+            from transformers import AutoConfig, AutoModelForCausalLM
+            from accelerate import init_empty_weights
+            hf_cfg = AutoConfig.from_pretrained(src, trust_remote_code=True)
+            with init_empty_weights():
+                _model = AutoModelForCausalLM.from_config(
+                    hf_cfg, trust_remote_code=True)
+            profile = introspect_model(_model)
+            desc = describe_model(src, profile)
+        hw = hw_probe(fast=True)
+        workload = {"batch": args.plan_batch, "seq_len": 32,
+                    "gen_tokens": args.plan_gen,
+                    "shared": not args.plan_diverse}
+        result = plan(desc, hw, workload, fidelity=args.plan_fidelity)
+        print(render_table(result, desc, hw))
+        return
 
     # ── COLOSSUS huge-model tier ─────────────────────────────────────
     # Models larger than HBM: meta-load, mmap residency, tiered execution.

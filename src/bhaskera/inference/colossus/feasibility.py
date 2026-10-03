@@ -107,3 +107,56 @@ def plan(model: dict, hw: dict, workload: dict,
             "recommended": feas[0] if feas else cands[-1],
             "candidates": feas + [c for c in cands if not c["fits"]],
             "reasons": [] if feas else ["no config fits; streaming floor (cap 0) priced above"]}
+
+
+def render_table(result: Dict[str, Any], model: dict, hw: dict) -> str:
+    """Human-readable plan table (model + hardware + ranked candidates)."""
+    w = model.get("weights") or {}
+    moe = model.get("moe") or {}
+    gpus = hw.get("gpus") or []
+    L = []
+    L.append("")
+    L.append("Model")
+    L.append(f"  total weights       {w.get('total_gb', 0):.1f} GB")
+    L.append(f"  resident            {w.get('resident_gb', 0):.1f} GB")
+    L.append(f"  routed              {w.get('routed_gb', 0):.1f} GB")
+    L.append(f"  dtype               {w.get('dtype', '?')}")
+    if moe:
+        L.append(f"  experts             {moe.get('routed_per_layer', '?')} routed"
+                 f" + {moe.get('shared', 0)} shared")
+        L.append(f"  top-k               {moe.get('top_k', '?')}")
+    L.append("")
+    L.append("Hardware")
+    if gpus:
+        L.append(f"  GPU                 {gpus[0].get('name', '?')}")
+        L.append(f"  HBM                 {gpus[0].get('total_gb', 0):.1f} GB")
+    else:
+        L.append("  GPU                 none (CPU-only)")
+    ram = hw.get("ram_gb") or {}
+    L.append(f"  RAM                 {ram.get('available_gb', 0):.0f} GB avail")
+    L.append(f"  PCIe                {hw.get('pcie_gbs', 0):.1f} GB/s")
+    L.append(f"  DRAM                {hw.get('dram_gbs', 0):.1f} GB/s")
+    L.append("")
+    if not result.get("feasible"):
+        L.append("No feasible GPU-resident plan.")
+        for r in result.get("reasons", []):
+            L.append(f"  Reason: {r}")
+        for c in result.get("candidates", [])[:3]:
+            for r in c.get("reasons", [])[:1]:
+                L.append(f"  [{c['placement']}/{c['capacity']}] {r}")
+        return "\n".join(L)
+    L.append("Plans")
+    L.append(f"  {'#':>2}  {'mode':<10} {'cap':>4}  {'est tok/s':>10}  {'VRAM':>7}  flags")
+    for i, c in enumerate(result.get("candidates", [])[:6], 1):
+        if not c["fits"]:
+            continue
+        flags = f"--offload-tier {c['placement']} --capacity {c['capacity']}"
+        if c["placement"] == "cpu":
+            flags += " --exactness-mode ulp1"
+        L.append(f"  {i:>2}  {c['placement']:<10} {c['capacity']:>4}  "
+                 f"{c['steady_tps']:>10.1f}  {c['vram_gb']:>6.1f}G  {flags}")
+    rec = result.get("recommended") or {}
+    if rec.get("fits"):
+        L.append(f"Recommended: {rec['placement']} C={rec['capacity']} "
+                 f"(~{rec['steady_tps']:.1f} tok/s, first token ~{rec['first_token_s']:.0f}s)")
+    return "\n".join(L)

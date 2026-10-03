@@ -20,7 +20,12 @@ DTYPE_BYTES = {"BF16": 2, "F16": 2, "F32": 4, "U8": 1, "I64": 8, "I32": 4}
 def inspect_weights(model_dir: str) -> Dict[str, Any]:
     """Weight statistics from the safetensors index alone (no tensors read)."""
     handles = ShardHandles.open(model_dir)
-    resident, routed = split_routed(handles.weight_map)
+    return inspect_handles(handles)
+
+
+def inspect_handles(handles) -> Dict[str, Any]:
+    """Weight statistics from any handles (local mmap or remote Range)."""
+    resident, routed = split_routed(dict(handles.weight_map))
     routed_set = set(routed)
     nbytes = {"total": 0, "resident": 0, "routed": 0}
     dtypes: Dict[str, int] = {}
@@ -56,12 +61,19 @@ def inspect_weights(model_dir: str) -> Dict[str, Any]:
     }
 
 
-def describe_model(model_dir: str, profile: Any = None,
-                   name: Optional[str] = None) -> Dict[str, Any]:
-    """Canonical description: architecture (profile) + weights (index)."""
-    w = inspect_weights(model_dir)
+def describe_model(model_dir: str = "", profile: Any = None,
+                   name: Optional[str] = None, handles=None) -> Dict[str, Any]:
+    """Canonical description: architecture (profile) + weights.
+
+    Weights come from the local index, or from a prebuilt handles object
+    (e.g. remote Range handles: headers only, no tensors read).
+    """
+    if handles is None:
+        w = inspect_weights(model_dir)
+    else:
+        w = inspect_handles(handles)
     desc: Dict[str, Any] = {
-        "model": {"name": name or os.path.basename(model_dir.rstrip("/"))},
+        "model": {"name": name or os.path.basename((model_dir or "").rstrip("/"))},
         "weights": w,
         "moe": None,
         "capabilities": {"tiered_execution": False, "cpu_placement": False,
