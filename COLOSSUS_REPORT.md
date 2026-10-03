@@ -196,6 +196,10 @@ Offload trades 3–9× speed for 3× memory on a model that fits — optional he
 
 **Integration note:** `generate()`-based dense paths fail on both transformers 4.57 and 5.12 against these modeling files (`seen_tokens`, mask size) — custom-model `generate` is fragile to version drift while the manual prefill/decode loop (as in `serve.py`) is robust. Upstream `engine.generate` needs the same compat attention before it can serve custom MoE modeling files.
 
+## 18. `plan` CLI: inspect → probe → ranked table (2026-10-01)
+
+`bhaskera-infer --plan --model <dir|id> [--plan-batch N --plan-diverse --plan-fidelity ulp1]` prints model description (index-only, seconds), live hardware probe (PCIe 43.4 / DRAM 60.5 GB/s measured, not asserted), and ranked serving flags. B=1 estimate **0.6 tok/s matches measured 0.57–0.63**. Without GPU it degrades to a reasoned refusal (demonstrated: CPU-only run explains resident-overflow per candidate). Known v1 limit: estimates ignore hit-rate effects (capacity changes bytes only via the floor, not the curve).
+
 ## 17. Third family live: Mixtral-8x7B + conditional routing bound (2026-10-01)
 
 **Mixtral-8x7B (32 layers, 8 experts, top-2, w1/w2/w3, `block_sparse_moe`) serves through the identical CLI with zero Mixtral-specific execution code: 1.0 tok/s B=1, 45 GB VRAM, coherent quicksort.** Three generality bugs found and fixed by this run (all in shared code, all tested): index keys without top prefix (prefix-tolerant placement), w1/w2/w3 projection discovery, tupled `(hidden, logits)` return convention for `block_sparse_moe` forwards.
