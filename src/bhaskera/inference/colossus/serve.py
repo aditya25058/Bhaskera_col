@@ -144,7 +144,12 @@ def serve_huge_moe(model, tokenizer, profile, handles: ShardHandles,
     t_prefill = time.perf_counter() - t_prefill
     if next_token.device != device:
         next_token = next_token.to(device)
+    # Teacher-forced flip audit (B=1 only): feed reference tokens, record own
+    # argmax + fp32 margin per position (isolates per-position noise).
+    audit: List[dict] = []
     if teacher_tokens is not None:
+        assert B == 1, "teacher protocol requires batch size 1"
+        assert len(teacher_tokens) >= max_new_tokens, "teacher too short"
         tv, ti = logits[0, -1, :].float().topk(2)
         own = int(ti[0])
         audit.append({"pos": 1, "own": own, "ref": teacher_tokens[0],
@@ -159,12 +164,6 @@ def serve_huge_moe(model, tokenizer, profile, handles: ShardHandles,
     if log_routing:
         for w in wrappers:
             w.routing_log = []
-    # Teacher-forced flip audit (B=1 only): feed reference tokens, record own
-    # argmax + fp32 margin per position (isolates per-position noise).
-    audit: List[dict] = []
-    if teacher_tokens is not None:
-        assert B == 1, "teacher protocol requires batch size 1"
-        assert len(teacher_tokens) >= max_new_tokens, "teacher too short"
     for step in range(max_new_tokens - 1):
         if device.type == "cuda":
             torch.cuda.synchronize(device)
