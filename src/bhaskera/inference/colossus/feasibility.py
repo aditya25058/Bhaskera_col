@@ -13,7 +13,7 @@ the planner prices, never refuses (unknown arch / no device excepted).
 """
 from __future__ import annotations
 
-from typing Any, Dict, List
+from typing import Any, Dict, List
 
 # Calibrated constants (this program's measurements; overridable per box).
 FIXED_MS_PER_LAYER = 20.0   # Python orchestration per MoE layer per step
