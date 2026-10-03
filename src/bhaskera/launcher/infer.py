@@ -125,6 +125,10 @@ def _build_parser() -> argparse.ArgumentParser:
                         "the rest (TieredHandles; no index.json needed)")
     p.add_argument("--log-routing", default=None, metavar="PATH",
                    help="Dump per-layer per-step routing unions to JSON")
+    p.add_argument("--teacher-tokens", default=None, metavar="PATH",
+                   help="JSON int list; teacher-forced flip protocol (B=1 only)")
+    p.add_argument("--audit-logits", default=None, metavar="PATH",
+                   help="Dump per-position {own, ref, margin} flip audit")
     # Planner (inspect + probe + feasibility; serves nothing)
     p.add_argument("--plan", action="store_true",
                    help="Print ranked serving plans instead of serving")
@@ -399,11 +403,17 @@ def main(argv: List[str] = None) -> None:
         else:
             handles = ShardHandles.open(model_dir)
         t0 = time.perf_counter()
+        _teacher = None
+        if args.teacher_tokens:
+            import json as _json
+            with open(args.teacher_tokens) as f:
+                _teacher = _json.load(f)
         res = serve_huge_moe(
             model, tokenizer, profile, handles, device, prompts,
             max_new_tokens=args.max_new_tokens or infer.max_new_tokens,
             capacity=_cap, placement=_tier,
-            prefill_chunk=_chunk, log_routing=args.log_routing)
+            prefill_chunk=_chunk, log_routing=args.log_routing,
+            teacher_tokens=_teacher, audit_logits=args.audit_logits)
         elapsed = time.perf_counter() - t0
         outputs = res["texts"]
         total_output_tokens = sum(_count_output_tokens(o, tokenizer) for o in outputs)

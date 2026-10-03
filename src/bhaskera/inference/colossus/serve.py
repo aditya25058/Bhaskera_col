@@ -94,6 +94,8 @@ def serve_huge_moe(model, tokenizer, profile, handles: ShardHandles,
                    use_cache: bool = True, zssr: bool = False,
                    prefetch_topk: int = 8, prefetch_conf: float = 0.0,
                    log_routing: Optional[str] = None,
+                   teacher_tokens: Optional[List[int]] = None,
+                   audit_logits: Optional[str] = None,
                    ) -> Dict[str, Any]:
     """Greedy lockstep serve with ledger. Returns results dict."""
     from transformers.cache_utils import DynamicCache
@@ -142,6 +144,13 @@ def serve_huge_moe(model, tokenizer, profile, handles: ShardHandles,
     t_prefill = time.perf_counter() - t_prefill
     if next_token.device != device:
         next_token = next_token.to(device)
+    if teacher_tokens is not None:
+        tv, ti = logits[0, -1, :].float().topk(2)
+        own = int(ti[0])
+        audit.append({"pos": 1, "own": own, "ref": teacher_tokens[0],
+                      "match": own == teacher_tokens[0],
+                      "margin": float(tv[0] - tv[1])})
+        next_token = torch.tensor([[teacher_tokens[0]]], device=device)
 
     finished = [False] * B
     eos_id = tokenizer.eos_token_id
@@ -150,6 +159,12 @@ def serve_huge_moe(model, tokenizer, profile, handles: ShardHandles,
     if log_routing:
         for w in wrappers:
             w.routing_log = []
+    # Teacher-forced flip audit (B=1 only): feed reference tokens, record own
+    # argmax + fp32 margin per position (isolates per-position noise).
+    audit: List[dict] = []
+    if teacher_tokens is not None:
+        assert B == 1, "teacher protocol requires batch size 1"
+        assert len(teacher_tokens) >= max_new_tokens, "teacher too short"
     for step in range(max_new_tokens - 1):
         if device.type == "cuda":
             torch.cuda.synchronize(device)
@@ -164,6 +179,16 @@ def serve_huge_moe(model, tokenizer, profile, handles: ShardHandles,
             next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True)
             if use_cache:
                 past = getattr(out, "past_key_values", None)
+            if teacher_tokens is not None:
+                pos = step + 2
+                if pos - 1 < len(teacher_tokens):
+                    tv, ti = logits[0, -1, :].float().topk(2)
+                    own = int(ti[0])
+                    ref = teacher_tokens[pos - 1]
+                    audit.append({"pos": pos, "own": own, "ref": ref,
+                                  "match": own == ref,
+                                  "margin": float(tv[0] - tv[1])})
+                    next_token = torch.tensor([[ref]], device=device)
         if device.type == "cuda":
             torch.cuda.synchronize(device)
         latencies.append(time.perf_counter() - t0)
@@ -197,6 +222,12 @@ def serve_huge_moe(model, tokenizer, profile, handles: ShardHandles,
             _json.dump(entries, f)
         routing_steps = (len(wrappers[0].routing_log or [])
                          if wrappers else 0)
+    flip_audit = None
+    if audit_logits:
+        import json as _json2
+        with open(audit_logits, "w") as f:
+            _json2.dump({"audit": audit}, f)
+        flip_audit = audit
     return {
         "texts": texts,
         "batch_size": B,
@@ -212,4 +243,5 @@ def serve_huge_moe(model, tokenizer, profile, handles: ShardHandles,
         "placement": placement,
         "capacity": capacity,
         "routing_log_steps": routing_steps,
+        "flip_audit": flip_audit,
     }

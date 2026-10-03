@@ -108,3 +108,22 @@ def test_prepare_wraps_all_layers():
                              torch.device("cpu"), capacity=4)
     assert len(wrappers) == 2
     assert all(isinstance(model.layers[i].mlp, TieredMoEWrapper) for i in (0, 1))
+
+
+def test_teacher_audit_records(tmp_path):
+    model = FakeCausalMoE()
+    tok = FakeTokenizer()
+    handles = _stub_handles(model)
+    audit_path = str(tmp_path / "audit.json")
+    teacher = [7] * 8
+    res = serve_huge_moe(model, tok, FakeProfile(), handles,
+                         torch.device("cpu"), ["hi"],
+                         max_new_tokens=6, capacity=8,
+                         teacher_tokens=teacher, audit_logits=audit_path)
+    import json
+    audit = json.load(open(audit_path))["audit"]
+    assert len(audit) == 6
+    for e in audit:
+        assert set(e) == {"pos", "own", "ref", "match", "margin"}
+        assert e["ref"] == 7 and e["match"] == (e["own"] == 7)
+    assert res["flip_audit"] == audit
