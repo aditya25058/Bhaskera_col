@@ -133,6 +133,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--plan-diverse", action="store_true",
                    help="Diverse (non-shared) batch workload assumption")
     p.add_argument("--plan-fidelity", default="bitwise", choices=["bitwise", "ulp1"])
+    p.add_argument("--plan-apply", action="store_true",
+                   help="With --plan: serve immediately with the recommended "
+                        "flags (needs --prompt/--prompt-file)")
     p.add_argument("--remote-token", default=None, metavar="TOKEN",
                    help="Hub token for gated repos (or HF_TOKEN env)")
 
@@ -317,7 +320,22 @@ def main(argv: List[str] = None) -> None:
                     "shared": not args.plan_diverse}
         result = plan(desc, hw, workload, fidelity=args.plan_fidelity)
         print(render_table(result, desc, hw))
-        return
+        if not args.plan_apply:
+            return
+        rec = result.get("recommended") or {}
+        if not rec.get("fits"):
+            parser.error("plan --apply: recommended candidate does not fit "
+                         f"({(rec.get('reasons') or ['unknown'])[:1]})")
+        if not prompts:
+            parser.error("plan --apply needs --prompt/--prompt-file to serve")
+        args.offload_tier = rec["placement"]
+        args.capacity = rec["capacity"]
+        if rec["placement"] == "cpu":
+            args.exactness_mode = "ulp1"
+        print(f"APPLYING: --offload-tier {rec['placement']} "
+              f"--capacity {rec['capacity']} "
+              f"(est ~{rec['steady_tps']:.1f} tok/s)")
+        # fall through to the offload-tier branch below
 
     # ── COLOSSUS huge-model tier ─────────────────────────────────────
     # Models larger than HBM: meta-load, mmap residency, tiered execution.
