@@ -12,7 +12,7 @@ from __future__ import annotations
 import os
 import platform
 import time
-from typing Any, Dict
+from typing import Any, Dict
 
 import torch
 
