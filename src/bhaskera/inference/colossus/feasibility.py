@@ -14,7 +14,7 @@ Never refuses silently.
 """
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Any
 
 # Calibrated constants (this program's measurements; overridable per box).
 FIXED_MS_PER_LAYER = 20.0   # Python orchestration per MoE layer per step
@@ -44,7 +44,7 @@ def _union_per_layer(moe: dict, batch: int, shared: bool) -> float:
 
 
 def plan(model: dict, hw: dict, workload: dict,
-         fidelity: str = "bitwise") -> Dict[str, Any]:
+         fidelity: str = "bitwise") -> dict[str, Any]:
     moe = model.get("moe") or {}
     w = model.get("weights") or {}
     if not moe.get("routed_per_layer"):
@@ -78,6 +78,8 @@ def plan(model: dict, hw: dict, workload: dict,
             if place == "slots" and not has_cuda:
                 fits = False
             demand_gb = union * layers * egb
+            ram_need = resident + demand_gb
+            ram_ok = (ram_need <= ram) if ram > 0 else True
             if place == "slots":
                 bw = pcie
                 t_step = (demand_gb / bw if bw > 0 else 0.0) + fixed_s
@@ -90,6 +92,9 @@ def plan(model: dict, hw: dict, workload: dict,
             reasons = []
             if not fits:
                 reasons.append(f"resident {vram:.1f}GB exceeds usable HBM {hbm:.1f}GB")
+            if not ram_ok:
+                fits = False
+                reasons.append(f"working set {ram_need:.1f}GB exceeds avail RAM {ram:.1f}GB")
             if place == "cpu" and not (hw.get("cpu") or {}).get("bf16", True):
                 reasons.append("no CPU BF16: fp32 fallback (slower, untested)")
             cands.append({
@@ -113,7 +118,7 @@ def plan(model: dict, hw: dict, workload: dict,
             "reasons": [] if feas else ["no config fits; streaming floor (cap 0) priced above"]}
 
 
-def render_table(result: Dict[str, Any], model: dict, hw: dict) -> str:
+def render_table(result: dict[str, Any], model: dict, hw: dict) -> str:
     """Human-readable plan table (model + hardware + ranked candidates)."""
     w = model.get("weights") or {}
     moe = model.get("moe") or {}

@@ -15,7 +15,6 @@ import torch
 
 from bhaskera.inference.colossus.loading import (
     ShardHandles,
-    ShardMap,
     is_routed_expert_key,
     materialize,
     split_routed,
@@ -84,7 +83,7 @@ def test_shard_views_exact(fake_model_dir):
 def test_materialize_into_empty_model(fake_model_dir):
     d, g = fake_model_dir
     h = ShardHandles.open(d)
-    import torch.nn as nn
+    from torch import nn
 
     class Tiny(nn.Module):
         def __init__(self):
@@ -100,8 +99,9 @@ def test_materialize_into_empty_model(fake_model_dir):
 
 
 def test_set_module_tensor_prefix_tolerant():
+    from torch import nn
+
     from bhaskera.inference.colossus.loading import set_module_tensor
-    import torch.nn as nn
 
     class Inner(nn.Module):
         def __init__(self):

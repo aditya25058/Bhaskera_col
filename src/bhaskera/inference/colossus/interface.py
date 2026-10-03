@@ -16,12 +16,13 @@ caller falls back to the per-expert sorted-dispatch loop.
 """
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any, List, Optional, Sequence, Tuple
+from typing import Any
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+from torch import nn
 
 GATE_DEEPSEEK_3TUPLE = "deepseek_3tuple"
 GATE_LOGITS = "logits"
@@ -54,7 +55,7 @@ ROLE_HINTS = {
 }
 
 
-def experts_of(moe_block: Any) -> Tuple[str, Sequence[nn.Module]]:
+def experts_of(moe_block: Any) -> tuple[str, Sequence[nn.Module]]:
     """(container_attr, expert_modules) trying known container names."""
     for attr in EXPERT_CONTAINERS:
         if hasattr(moe_block, attr):
@@ -68,7 +69,7 @@ def experts_of(moe_block: Any) -> Tuple[str, Sequence[nn.Module]]:
 MOE_BLOCK_ATTRS = ("mlp", "block_sparse_moe", "moe", "sparse_moe")
 
 
-def find_moe_block(decoder_layer: Any) -> Optional[Tuple[str, Any]]:
+def find_moe_block(decoder_layer: Any) -> tuple[str, Any] | None:
     """(attr, block) for the first attr holding an experts container; None."""
     for attr in MOE_BLOCK_ATTRS:
         block = getattr(decoder_layer, attr, None)
@@ -137,7 +138,7 @@ def detect_gate_style(moe_block: Any) -> str:
     return GATE_LOGITS
 
 
-def classify_role(relname: str) -> Optional[str]:
+def classify_role(relname: str) -> str | None:
     """Map an expert-relative param name to gate/up/down (None if unknown)."""
     low = relname.lower()
     for role, hints in ROLE_HINTS.items():
@@ -152,7 +153,7 @@ class MoELayerSpec:
     experts: Sequence[nn.Module]
     gate: nn.Module
     gate_style: str
-    shared: Optional[nn.Module]
+    shared: nn.Module | None
     top_k: int
     n_routed: int
     hidden: int
@@ -162,7 +163,7 @@ class MoELayerSpec:
     activation: str = "silu"
 
     @classmethod
-    def from_block(cls, moe_block: Any, top_k: Optional[int] = None) -> "MoELayerSpec":
+    def from_block(cls, moe_block: Any, top_k: int | None = None) -> MoELayerSpec:
         container_attr, experts = experts_of(moe_block)
         gate = getattr(moe_block, "gate", None)
         if gate is None:
@@ -189,7 +190,7 @@ class MoELayerSpec:
                        getattr(getattr(moe_block, "config", None),
                                "hidden_act", "silu")))
 
-    def route(self, hidden: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def route(self, hidden: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Unified routing -> (topk_idx, topk_weight), rank mirrors input.
 
         DeepSeek-style gates consume the tensor as given (often 3D); logits
@@ -210,7 +211,7 @@ class MoELayerSpec:
         return (idx.long().view(*lead, self.top_k),
                 w.to(hidden.dtype).view(*lead, self.top_k))
 
-    def router_weight(self) -> Optional[torch.Tensor]:
+    def router_weight(self) -> torch.Tensor | None:
         """Detached fp32 router matrix for ZSSR probing (None if absent)."""
         g = self.gate
         if hasattr(g, "weight"):

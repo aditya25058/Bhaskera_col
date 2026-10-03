@@ -7,7 +7,7 @@ Model-agnostic: no names, no templates, no architecture branches.
 from __future__ import annotations
 
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 import torch
 
@@ -59,7 +59,7 @@ def prepare_model(model: torch.nn.Module, profile: Any, handles: ShardHandles,
                   dtype: torch.dtype = torch.bfloat16,
                   placement: str = "slots", dma_stream: Any = None,
                   zssr: bool = False, prefetch_topk: int = 8,
-                  prefetch_conf: float = 0.0) -> List[TieredMoEWrapper]:
+                  prefetch_conf: float = 0.0) -> list[TieredMoEWrapper]:
     """Materialize resident weights + wrap MoE layers. Returns wrappers."""
     resident, _ = split_routed(handles.weight_map)
     materialize(model, resident, handles, device, dtype)
@@ -88,15 +88,15 @@ def prepare_model(model: torch.nn.Module, profile: Any, handles: ShardHandles,
 
 
 def serve_huge_moe(model, tokenizer, profile, handles: ShardHandles,
-                   device: torch.device, prompts: List[str],
+                   device: torch.device, prompts: list[str],
                    max_new_tokens: int = 16, capacity: int = 12,
                    placement: str = "slots", prefill_chunk: int = 0,
                    use_cache: bool = True, zssr: bool = False,
                    prefetch_topk: int = 8, prefetch_conf: float = 0.0,
-                   log_routing: Optional[str] = None,
-                   teacher_tokens: Optional[List[int]] = None,
-                   audit_logits: Optional[str] = None,
-                   ) -> Dict[str, Any]:
+                   log_routing: str | None = None,
+                   teacher_tokens: list[int] | None = None,
+                   audit_logits: str | None = None,
+                   ) -> dict[str, Any]:
     """Greedy lockstep serve with ledger. Returns results dict."""
     from transformers.cache_utils import DynamicCache
 
@@ -146,7 +146,7 @@ def serve_huge_moe(model, tokenizer, profile, handles: ShardHandles,
         next_token = next_token.to(device)
     # Teacher-forced flip audit (B=1 only): feed reference tokens, record own
     # argmax + fp32 margin per position (isolates per-position noise).
-    audit: List[dict] = []
+    audit: list[dict] = []
     if teacher_tokens is not None:
         assert B == 1, "teacher protocol requires batch size 1"
         assert len(teacher_tokens) >= max_new_tokens, "teacher too short"
@@ -160,7 +160,7 @@ def serve_huge_moe(model, tokenizer, profile, handles: ShardHandles,
     finished = [False] * B
     eos_id = tokenizer.eos_token_id
     new_counts = [1] * B
-    latencies: List[float] = []
+    latencies: list[float] = []
     if log_routing:
         for w in wrappers:
             w.routing_log = []

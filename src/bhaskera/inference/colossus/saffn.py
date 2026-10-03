@@ -16,9 +16,8 @@ As specified in COLOSSUS v3 (Section 5.3, Equations 30-34, and Section 7.1):
 from __future__ import annotations
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Tuple
+from torch import nn
 
 
 class ADETRBuffer:
@@ -72,7 +71,7 @@ class ADETRBuffer:
             self.cpu_up_cold.copy_(up_w[self.i_hot:, :], non_blocking=True)
             self.cpu_down_cold.copy_(down_w[:, self.i_hot:], non_blocking=True)
 
-    def load_cold_columns(self, non_blocking: bool = True, stream: Optional[torch.cuda.Stream] = None):
+    def load_cold_columns(self, non_blocking: bool = True, stream: torch.cuda.Stream | None = None):
         """Transfer cold columns into pre-allocated contiguous GPU receive buffer."""
         if torch.cuda.is_available():
             stream_ctx = stream if stream else torch.cuda.current_stream()

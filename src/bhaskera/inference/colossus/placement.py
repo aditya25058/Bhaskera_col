@@ -11,11 +11,11 @@ stream is provided; otherwise plain synchronous copies (CPU-testable).
 from __future__ import annotations
 
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+from torch import nn
 
 from .interface import MoELayerSpec
 
@@ -67,7 +67,7 @@ class TieredMoEWrapper(nn.Module):
         self,
         layer_idx: int,
         spec: MoELayerSpec,
-        expert_keys: List[Dict[str, str]],
+        expert_keys: list[dict[str, str]],
         device: torch.device,
         capacity: int,
         handles: Any,
@@ -97,8 +97,8 @@ class TieredMoEWrapper(nn.Module):
         # `block_sparse_moe` forwards return (hidden, router_logits) while
         # `mlp` blocks return a bare tensor. Mapped explicitly (known cases).
         self.tupled = bool(tupled)
-        self._cpu_cache: Dict[int, Dict[str, torch.Tensor]] = {}
-        self._cpu_fifo: List[int] = []
+        self._cpu_cache: dict[int, dict[str, torch.Tensor]] = {}
+        self._cpu_fifo: list[int] = []
 
         self.gate = spec.gate
         self.shared_experts = spec.shared
@@ -108,13 +108,13 @@ class TieredMoEWrapper(nn.Module):
         if self.streaming:
             capacity = 1
         self.capacity = capacity
-        self.slots: List[nn.Module] = nn.ModuleList([
+        self.slots: list[nn.Module] = nn.ModuleList([
             FastSlot(spec.hidden, spec.inter, device, spec.dtype, spec.activation)
             for _ in range(capacity)
         ])
-        self.slot_to_expert: Dict[int, int] = {}
-        self.expert_to_slot: Dict[int, int] = {}
-        self.slot_lru: List[int] = list(range(capacity))
+        self.slot_to_expert: dict[int, int] = {}
+        self.expert_to_slot: dict[int, int] = {}
+        self.slot_lru: list[int] = list(range(capacity))
 
         self.hits = 0
         self.misses = 0
@@ -122,7 +122,7 @@ class TieredMoEWrapper(nn.Module):
         self.zssr_predictions = 0
         self.zssr_correct = 0
         self.zssr_suppressed = 0
-        self._prefetched: Dict[int, int] = {}
+        self._prefetched: dict[int, int] = {}
         self.routing_log = None
         self.cpu_ms = 0.0
         self.cpu_n = 0
@@ -213,7 +213,7 @@ class TieredMoEWrapper(nn.Module):
         K = topk_indices.shape[-1]
         TI = topk_indices.reshape(-1, K).cpu()
         TW = topk_weights.reshape(-1, K).cpu()
-        groups: Dict[int, list] = {}
+        groups: dict[int, list] = {}
         for b in range(TI.shape[0]):
             for k in range(TI.shape[1]):
                 groups.setdefault(int(TI[b, k]), []).append((b, k))
@@ -326,7 +326,7 @@ class TieredMoEWrapper(nn.Module):
 
 def wrap_moe_layers(model: nn.Module, profile: Any, handles: Any,
                    device: torch.device, capacity: int,
-                   dma_stream: Any = None, **opts) -> List["TieredMoEWrapper"]:
+                   dma_stream: Any = None, **opts) -> list[TieredMoEWrapper]:
     """Replace every MoE block with a TieredMoEWrapper (model-agnostic).
 
     Discovery: profile.decoder_layer_cls instances -> find_moe_block each.
@@ -334,7 +334,7 @@ def wrap_moe_layers(model: nn.Module, profile: Any, handles: Any,
     interface.expert_weight_keys against handles.weight_map.
     Returns wrappers in layer order.
     """
-    from .interface import expert_weight_keys, find_moe_block, MoELayerSpec
+    from .interface import MoELayerSpec, expert_weight_keys, find_moe_block
 
     decoder_cls = getattr(profile, "decoder_layer_cls", None)
     if decoder_cls is not None:

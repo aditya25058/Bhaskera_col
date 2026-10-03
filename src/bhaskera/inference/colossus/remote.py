@@ -18,7 +18,7 @@ import json
 import os
 import urllib.request
 from collections import OrderedDict
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any
 
 import torch
 
@@ -41,14 +41,14 @@ class RangeFetcher:
         try:
             with (self.opener or urllib.request).urlopen(req) as r:
                 if r.status not in (200, 206):
-                    raise IOError(f"range fetch {url} [{start},{end}): HTTP {r.status}")
+                    raise OSError(f"range fetch {url} [{start},{end}): HTTP {r.status}")
                 data = r.read()
         except Exception as e:
-            raise IOError(f"range fetch {url} [{start},{end}) failed: "
+            raise OSError(f"range fetch {url} [{start},{end}) failed: "
                           f"{type(e).__name__}: {e}") from e
         want = end - start
         if len(data) != want:
-            raise IOError(f"range fetch {url}: short read {len(data)}/{want} "
+            raise OSError(f"range fetch {url}: short read {len(data)}/{want} "
                           f"(status {r.status})")
         self.requests += 1
         self.bytes += len(data)
@@ -61,9 +61,9 @@ class RemoteShardHandles:
     MANIFEST = "manifest.json"
     LRU = "lru.json"
 
-    def __init__(self, weight_map: Dict[str, str], fetcher: RangeFetcher,
+    def __init__(self, weight_map: dict[str, str], fetcher: RangeFetcher,
                  cache_dir: str, cache_cap_gb: float = 200.0,
-                 expected_hashes: Optional[Dict[str, str]] = None):
+                 expected_hashes: dict[str, str] | None = None):
         self.weight_map = dict(weight_map)
         self.fetcher = fetcher
         self.cache_dir = cache_dir
@@ -71,8 +71,8 @@ class RemoteShardHandles:
         self.expected_hashes = expected_hashes or {}
         os.makedirs(os.path.join(cache_dir, "tensors"), exist_ok=True)
         self._manifest = self._load_json(self.MANIFEST, {})
-        self._headers: Dict[str, dict] = self._manifest.get("headers", {})
-        self._lru: "OrderedDict[str, None]" = OrderedDict(
+        self._headers: dict[str, dict] = self._manifest.get("headers", {})
+        self._lru: OrderedDict[str, None] = OrderedDict(
             (k, None) for k in self._load_json(self.LRU, []))
         self._used_bytes = self._scan_cache()
         self.net_bytes = 0
@@ -86,7 +86,7 @@ class RemoteShardHandles:
         try:
             with open(p) as f:
                 return json.load(f)
-        except Exception:
+        except Exception:  # noqa: BLE001 - corrupt/missing cache must degrade, never crash
             return default
 
     def _save_json(self, name, obj) -> None:
@@ -121,7 +121,7 @@ class RemoteShardHandles:
     def header(self, key: str) -> dict:
         return self._shard_header(self.weight_map[key])[key]
 
-    def shards(self) -> List[str]:
+    def shards(self) -> list[str]:
         return sorted(set(self.weight_map.values()))
 
     # -- tensors -------------------------------------------------------
@@ -192,7 +192,7 @@ class RemoteShardHandles:
         digest = hashlib.sha256(raw).hexdigest()
         exp = self.expected_hashes.get(key)
         if exp is not None and digest != exp:
-            raise IOError(f"integrity failure for {key}: hash mismatch")
+            raise OSError(f"integrity failure for {key}: hash mismatch")
         with open(p, "wb") as f:
             f.write(raw)
         with open(p[:-4] + ".sha", "w") as f:
@@ -204,7 +204,7 @@ class RemoteShardHandles:
                                 dtype=_safetensors_dtype(info.get("dtype", "BF16"))
                                 ).reshape(info["shape"])
 
-    def stats(self) -> Dict[str, Any]:
+    def stats(self) -> dict[str, Any]:
         total = self.hits + self.misses
         return {"network_bytes": self.net_bytes,
                 "disk_bytes": self.disk_bytes,
@@ -218,9 +218,9 @@ class RemoteShardHandles:
 
     @classmethod
     def from_hub(cls, repo_id: str, revision: str = "main",
-                 cache_dir: Optional[str] = None,
+                 cache_dir: str | None = None,
                  cache_cap_gb: float = 200.0,
-                 token: Optional[str] = None) -> "RemoteShardHandles":
+                 token: str | None = None) -> RemoteShardHandles:
         """Build from a Hub repo: list shards, fetch headers, weight map.
 
         No file is downloaded in full; only 8B + JSON headers per shard
@@ -243,17 +243,17 @@ class RemoteShardHandles:
                 try:
                     r = urllib.request.urlopen(req, timeout=120)
                     if r.status not in (200, 206):
-                        raise IOError(f"HTTP {r.status}")
+                        raise OSError(f"HTTP {r.status}")
                     data = r.read()
                 except Exception as e:
-                    raise IOError(f"hub range fetch {path} [{start},{end}): "
+                    raise OSError(f"hub range fetch {path} [{start},{end}): "
                                   f"{type(e).__name__}: {e}") from e
                 self.requests += 1
                 self.bytes += len(data)
                 return data
 
         fetcher = _HubFetch("")
-        weight_map: Dict[str, str] = {}
+        weight_map: dict[str, str] = {}
         tmp = cls(weight_map, fetcher,
                   cache_dir or f"/tmp/remote_cache_{repo_id.replace('/', '_')}",
                   cache_cap_gb)
@@ -282,7 +282,6 @@ class TieredHandles:
         self.local = local
         self.remote = remote
         local_keys = set(local.weight_map.keys())
-        remote_keys = set(remote.weight_map.keys())
         merged = dict(remote.weight_map)
         merged.update(local.weight_map)
         self.weight_map = merged
@@ -290,7 +289,7 @@ class TieredHandles:
         self.local_hits = 0
         self.remote_hits = 0
 
-    def shards(self) -> List[str]:
+    def shards(self) -> list[str]:
         return sorted(set(self.local.shards()) | set(self.remote.shards()))
 
     def header(self, key: str) -> dict:
@@ -304,12 +303,12 @@ class TieredHandles:
                 t = self.local.get_tensor(key)
                 self.local_hits += 1
                 return t
-            except Exception:
+            except Exception:  # noqa: BLE001,S110 - corrupt local falls through to remote
                 pass
         self.remote_hits += 1
         return self.remote.get_tensor(key)
 
-    def stats(self) -> Dict[str, Any]:
+    def stats(self) -> dict[str, Any]:
         s = dict(self.remote.stats())
         s["local_hits"] = self.local_hits
         s["remote_hits"] = self.remote_hits

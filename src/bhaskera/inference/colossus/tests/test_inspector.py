@@ -6,7 +6,6 @@ derivation, capability flags, and JSON round-trip. CPU-only.
 from __future__ import annotations
 
 import json
-import os
 
 import torch
 

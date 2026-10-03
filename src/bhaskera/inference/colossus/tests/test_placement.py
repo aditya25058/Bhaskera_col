@@ -7,10 +7,8 @@ CPU-only, no GPU, no weights download.
 """
 from __future__ import annotations
 
-import pytest
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
+from torch import nn
 
 from bhaskera.inference.colossus.interface import MoELayerSpec
 from bhaskera.inference.colossus.placement import TieredMoEWrapper, wrap_moe_layers

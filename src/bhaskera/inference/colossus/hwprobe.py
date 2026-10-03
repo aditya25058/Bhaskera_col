@@ -9,17 +9,16 @@ CUDA fields degrade gracefully to absent (CPU-only hosts supported).
 """
 from __future__ import annotations
 
-import os
 import platform
 import time
-from typing import Any, Dict
+from typing import Any
 
 import torch
 
 
-def _cpu_info() -> Dict[str, Any]:
+def _cpu_info() -> dict[str, Any]:
     import multiprocessing
-    info: Dict[str, Any] = {"cores": multiprocessing.cpu_count()}
+    info: dict[str, Any] = {"cores": multiprocessing.cpu_count()}
     try:
         with open("/proc/cpuinfo") as f:
             for line in f:
@@ -42,7 +41,7 @@ def _cpu_info() -> Dict[str, Any]:
     return info
 
 
-def _ram_info() -> Dict[str, Any]:
+def _ram_info() -> dict[str, Any]:
     out = {"total_gb": 0.0, "available_gb": 0.0}
     try:
         with open("/proc/meminfo") as f:
@@ -108,7 +107,7 @@ def _measure_pcie_gbs(size_mb: int = 256, iters: int = 3) -> float:
     return (n * 4) / best / 1e9
 
 
-def probe(fast: bool = True) -> Dict[str, Any]:
+def probe(fast: bool = True) -> dict[str, Any]:
     """Hardware capability dict (JSON-serializable)."""
     gpus = _gpu_info()
     pcie = _measure_pcie_gbs(64 if fast else 256, 2 if fast else 3)
@@ -123,7 +122,7 @@ def probe(fast: bool = True) -> Dict[str, Any]:
     }
 
 
-def write_probe_json(out_path: str, fast: bool = True) -> Dict[str, Any]:
+def write_probe_json(out_path: str, fast: bool = True) -> dict[str, Any]:
     import json
     desc = probe(fast=fast)
     with open(out_path, "w") as f:

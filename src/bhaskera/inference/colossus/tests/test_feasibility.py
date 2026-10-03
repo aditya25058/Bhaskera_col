@@ -61,6 +61,14 @@ def test_unknown_arch_refused_with_reasons():
     assert not r["feasible"] and r["reasons"]
 
 
+def test_ram_shortage_refused_with_reason():
+    m = _moe()
+    r = plan(m, _hw(hbm=93.1, ram=10.0), {"batch": 1, "gen_tokens": 16})
+    assert not r["feasible"]
+    flat = " ".join(x for c in r["candidates"] for x in c["reasons"])
+    assert "RAM" in flat
+
+
 def test_bitwise_excludes_cpu():
     m = _moe()
     r = plan(m, _hw(), {"batch": 1})

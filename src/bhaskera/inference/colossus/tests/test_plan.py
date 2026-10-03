@@ -50,7 +50,6 @@ class StubHandles:
         n = 1
         for d in self._shapes[key]:
             n *= d
-        import math
         return {"data_offsets": [0, n * 2], "dtype": "BF16",
                 "shape": list(self._shapes[key])}
 

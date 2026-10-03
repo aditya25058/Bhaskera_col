@@ -21,7 +21,6 @@ from __future__ import annotations
 
 def dense_expert_forward(x, Wg, Wu, Wd):
     """Reference dense SwiGLU expert. ``x``: [H] or [B,H]."""
-    import torch
     import torch.nn.functional as F
 
     squeeze = x.dim() == 1
@@ -61,7 +60,6 @@ def sa_expert_forward(x, cols_cached, cols_missed, Wg, Wu, Wd):
 
 def verify_lossless(y_dense, y_sa):
     """Returns ``(linf, l1, cosine)`` between dense and SA-FFN outputs."""
-    import torch
 
     d = y_dense.float().reshape(-1)
     s = y_sa.float().reshape(-1)

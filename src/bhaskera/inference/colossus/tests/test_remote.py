@@ -89,11 +89,11 @@ def _remote(base_url, wm, cache, cap_gb=200.0):
 
 
 def test_fetch_exact(served_shard, tmp_path):
-    import urllib.request
     base_url, wm, srvdir = served_shard
     # local reference straight from the served files (same bytes the mock serves)
-    from safetensors import safe_open
     import glob
+
+    from safetensors import safe_open
     ref = {}
     for fn in glob.glob(srvdir + "/*.safetensors"):
         with safe_open(fn, framework="pt", device="cpu") as fh:
@@ -127,8 +127,9 @@ def test_warm_pass_zero_http(served_shard, tmp_path):
 
 def test_eviction_stays_exact(served_shard, tmp_path):
     base_url, wm, _ = served_shard
-    from safetensors import safe_open
     import glob
+
+    from safetensors import safe_open
     ref = {}
     # reference tensors (re-read served files)
     srvdir = RangeHandler.root

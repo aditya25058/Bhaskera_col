@@ -9,26 +9,26 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Any, Dict, Optional
+from typing import Any
 
-from .loading import ShardHandles, is_routed_expert_key, split_routed
 from .interface import classify_role
+from .loading import ShardHandles, split_routed
 
 DTYPE_BYTES = {"BF16": 2, "F16": 2, "F32": 4, "U8": 1, "I64": 8, "I32": 4}
 
 
-def inspect_weights(model_dir: str) -> Dict[str, Any]:
+def inspect_weights(model_dir: str) -> dict[str, Any]:
     """Weight statistics from the safetensors index alone (no tensors read)."""
     handles = ShardHandles.open(model_dir)
     return inspect_handles(handles)
 
 
-def inspect_handles(handles) -> Dict[str, Any]:
+def inspect_handles(handles) -> dict[str, Any]:
     """Weight statistics from any handles (local mmap or remote Range)."""
     resident, routed = split_routed(dict(handles.weight_map))
     routed_set = set(routed)
     nbytes = {"total": 0, "resident": 0, "routed": 0}
-    dtypes: Dict[str, int] = {}
+    dtypes: dict[str, int] = {}
     hidden, inter = 0, 0
     for k in handles.weight_map:
         info = handles.header(k)
@@ -62,7 +62,7 @@ def inspect_handles(handles) -> Dict[str, Any]:
 
 
 def describe_model(model_dir: str = "", profile: Any = None,
-                   name: Optional[str] = None, handles=None) -> Dict[str, Any]:
+                   name: str | None = None, handles=None) -> dict[str, Any]:
     """Canonical description: architecture (profile) + weights.
 
     Weights come from the local index, or from a prebuilt handles object
@@ -72,7 +72,7 @@ def describe_model(model_dir: str = "", profile: Any = None,
         w = inspect_weights(model_dir)
     else:
         w = inspect_handles(handles)
-    desc: Dict[str, Any] = {
+    desc: dict[str, Any] = {
         "model": {"name": name or os.path.basename((model_dir or "").rstrip("/"))},
         "weights": w,
         "moe": None,
@@ -110,7 +110,7 @@ def describe_model(model_dir: str = "", profile: Any = None,
 
 
 def write_inspect_json(model_dir: str, out_path: str, profile: Any = None,
-                       name: Optional[str] = None) -> Dict[str, Any]:
+                       name: str | None = None) -> dict[str, Any]:
     desc = describe_model(model_dir, profile, name)
     with open(out_path, "w") as f:
         json.dump(desc, f, indent=2)

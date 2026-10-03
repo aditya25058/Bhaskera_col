@@ -8,9 +8,8 @@ from __future__ import annotations
 
 import types
 
-import pytest
 import torch
-import torch.nn as nn
+from torch import nn
 
 from bhaskera.inference.colossus.placement import TieredMoEWrapper
 from bhaskera.inference.colossus.serve import prepare_model, serve_huge_moe

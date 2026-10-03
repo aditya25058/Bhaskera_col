@@ -24,7 +24,7 @@ Design decisions:
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -51,12 +51,12 @@ class ExpertOffloadManager:
         self.hot_expert_topk = hot_expert_topk
         self.device = device
         # State: {layer_idx: set of expert indices that were offloaded}
-        self._offloaded: Dict[int, Set[int]] = {}
+        self._offloaded: dict[int, set[int]] = {}
         self._bytes_offloaded: int = 0
         self._bytes_total_experts: int = 0
         self._profiled: bool = False
         # JIT-wrapped experts (for cleanup during restore)
-        self._jit_wrapped: List[Any] = []
+        self._jit_wrapped: list[Any] = []
         self._jit_fetches: int = 0  # count of JIT GPU fetches during generation
 
     # -- JIT prefetch wrappers -------------------------------------------
@@ -71,7 +71,6 @@ class ExpertOffloadManager:
         This keeps VRAM low (cold experts reside on CPU) while allowing
         correct execution for *any* routing decision the model makes.
         """
-        import torch
 
         original_forward = expert_module.forward
         device = self.device
@@ -111,7 +110,7 @@ class ExpertOffloadManager:
         hook: Any,
         model: Any,
         input_ids: Any,
-    ) -> Dict[int, List[int]]:
+    ) -> dict[int, list[int]]:
         """Run a lightweight forward pass on the prompt to collect hidden
         states, then use the ZSSR predictor to identify hot experts.
 
@@ -119,7 +118,7 @@ class ExpertOffloadManager:
         """
         import torch
 
-        hot_map: Dict[int, List[int]] = {}
+        hot_map: dict[int, list[int]] = {}
 
         # Run a single forward pass on the prompt to populate hook hidden states.
         # This is the prefill pass — it's already needed by generate(), so the
@@ -154,8 +153,8 @@ class ExpertOffloadManager:
     def offload_cold_experts(
         self,
         model: Any,
-        hot_map: Dict[int, List[int]],
-    ) -> Dict[str, Any]:
+        hot_map: dict[int, list[int]],
+    ) -> dict[str, Any]:
         """Move cold expert weights to CPU. Only experts NOT in ``hot_map``
         for each layer are offloaded.
 
@@ -295,7 +294,7 @@ class ExpertOffloadManager:
         model: Any,
         hook: Any,
         input_ids: Any,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Convenience method: profile + offload in one call.
 
         This is the primary API used by ``_HFBackend.generate()``.

@@ -19,7 +19,7 @@ import json
 import mmap
 import os
 import re
-from typing import Any, Dict, List, Tuple
+from typing import Any
 
 import torch
 
@@ -39,7 +39,7 @@ def is_routed_expert_key(key: str) -> bool:
     return any(rx.search(key) is not None for rx in EXPERT_CONTAINER_RES)
 
 
-def split_routed(weight_map: Dict[str, str]) -> Tuple[List[str], List[str]]:
+def split_routed(weight_map: dict[str, str]) -> tuple[list[str], list[str]]:
     """-> (resident_keys, routed_keys), both sorted for determinism."""
     resident, routed = [], []
     for k in weight_map:
@@ -50,7 +50,7 @@ def split_routed(weight_map: Dict[str, str]) -> Tuple[List[str], List[str]]:
 class ShardMap:
     """One aligned mmap per safetensors shard; zero-copy tensor views."""
 
-    _cache: Dict[str, "ShardMap"] = {}
+    _cache: dict[str, ShardMap] = {}
 
     def __init__(self, path: str):
         self.path = path
@@ -63,7 +63,7 @@ class ShardMap:
         self.u8 = torch.frombuffer(self.mm, dtype=torch.uint8)
 
     @classmethod
-    def get(cls, path: str) -> "ShardMap":
+    def get(cls, path: str) -> ShardMap:
         if path not in cls._cache:
             cls._cache[path] = ShardMap(path)
         return cls._cache[path]
@@ -89,24 +89,24 @@ def _safetensors_dtype(tag: str) -> torch.dtype:
 class ShardHandles:
     """Index-driven mmap handles for a sharded safetensors model directory."""
 
-    def __init__(self, model_dir: str, weight_map: Dict[str, str]):
+    def __init__(self, model_dir: str, weight_map: dict[str, str]):
         self.model_dir = model_dir
         self.weight_map = weight_map
-        self._maps: Dict[str, ShardMap] = {}
-        self._safe: Dict[str, Any] = {}  # shard -> persistent safe_open handle
+        self._maps: dict[str, ShardMap] = {}
+        self._safe: dict[str, Any] = {}  # shard -> persistent safe_open handle
 
     @classmethod
-    def open(cls, model_dir: str) -> "ShardHandles":
+    def open(cls, model_dir: str) -> ShardHandles:
         idx_path = os.path.join(model_dir, "model.safetensors.index.json")
         with open(idx_path) as f:
             weight_map = json.load(f)["weight_map"]
         return cls(model_dir, weight_map)
 
     @classmethod
-    def open_partial(cls, model_dir: str) -> "ShardHandles":
+    def open_partial(cls, model_dir: str) -> ShardHandles:
         """Index-less: scan *.safetensors headers (partial checkouts welcome)."""
         import glob
-        weight_map: Dict[str, str] = {}
+        weight_map: dict[str, str] = {}
         for path in sorted(glob.glob(os.path.join(model_dir, "*.safetensors"))):
             fn = os.path.basename(path)
             sm = ShardMap.get(path)
@@ -150,7 +150,7 @@ class ShardHandles:
             self._maps[shard] = sm
         return sm.header[key]
 
-    def shards(self) -> List[str]:
+    def shards(self) -> list[str]:
         return sorted(set(self.weight_map.values()))
 
 
@@ -186,7 +186,7 @@ def set_module_tensor(model: torch.nn.Module, dotted: str, value: torch.Tensor,
         f"cannot resolve {dotted!r} on {type(model).__name__}: {last_exc}")
 
 
-def materialize(model: torch.nn.Module, keys: List[str], handles: ShardHandles,
+def materialize(model: torch.nn.Module, keys: list[str], handles: ShardHandles,
                 device: torch.device, dtype: torch.dtype = torch.bfloat16) -> int:
     """Copy resident keys into the (meta/empty) model on device. Returns bytes."""
     nbytes = 0

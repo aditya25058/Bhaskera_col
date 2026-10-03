@@ -22,10 +22,10 @@ from __future__ import annotations
 
 import logging
 from collections import deque
-from typing import Any, Deque, Dict, List, Optional
+from typing import Any
 
 import torch
-import torch.nn as nn
+from torch import nn
 
 logger = logging.getLogger(__name__)
 
@@ -44,24 +44,24 @@ class ColossusMoEHook:
         self.predictor = predictor
         self.directory = directory
         self.budget_preset = budget_preset
-        self._handles: List[Any] = []
-        self._states: Dict[int, Deque] = {}
+        self._handles: list[Any] = []
+        self._states: dict[int, deque] = {}
         self._steps = 0
-        self._layers: List[int] = []
+        self._layers: list[int] = []
         self._hits_count = 0
         self._misses_count = 0
-        self.disabled_reason: Optional[str] = None
+        self.disabled_reason: str | None = None
         # Active-mode offload manager (set by build() when offload_enabled)
-        self._offload_mgr: Optional[Any] = None
+        self._offload_mgr: Any | None = None
         self._offload_stats: dict = {}
         # Dynamic MoE expert cache
-        self._wrapped_layers: Dict[int, Any] = {}
+        self._wrapped_layers: dict[int, Any] = {}
         self._dynamic_cache_enabled: bool = False
         self._cache_capacity: int = 16
 
     # -- construction ----------------------------------------------------
     @classmethod
-    def build(cls, model, profile, colossus_cfg) -> "ColossusMoEHook":
+    def build(cls, model, profile, colossus_cfg) -> ColossusMoEHook:
         """Best-effort router extraction. Raises with reason if unsupported."""
         from .directory import ColumnDirectory, plan_fixed_packets  # noqa: F401
         from .predictor import ZSSRPredictor
@@ -76,7 +76,7 @@ class ColossusMoEHook:
         if model_layers is not None:
             num_layers = max(num_layers, len(model_layers))
 
-        for idx in range(0, max(num_layers, 1)):
+        for idx in range(max(num_layers, 1)):
             if model_layers is None or idx >= len(model_layers):
                 continue
             layer = model_layers[idx]
@@ -133,7 +133,7 @@ class ColossusMoEHook:
         return hook
 
     # -- attach ----------------------------------------------------------
-    def attach(self, model, profile, device: Optional[torch.device] = None) -> int:
+    def attach(self, model, profile, device: torch.device | None = None) -> int:
         """Hook decoder layers or install dynamic MoE cache wrappers."""
         if getattr(self, "_dynamic_cache_enabled", False):
             from .dynamic_cache import DynamicMoELayerWrapper
@@ -145,7 +145,7 @@ class ColossusMoEHook:
                 missing_ratio = getattr(self, "_missing_col_ratio", 1.0)
                 warmup_slots = getattr(self, "_warmup_slots", 0)
                 lookahead_enabled = getattr(self, "_lookahead_enabled", False)
-                for idx in range(0, len(model_layers)):
+                for idx in range(len(model_layers)):
                     layer = model_layers[idx]
                     is_block_sparse = hasattr(layer, "block_sparse_moe")
                     mlp = getattr(layer, "block_sparse_moe", getattr(layer, "mlp", None))
@@ -274,7 +274,7 @@ class ColossusMoEHook:
         logger.info(f"[Colossus] Prefill warmup completed for {warmed} MoE layers")
 
     # -- active-mode offload / dynamic cache API ------------------------
-    def maybe_offload(self, model, input_ids) -> Optional[dict]:
+    def maybe_offload(self, model, input_ids) -> dict | None:
         """If dynamic cache is active, log VRAM and return status.
         If legacy offload manager is set, profile and offload.
         """
@@ -314,7 +314,7 @@ class ColossusMoEHook:
 
     # -- shadow prediction API (future SA-FFN replacement consumes this) --
     @torch.inference_mode()
-    def predict_for(self, h_prev: torch.Tensor, layer: int) -> Optional[dict]:
+    def predict_for(self, h_prev: torch.Tensor, layer: int) -> dict | None:
         """Return ``{experts, columns, hits, misses}`` or None if unknown."""
         from .directory import plan_fixed_packets
 

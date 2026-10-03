@@ -13,10 +13,10 @@ from __future__ import annotations
 import contextlib
 import logging
 import time
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any
 
 import torch
-import torch.nn as nn
+from torch import nn
 
 logger = logging.getLogger(__name__)
 
@@ -24,14 +24,14 @@ logger = logging.getLogger(__name__)
 class DynamicMoELayerWrapper(nn.Module):
     """Wraps SparseMoeBlock with pre-allocated GPU slot cache and async DMA streaming."""
 
-    _shared_dummy_expert: Optional[Any] = None
-    _shared_down_cold_rx: Optional[torch.Tensor] = None
-    _pinned_staging: Dict[str, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+    _shared_dummy_expert: Any | None = None
+    _shared_down_cold_rx: torch.Tensor | None = None
+    _pinned_staging: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
 
     @classmethod
     def get_pinned_staging(
         cls, key: str, intermediate_size: int, hidden_size: int, dtype: torch.dtype
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Allocate reusable pinned host staging buffers for direct DMA (Opt 1b).
         One buffer is ~352 MB. We maintain one for demand ('demand') and one for prefetch ('prefetch').
         Total host pinned RAM: ~704 MB (instantaneous 0.05s allocation vs 213s for 90GB).
@@ -60,7 +60,7 @@ class DynamicMoELayerWrapper(nn.Module):
         capacity: int = 16,
         device: torch.device = torch.device("cuda"),
         missing_col_ratio: float = 1.0,
-        config: Optional[Any] = None,
+        config: Any | None = None,
         warmup_slots: int = 0,
         lookahead_enabled: bool = False,
     ):
@@ -100,7 +100,7 @@ class DynamicMoELayerWrapper(nn.Module):
         self.missing_col_ratio = float(missing_col_ratio)
         self.i_missed = int(self.intermediate_size * self.missing_col_ratio)
         self.i_hot = self.intermediate_size - self.i_missed
-        self.missing_col_stats: List[float] = []
+        self.missing_col_stats: list[float] = []
 
         # Empirical DMA microbenchmark on Rudra rdgpu01 proved:
         # Pageable transfer is 111.69 ms vs Pinned 110.67 ms (only 0.9% delta).
@@ -189,10 +189,10 @@ class DynamicMoELayerWrapper(nn.Module):
         self.eval()
 
         # 4. Slot & LRU tracking
-        self.expert_to_slot: Dict[int, int] = {}
-        self.slot_to_expert: Dict[int, int] = {}
-        self.free_slots: List[int] = list(range(capacity))
-        self.slot_lru: List[int] = []  # most recently used at end
+        self.expert_to_slot: dict[int, int] = {}
+        self.slot_to_expert: dict[int, int] = {}
+        self.free_slots: list[int] = list(range(capacity))
+        self.slot_lru: list[int] = []  # most recently used at end
 
         # 5. Dedicated prefetch CUDA stream
         self.prefetch_stream = torch.cuda.Stream(device=device) if device.type == "cuda" else None
@@ -209,15 +209,15 @@ class DynamicMoELayerWrapper(nn.Module):
         self.demand_stall_s = 0.0
         self.prefetch_stall_s = 0.0
         self.pcie_time_s = 0.0
-        self.pending_prefetch_events: List[Tuple[torch.cuda.Event, torch.cuda.Event]] = []
-        self.pending_demand_events: List[Tuple[torch.cuda.Event, torch.cuda.Event]] = []
-        self.last_predicted_topk: Optional[List[int]] = None
+        self.pending_prefetch_events: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
+        self.pending_demand_events: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
+        self.last_predicted_topk: list[int] | None = None
 
         # Warmup cache with initial experts if requested
         if self.warmup_slots > 0:
             self.warmup(list(range(min(self.warmup_slots, self.capacity, self.num_experts))))
 
-    def warmup(self, initial_ids: List[int]):
+    def warmup(self, initial_ids: list[int]):
         """Warm up slots with initial experts."""
         for e_id in initial_ids[:self.capacity]:
             self._load_to_slot(e_id, non_blocking=False)
@@ -229,7 +229,7 @@ class DynamicMoELayerWrapper(nn.Module):
         self.pending_prefetch_events.clear()
         self.pending_demand_events.clear()
 
-    def warmup_from_prefill(self, hidden_states: torch.Tensor) -> List[int]:
+    def warmup_from_prefill(self, hidden_states: torch.Tensor) -> list[int]:
         """Opt 6: Analyze prefill routing decisions to seed cache with most-activated experts.
 
         Runs the router on all prefill token hidden states, counts expert activations,
@@ -287,7 +287,7 @@ class DynamicMoELayerWrapper(nn.Module):
         self.pending_demand_events = remaining
 
     def _load_to_slot(self, expert_id: int, non_blocking: bool = True, stream=None,
-                      locked_slots: Optional[Set[int]] = None) -> int:
+                      locked_slots: set[int] | None = None) -> int:
         """Stream expert weights from pinned CPU into assigned GPU slot via DMA."""
         if expert_id in self.expert_to_slot:
             slot_idx = self.expert_to_slot[expert_id]
@@ -399,7 +399,7 @@ class DynamicMoELayerWrapper(nn.Module):
 
         return slot_idx
 
-    def async_prefetch(self, expert_ids: List[int], locked_slots: Optional[Set[int]] = None) -> None:
+    def async_prefetch(self, expert_ids: list[int], locked_slots: set[int] | None = None) -> None:
         """Stream predicted experts to GPU via dedicated non-blocking CUDA stream."""
         miss_pref = [e_id for e_id in expert_ids if e_id not in self.expert_to_slot]
         if not miss_pref:
@@ -437,9 +437,9 @@ class DynamicMoELayerWrapper(nn.Module):
             self.pcie_time_s += dma_s
         self.pending_prefetch_events.clear()
 
-    def pre_attention_prefetch(self, hidden_states: torch.Tensor, confidence_threshold: float = 0.0) -> List[int]:
+    def pre_attention_prefetch(self, hidden_states: torch.Tensor, confidence_threshold: float = 0.0) -> list[int]:
         """Trigger speculative prefetch at layer entrance (before MHA) so DMA overlaps attention computation."""
-        predicted_topk: List[int] = []
+        predicted_topk: list[int] = []
         if self.router_weight is not None:
             with torch.no_grad():
                 h_rep = hidden_states[:, -1, :].to(dtype=self.router_weight.dtype, device=self.router_weight.device)
@@ -533,7 +533,7 @@ class DynamicMoELayerWrapper(nn.Module):
             # Standard generation step: all required experts fit in GPU slots simultaneously
             self.synchronize_prefetch()
 
-            locked_slots: Set[int] = set()
+            locked_slots: set[int] = set()
             for e_id in actual_flat:
                 if e_id in self.expert_to_slot:
                     self.hits += 1
@@ -613,7 +613,7 @@ class DynamicMoELayerWrapper(nn.Module):
 
         return y, (router_logits.view(bsz, seq_len, -1), topk_idx.view(bsz, seq_len, -1))
 
-    def get_stats(self) -> Dict[str, Any]:
+    def get_stats(self) -> dict[str, Any]:
         """Return layer cache metrics."""
         self._drain_demand_events(sync_first=True)
         total_accesses = self.hits + self.misses
