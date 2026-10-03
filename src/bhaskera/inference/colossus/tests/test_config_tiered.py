@@ -45,3 +45,15 @@ def test_defaults_off():
     cfg = Config()
     assert cfg.inference.colossus.placement == "off"
     assert cfg.inference.colossus.exactness_mode == "bitwise"
+
+
+def test_remote_fields_default_empty_and_round_trip():
+    from bhaskera.config import Config
+    cfg = Config()
+    col = cfg.inference.colossus
+    assert col.remote_repo == "" and col.remote_cache == ""
+    assert col.remote_cap_gb == 200.0 and col.local_mirror == ""
+    d = cfg.as_dict()
+    assert d["inference"]["colossus"]["remote_repo"] == ""
+    cfg2 = cfg.from_dict(d)
+    assert cfg2.inference.colossus.remote_cap_gb == 200.0

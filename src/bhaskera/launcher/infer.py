@@ -112,6 +112,21 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Chunked prefill size (0=single shot; bounds activation memory)")
     p.add_argument("--exactness-mode", default=None, choices=["bitwise", "ulp1"],
                    help="bitwise: GPU-only exact; ulp1: allow CPU placement")
+    # Phase B remote weights (research branch only; PRs frozen/unaffected).
+    p.add_argument("--remote-repo", default=None, metavar="REPO_ID",
+                   help="Serve without full download: fetch on demand from Hub "
+                        "(e.g. Qwen/Qwen3-30B-A3B); needs --remote-cache")
+    p.add_argument("--remote-cache", default=None, metavar="DIR",
+                   help="Persistent local tensor cache for --remote-repo")
+    p.add_argument("--remote-cap-gb", type=float, default=None,
+                   help="Remote cache byte cap (LRU, GB)")
+    p.add_argument("--local-mirror", default=None, metavar="DIR",
+                   help="Partial local checkout: serve local-first, remote fills "
+                        "the rest (TieredHandles; no index.json needed)")
+    p.add_argument("--log-routing", default=None, metavar="PATH",
+                   help="Dump per-layer per-step routing unions to JSON")
+    p.add_argument("--remote-token", default=None, metavar="TOKEN",
+                   help="Hub token for gated repos (or HF_TOKEN env)")
 
     return p
 
@@ -258,6 +273,11 @@ def main(argv: List[str] = None) -> None:
         getattr(_col, "prefill_chunk", 0) if _col else 0)
     _mode = args.exactness_mode or (getattr(_col, "exactness_mode", "bitwise")
                                     if _col else "bitwise")
+    _remote = args.remote_repo or (getattr(_col, "remote_repo", "") if _col else "")
+    _rcache = args.remote_cache or (getattr(_col, "remote_cache", "") if _col else "")
+    _rcap = args.remote_cap_gb if args.remote_cap_gb is not None else (
+        getattr(_col, "remote_cap_gb", 200.0) if _col else 200.0)
+    _mirror = args.local_mirror or (getattr(_col, "local_mirror", "") if _col else "")
     if _tier != "off":
         import os
         import torch
@@ -269,15 +289,19 @@ def main(argv: List[str] = None) -> None:
         from bhaskera.inference.colossus.serve import serve_huge_moe
 
         model_dir = args.model
-        if not model_dir or not Path(model_dir).is_dir():
+        remote = _remote
+        if remote:
+            assert _rcache, "--remote-repo needs --remote-cache"
+        elif not model_dir or not Path(model_dir).is_dir():
             parser.error("--offload-tier needs --model <local sharded dir with "
-                         "model.safetensors.index.json>")
+                         "model.safetensors.index.json> or --remote-repo")
         device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-        logger.info(f"Loading tokenizer + meta model from {model_dir} ...")
+        src = remote or model_dir
+        logger.info(f"Loading tokenizer + meta model from {src} ...")
         from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
         from accelerate import init_empty_weights
-        tokenizer = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
-        hf_cfg = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
+        tokenizer = AutoTokenizer.from_pretrained(src, trust_remote_code=True)
+        hf_cfg = AutoConfig.from_pretrained(src, trust_remote_code=True)
         with init_empty_weights():
             model = AutoModelForCausalLM.from_config(
                 hf_cfg, trust_remote_code=True)
@@ -285,13 +309,30 @@ def main(argv: List[str] = None) -> None:
         logger.info(f"Profile: {profile.num_experts} experts/layer, "
                     f"top-{profile.experts_per_token}, "
                     f"layer={getattr(profile.decoder_layer_cls, '__name__', '?')}")
-        handles = ShardHandles.open(model_dir)
+        if remote:
+            from bhaskera.inference.colossus.remote import RemoteShardHandles
+            import os as _os
+            remote_handles = RemoteShardHandles.from_hub(
+                remote, cache_dir=_rcache,
+                cache_cap_gb=_rcap,
+                token=args.remote_token or _os.environ.get("HF_TOKEN"))
+            if _mirror:
+                from bhaskera.inference.colossus.loading import ShardHandles as _SH
+                from bhaskera.inference.colossus.remote import TieredHandles
+                partial = _SH.open_partial(_mirror)
+                logger.info(f"Local mirror: {len(partial.weight_map)} tensors; "
+                            f"remote fills the rest")
+                handles = TieredHandles(partial, remote_handles)
+            else:
+                handles = remote_handles
+        else:
+            handles = ShardHandles.open(model_dir)
         t0 = time.perf_counter()
         res = serve_huge_moe(
             model, tokenizer, profile, handles, device, prompts,
             max_new_tokens=args.max_new_tokens or infer.max_new_tokens,
             capacity=_cap, placement=_tier,
-            prefill_chunk=_chunk)
+            prefill_chunk=_chunk, log_routing=args.log_routing)
         elapsed = time.perf_counter() - t0
         outputs = res["texts"]
         total_output_tokens = sum(_count_output_tokens(o, tokenizer) for o in outputs)
@@ -306,6 +347,13 @@ def main(argv: List[str] = None) -> None:
               f"hits={res['total_hits']} misses={res['total_misses']} | "
               f"DMA={res['total_dma_mb']:.1f} MB | prefill={res['prefill_s']:.1f}s | "
               f"Peak VRAM: {res['peak_vram_gb']:.2f} GB")
+        if remote:
+            st = handles.stats()
+            print(f"REMOTE: net={st['network_bytes'] / 1e9:.2f} GB fetched, "
+                  f"disk={st['disk_bytes'] / 1e9:.2f} GB reread, "
+                  f"reqs={st['requests']}, "
+                  f"cache={st['cache_bytes'] / 1e9:.2f}/{st['cache_cap_bytes'] / 1e9:.0f} GB "
+                  f"(hit {st['hit_rate'] * 100:.1f}%)")
         if args.output_file:
             out_path = Path(args.output_file)
             with open(out_path, "w") as f:

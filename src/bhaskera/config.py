@@ -92,6 +92,12 @@ class ColossusConfig:
     prefetch_conf: float = 0.0
     cpu_threads: int = 6
     audit_logits: str = ""
+    # Phase B remote weights (serve without full download; default off).
+    # NOTE: no token field by design (secrets belong in flags/env, not YAML).
+    remote_repo: str = ""
+    remote_cache: str = ""
+    remote_cap_gb: float = 200.0
+    local_mirror: str = ""
 
 
 @dataclass
@@ -459,6 +465,10 @@ def _dict_to_config(raw: dict) -> Config:
                 prefetch_conf=float(col_raw.get("prefetch_conf", 0.0)),
                 cpu_threads=int(col_raw.get("cpu_threads", 6)),
                 audit_logits=str(col_raw.get("audit_logits", "")),
+                remote_repo=str(col_raw.get("remote_repo", "")),
+                remote_cache=str(col_raw.get("remote_cache", "")),
+                remote_cap_gb=float(col_raw.get("remote_cap_gb", 200.0)),
+                local_mirror=str(col_raw.get("local_mirror", "")),
             ),
         ),
         monitoring=MonitoringConfig(
