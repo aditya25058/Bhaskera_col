@@ -196,6 +196,12 @@ Offload trades 3–9× speed for 3× memory on a model that fits — optional he
 
 **Integration note:** `generate()`-based dense paths fail on both transformers 4.57 and 5.12 against these modeling files (`seen_tokens`, mask size) — custom-model `generate` is fragile to version drift while the manual prefill/decode loop (as in `serve.py`) is robust. Upstream `engine.generate` needs the same compat attention before it can serve custom MoE modeling files.
 
+## 17. Third family live: Mixtral-8x7B + conditional routing bound (2026-10-01)
+
+**Mixtral-8x7B (32 layers, 8 experts, top-2, w1/w2/w3, `block_sparse_moe`) serves through the identical CLI with zero Mixtral-specific execution code: 1.0 tok/s B=1, 45 GB VRAM, coherent quicksort.** Three generality bugs found and fixed by this run (all in shared code, all tested): index keys without top prefix (prefix-tolerant placement), w1/w2/w3 projection discovery, tupled `(hidden, logits)` return convention for `block_sparse_moe` forwards.
+
+**Routing (the coarse counterexample):** consecutive-Jaccard **0.254** (vs 0.103 Lite, 0.041 V2-236B), K=8 union 3.33× → SVB oracle ceiling **2.4×**. The speculative kill is now **conditional with a measured threshold**: dead on fine-grained routing (Jaccard ≲ 0.15), viable-leaning on coarse (Jaccard ≳ 0.25). SP-MoE/MoE-SpeQ tested exactly this regime — reconciled, not contradicted.
+
 ## 15. Phase B (mock-first): remote-backed serving without full download
 
 **Design:** `RemoteShardHandles` mirrors the `ShardHandles` surface over HTTP Range + persistent content-addressed cache (verify-once, LRU byte-cap eviction, offline named errors, cold/warm split stats). Executors untouched by construction. Full spec in `docs/remote_handles_spec.md` (research branch only; PRs frozen and unaffected).
