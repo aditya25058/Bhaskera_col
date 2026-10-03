@@ -33,10 +33,16 @@ def test_small_model_slots_recommended():
 
 def test_huge_model_cpu_or_streaming():
     m = _moe()
+    # 24GB HBM cannot hold 24GB resident + KV: honest refusal with reasons
+    # (streaming still needs resident weights on GPU).
     r = plan(m, _hw(hbm=24.0, ram=400.0), {"batch": 1, "gen_tokens": 16},
              fidelity="ulp1")
-    assert r["feasible"]
-    assert r["recommended"]["placement"] in ("slots", "cpu")
+    assert not r["feasible"] and r["reasons"]
+    # 30GB HBM: resident fits, slots do not -> floor carries it.
+    r2 = plan(m, _hw(hbm=30.0, ram=400.0), {"batch": 1, "gen_tokens": 16},
+              fidelity="ulp1")
+    assert r2["feasible"]
+    assert r2["recommended"]["placement"] in ("slots", "cpu")
     # 24GB HBM cannot hold 24GB resident + slots: slots must fail, cpu wins
     slots = [c for c in r["candidates"] if c["placement"] == "slots" and c["capacity"] > 0]
     assert all(not c["fits"] for c in slots)
@@ -44,9 +50,11 @@ def test_huge_model_cpu_or_streaming():
 
 def test_streaming_floor_always_fits():
     m = _moe()
-    r = plan(m, _hw(hbm=4.0, ram=400.0), {"batch": 1, "gen_tokens": 16})
+    r = plan(m, _hw(hbm=30.0, ram=400.0), {"batch": 1, "gen_tokens": 16})
     caps = [c for c in r["candidates"] if c["capacity"] == 0]
     assert caps and all(c["fits"] for c in caps)
+    assert all(not c["fits"] for c in r["candidates"]
+               if c["placement"] == "slots" and c["capacity"] > 0)
 
 
 def test_unknown_arch_refused_with_reasons():

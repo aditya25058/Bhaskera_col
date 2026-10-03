@@ -8,8 +8,9 @@ Inputs (all discovered, never hardcoded):
 
 Output: ranked candidates [{placement, capacity, fits, first_token_s,
 steady_tps, vram_gb, ram_gb, fetched_gb, reasons[]}]. Best first.
-Streaming floor (capacity 0) is always feasible on any torch device:
-the planner prices, never refuses (unknown arch / no device excepted).
+Streaming floor (capacity 0) is feasible whenever resident weights fit HBM;
+beyond that (or unknown arch / no device) the planner refuses with reasons.
+Never refuses silently.
 """
 from __future__ import annotations
 
