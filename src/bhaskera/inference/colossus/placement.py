@@ -77,6 +77,7 @@ class TieredMoEWrapper(nn.Module):
         prefetch_conf: float = 0.0,
         cpu_exec: bool = False,
         cpu_cache_cap: int = 128,
+        tupled: bool = False,
     ):
         super().__init__()
         assert len(expert_keys) == spec.n_routed, "keys/experts misaligned"
@@ -92,6 +93,10 @@ class TieredMoEWrapper(nn.Module):
         self.prefetch_conf = float(prefetch_conf)
         self.cpu_exec = bool(cpu_exec)
         self.cpu_cache_cap = int(cpu_cache_cap)
+        # Return convention must match the replaced block: Mixtral-style
+        # `block_sparse_moe` forwards return (hidden, router_logits) while
+        # `mlp` blocks return a bare tensor. Mapped explicitly (known cases).
+        self.tupled = bool(tupled)
         self._cpu_cache: Dict[int, Dict[str, torch.Tensor]] = {}
         self._cpu_fifo: List[int] = []
 
@@ -247,8 +252,11 @@ class TieredMoEWrapper(nn.Module):
         shared_out = self.shared_experts(identity) if self.shared_experts is not None \
             else torch.zeros_like(identity)
         if self.cpu_exec:
-            return self._cpu_moe_forward(hidden_states, shared_out,
-                                         topk_indices, topk_weights, orig_shape)
+            out = self._cpu_moe_forward(hidden_states, shared_out,
+                                        topk_indices, topk_weights, orig_shape)
+            if self.tupled:
+                return out, None
+            return out
 
         if len(needed_experts) <= self.capacity:
             for exp_id in needed_experts:
@@ -299,7 +307,10 @@ class TieredMoEWrapper(nn.Module):
                      .mul_(topk_weights.unsqueeze(dim=-1))
                      .sum(dim=1)
                      .type(new_x.dtype))
-        return shared_out + final_out.view(*orig_shape)
+        out = shared_out + final_out.view(*orig_shape)
+        if self.tupled:
+            return out, None
+        return out
 
 
 def wrap_moe_layers(model: nn.Module, profile: Any, handles: Any,
@@ -337,7 +348,8 @@ def wrap_moe_layers(model: nn.Module, profile: Any, handles: Any,
             keys.append(expert_weight_keys(dotted_e, weight_keys))
         wrapper = TieredMoEWrapper(
             layer_idx=layer_idx, spec=spec, expert_keys=keys, device=device,
-            capacity=capacity, handles=handles, dma_stream=dma_stream, **opts)
+            capacity=capacity, handles=handles, dma_stream=dma_stream,
+            tupled=(attr == "block_sparse_moe"), **opts)
         setattr(layer, attr, wrapper)
         wrappers.append(wrapper)
     return wrappers

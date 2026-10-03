@@ -103,8 +103,7 @@ def test_mixtral_block_no_shared():
     assert w.misses > 0
 
 
-def test_prefetch_admission_and_suppress():
-    torch.manual_seed(4)
+def test_prefetch_admission_and_suppress():    torch.manual_seed(4)
     block = FakeDeepSeekBlock()
     w = _make(block, zssr_prefetch=True, prefetch_topk=4, prefetch_conf=0.99)
     x = torch.randn(1, 1, 16)
@@ -195,3 +194,20 @@ def test_wrapped_model_matches_native():
     # expert-grouped summation order differs from native token order).
     assert torch.allclose(y_run, y_ref, atol=1e-4)
     assert sum(w.misses for w in wrappers) > 0
+
+
+def test_tupled_return_convention():
+    torch.manual_seed(11)
+    block = FakeDeepSeekBlock()
+    spec = MoELayerSpec.from_block(block)
+    handles, keys = _handles_for(block)
+    w = TieredMoEWrapper(layer_idx=0, spec=spec, expert_keys=keys,
+                         device=torch.device("cpu"), capacity=4,
+                         handles=handles, dma_stream=None, tupled=True)
+    x = torch.randn(1, 1, 16)
+    out = w(x)
+    assert isinstance(out, tuple) and len(out) == 2
+    w2 = TieredMoEWrapper(layer_idx=0, spec=spec, expert_keys=keys,
+                          device=torch.device("cpu"), capacity=4,
+                          handles=handles, dma_stream=None, tupled=False)
+    assert isinstance(w2(x), torch.Tensor)
