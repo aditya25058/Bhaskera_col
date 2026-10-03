@@ -103,7 +103,8 @@ def test_mixtral_block_no_shared():
     assert w.misses > 0
 
 
-def test_prefetch_admission_and_suppress():    torch.manual_seed(4)
+def test_prefetch_admission_and_suppress():
+    torch.manual_seed(4)
     block = FakeDeepSeekBlock()
     w = _make(block, zssr_prefetch=True, prefetch_topk=4, prefetch_conf=0.99)
     x = torch.randn(1, 1, 16)
