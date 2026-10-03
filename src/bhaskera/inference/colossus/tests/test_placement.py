@@ -212,3 +212,20 @@ def test_tupled_return_convention():
                           device=torch.device("cpu"), capacity=4,
                           handles=handles, dma_stream=None, tupled=False)
     assert isinstance(w2(x), torch.Tensor)
+
+
+def test_streaming_floor_misses_everything_exact():
+    torch.manual_seed(12)
+    block = FakeDeepSeekBlock()
+    spec = MoELayerSpec.from_block(block)
+    handles, keys = _handles_for(block)
+    w = TieredMoEWrapper(layer_idx=0, spec=spec, expert_keys=keys,
+                         device=torch.device("cpu"), capacity=0,
+                         handles=handles, dma_stream=None)
+    assert len(w.slots) == 1  # one transient slot
+    x = torch.randn(1, 1, 16)
+    with torch.no_grad():
+        y1, y2 = w(x), w(x)
+    assert torch.equal(y1, y2)  # deterministic despite zero residency
+    assert not w.expert_to_slot  # bindings die every forward
+    assert w.hits == 0 and w.misses > 0

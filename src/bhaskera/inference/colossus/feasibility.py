@@ -102,7 +102,11 @@ def plan(model: dict, hw: dict, workload: dict,
                 "reasons": reasons,
             })
     feas = [c for c in cands if c["fits"]]
-    feas.sort(key=lambda c: -c["steady_tps"])
+    # Primary: estimated throughput. Tie-break: capacity nearest 2x top-k
+    # (covers one step's union with headroom; documented heuristic — the
+    # v1 model prices bytes, not hit-rate effects).
+    _tk = moe.get("top_k", 6) or 6
+    feas.sort(key=lambda c: (-c["steady_tps"], abs(c["capacity"] - 2 * _tk)))
     return {"feasible": bool(feas),
             "recommended": feas[0] if feas else cands[-1],
             "candidates": feas + [c for c in cands if not c["fits"]],

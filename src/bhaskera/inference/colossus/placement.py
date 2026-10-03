@@ -102,6 +102,12 @@ class TieredMoEWrapper(nn.Module):
 
         self.gate = spec.gate
         self.shared_experts = spec.shared
+        # Streaming floor (capacity 0): one transient slot, bindings cleared
+        # after every forward (every needed expert misses, honestly priced).
+        self.streaming = (capacity == 0)
+        if self.streaming:
+            capacity = 1
+        self.capacity = capacity
         self.slots: List[nn.Module] = nn.ModuleList([
             FastSlot(spec.hidden, spec.inter, device, spec.dtype, spec.activation)
             for _ in range(capacity)
@@ -308,6 +314,11 @@ class TieredMoEWrapper(nn.Module):
                      .sum(dim=1)
                      .type(new_x.dtype))
         out = shared_out + final_out.view(*orig_shape)
+        if self.streaming:
+            # Transient slot: bindings die here; next forward misses everything.
+            self.expert_to_slot.clear()
+            self.slot_to_expert.clear()
+            self.slot_lru = list(range(len(self.slots)))
         if self.tupled:
             return out, None
         return out
