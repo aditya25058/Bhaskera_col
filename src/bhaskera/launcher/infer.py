@@ -60,8 +60,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--model",   default=None,   help="HuggingFace model id (overrides config)")
     p.add_argument("--device",  default="auto", help="Device: auto | cuda | cpu | mps")
 
-    # Input
-    inp = p.add_mutually_exclusive_group(required=True)
+    # Input (required unless --plan, which serves nothing)
+    inp = p.add_mutually_exclusive_group(required=False)
     inp.add_argument("--prompt",      default=None, help="Single prompt string")
     inp.add_argument("--prompt-file", default=None, metavar="FILE",
                      help="File with one prompt per line")
@@ -256,7 +256,7 @@ def main(argv: List[str] = None) -> None:
     # ── Prompts ──────────────────────────────────────────────────────
     if args.prompt:
         prompts = [args.prompt]
-    else:
+    elif args.prompt_file:
         path = Path(args.prompt_file)
         if not path.exists():
             parser.error(f"Prompt file not found: {args.prompt_file}")
@@ -265,6 +265,10 @@ def main(argv: List[str] = None) -> None:
         if not prompts:
             parser.error(f"No prompts found in {args.prompt_file}")
         logger.info(f"Loaded {len(prompts)} prompts from {args.prompt_file}")
+    elif not args.plan:
+        parser.error("one of --prompt/--prompt-file is required (unless --plan)")
+    else:
+        prompts = []
 
     # ── Config ───────────────────────────────────────────────────────
     cfg = _build_config(args)
