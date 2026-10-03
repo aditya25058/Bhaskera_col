@@ -112,12 +112,19 @@ def find_proj(expert: nn.Module, *name_hints: str) -> nn.Linear:
     """Locate a projection Linear inside an expert by name hints.
 
     Primary: child whose name contains f"{hint}_proj" (gate_proj, ...).
+    Secondary: leaf name exactly equals a hint (w1/w2/w3 style).
     Fallback: error listing candidate Linear children (explicit > guessing).
     """
     named = dict(expert.named_modules())
     for hint in name_hints:
         for name, mod in named.items():
             if isinstance(mod, nn.Linear) and f"{hint}_proj" in name:
+                return mod
+    bare = {"w1": "gate", "w3": "up", "w2": "down"}
+    for hint in name_hints:
+        want = {k for k, v in bare.items() if v == hint} | {hint}
+        for name, mod in named.items():
+            if isinstance(mod, nn.Linear) and name.split(".")[-1] in want:
                 return mod
     cands = [n for n, m in named.items() if isinstance(m, nn.Linear)]
     raise KeyError(f"no projection matching {name_hints}; Linear candidates: {cands}")

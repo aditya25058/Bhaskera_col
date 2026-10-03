@@ -146,6 +146,23 @@ def test_find_proj_and_errors():
         find_proj(e, "nonexistent")
 
 
+class W123Expert(nn.Module):
+    """Mixtral-style expert (w1/w2/w3 leaf names, no _proj suffix)."""
+
+    def __init__(self, hidden=16, inter=24):
+        super().__init__()
+        self.w1 = nn.Linear(hidden, inter, bias=False)
+        self.w3 = nn.Linear(hidden, inter, bias=False)
+        self.w2 = nn.Linear(inter, hidden, bias=False)
+
+
+def test_find_proj_w123_style():
+    e = W123Expert()
+    assert find_proj(e, "gate") is e.w1
+    assert find_proj(e, "up") is e.w3
+    assert find_proj(e, "down") is e.w2
+
+
 def test_missing_gate_raises():
     m = nn.Module()
     m.experts = nn.ModuleList([FakeExpert()])
