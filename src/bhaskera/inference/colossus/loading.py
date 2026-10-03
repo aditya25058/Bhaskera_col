@@ -159,17 +159,31 @@ def set_module_tensor(model: torch.nn.Module, dotted: str, value: torch.Tensor,
                       dtype: torch.dtype | None = None) -> None:
     """Version-proof replacement for transformers' removed
     set_module_tensor_to_device: walk dotted path, replace param in-place.
-    Never queries the existing (possibly meta) tensor for device/dtype."""
+    Never queries the existing (possibly meta) tensor for device/dtype.
+    Tries the model root, then common decoder containers, tolerating index
+    keys with or without the top-level prefix."""
     parts = dotted.split(".")
-    mod = model
-    for p in parts[:-1]:
-        mod = getattr(mod, p)
-    v = value
-    if dtype is not None or device is not None:
-        v = v.to(device=device or v.device, dtype=dtype or v.dtype)
-    # Fresh Parameter (never .data-assign: meta->device is rejected, and
-    # replacement keeps inference graphs clean; no optim state exists here).
-    setattr(mod, parts[-1], torch.nn.Parameter(v, requires_grad=False))
+    last_exc = None
+    for root in (model, getattr(model, "model", None),
+                 getattr(model, "transformer", None)):
+        if root is None:
+            continue
+        try:
+            mod = root
+            for p in parts[:-1]:
+                mod = getattr(mod, p)
+            v = value
+            if dtype is not None or device is not None:
+                v = v.to(device=device or v.device, dtype=dtype or v.dtype)
+            # Fresh Parameter (never .data-assign: meta->device is rejected,
+            # and replacement keeps inference graphs clean).
+            setattr(mod, parts[-1], torch.nn.Parameter(v, requires_grad=False))
+            return
+        except AttributeError as e:
+            last_exc = e
+            continue
+    raise AttributeError(
+        f"cannot resolve {dotted!r} on {type(model).__name__}: {last_exc}")
 
 
 def materialize(model: torch.nn.Module, keys: List[str], handles: ShardHandles,

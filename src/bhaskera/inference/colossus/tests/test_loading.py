@@ -99,6 +99,28 @@ def test_materialize_into_empty_model(fake_model_dir):
     assert torch.equal(got, want)
 
 
+def test_set_module_tensor_prefix_tolerant():
+    from bhaskera.inference.colossus.loading import set_module_tensor
+    import torch.nn as nn
+
+    class Inner(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = nn.ModuleList([nn.Linear(4, 4, bias=False)])
+
+    class Outer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = Inner()
+
+    m = Outer().to("meta")
+    v = torch.randn(4, 4)
+    # index-style key without the top prefix resolves via .model container
+    set_module_tensor(m, "layers.0.weight", v, device=torch.device("cpu"),
+                      dtype=torch.float32)
+    assert torch.equal(m.model.layers[0].weight.cpu(), v)
+
+
 def test_conventions_in_sync():
     import bhaskera.introspect as intro
     from bhaskera.inference.colossus import loading as L
