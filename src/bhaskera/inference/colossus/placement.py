@@ -363,4 +363,9 @@ def wrap_moe_layers(model: nn.Module, profile: Any, handles: Any,
             tupled=(attr == "block_sparse_moe"), **opts)
         setattr(layer, attr, wrapper)
         wrappers.append(wrapper)
+    _want = int(getattr(profile, "num_experts", 0) or 0)
+    if _want > 0 and not wrappers:
+        raise RuntimeError(
+            "wrap_moe_layers: profile declares MoE experts but zero blocks "
+            "were wrapped (block discovery failed silently)")
     return wrappers
