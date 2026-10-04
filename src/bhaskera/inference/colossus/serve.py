@@ -172,6 +172,7 @@ def serve_huge_moe(model, tokenizer, profile, handles: ShardHandles,
                    config=None,
                    kv_cache: str = "full",
                    kv_kwargs: dict | None = None,
+                   dump_ids: str | None = None,
                    ) -> dict[str, Any]:
     """Greedy lockstep serve with ledger. Returns results dict.
 
@@ -316,6 +317,12 @@ def serve_huge_moe(model, tokenizer, profile, handles: ShardHandles,
         with open(audit_logits, "w") as f:
             _json2.dump({"audit": audit}, f)
         flip_audit = audit
+    if dump_ids:
+        import json as _json3
+        with open(dump_ids, "w") as f:
+            _json3.dump({"continuation_ids": generated_ids[:, prompt_len:].tolist()
+                         if B == 1 else None,
+                         "batch": B, "prompt_len": prompt_len}, f)
     return {
         "texts": texts,
         "batch_size": B,
