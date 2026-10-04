@@ -138,6 +138,18 @@ class BaseKVCache(Cache):
     def get_seq_length(self, layer_idx: Optional[int] = 0) -> int:
         return self.seq_len
 
+    def get_usable_length(self, seq_length: int = 0,
+                          layer_idx: Optional[int] = 0) -> int:
+        """HF Cache API: cached tokens usable for attention (both signatures)."""
+        return self.seq_len
+
+    @property
+    def seen_tokens(self) -> int:
+        return self.seq_len
+
+    def get_max_length(self) -> Optional[int]:
+        return getattr(self, "max_seq_len", None)
+
     @property
     @abstractmethod
     def seq_len(self) -> int: ...
@@ -280,8 +292,10 @@ class _LayerKVStore:
         device: torch.device,
         dtype: torch.dtype,
         full_precision: bool = False,
+        v_head_dim: int | None = None,
     ):
-        self.head_dim    = head_dim
+        self.head_dim    = head_dim      # k dim; None = lazy (first update)
+        self.v_head_dim  = v_head_dim if v_head_dim is not None else head_dim
         self.device      = device
         self.dtype       = dtype
         self.batch_size  = batch_size          # may be overwritten on first update
@@ -291,12 +305,11 @@ class _LayerKVStore:
         self.value_bits  = value_bits if not full_precision else min(value_bits + 2, 8)
         self.rotation_seed = rotation_seed
 
-        # Codebooks — on device, built once
-        self.k_cb = FastLloydMaxCodebook.get(head_dim, self.key_bits,   device)
-        self.v_cb = FastLloydMaxCodebook.get(head_dim, self.value_bits, device)
-
-        # Rotation — on device, never moved
-        self._R = _generate_rotation_matrix(head_dim, seed=rotation_seed, device=device)
+        # Codebooks + rotation — now (dims known) or lazily (dims observed).
+        self.k_cb = self.v_cb = None
+        self._R_k = self._R_v = None
+        if head_dim is not None:
+            self._init_codecs(head_dim, self.v_head_dim)
 
         # Pre-allocated compressed storage — lazily initialised on first update()
         # so we use the real tensor B/H rather than the model-config estimate.
@@ -320,33 +333,53 @@ class _LayerKVStore:
     # Lazy allocation — called on first update with the real tensor shape  #
     # ------------------------------------------------------------------ #
 
-    def _lazy_alloc(self, B: int, H: int) -> None:
-        """Allocate compressed storage using the *actual* B and H from the
-        first tensor seen.  This avoids the Falcon MQA mismatch where the
-        model config reports num_attention_heads=71 but the KV tensors only
-        have 1 head (MQA)."""
+    def _init_codecs(self, dk: int, dv: int) -> None:
+        """Build per-side codebooks + rotations (scalar LUTs, dim-sized R)."""
+        self.k_cb = FastLloydMaxCodebook.get(dk, self.key_bits, self.device)
+        self.v_cb = FastLloydMaxCodebook.get(dv, self.value_bits, self.device)
+        self._R_k = _generate_rotation_matrix(dk, seed=self.rotation_seed,
+                                              device=self.device)
+        self._R_v = (_generate_rotation_matrix(dv, seed=self.rotation_seed + 1,
+                                               device=self.device)
+                     if dv != dk else self._R_k)
+
+    def _lazy_alloc(self, B: int, H: int, Dk: int, Dv: int) -> None:
+        """Allocate compressed storage using the *actual* B/H/D from the
+        first tensor seen (Falcon MQA precedent; now also MLA k/v dims)."""
+        if self.head_dim is None:
+            self.head_dim, self.v_head_dim = Dk, Dv
+            self._init_codecs(Dk, Dv)
+        if Dk != self.head_dim or Dv != self.v_head_dim:
+            raise ValueError(
+                f"KV dim change mid-run: k {self.head_dim}->{Dk}, "
+                f"v {self.v_head_dim}->{Dv}")
         if self._allocated:
             return
         self.batch_size = B
         self.num_heads  = H
         BH = B * H
-        D  = self.head_dim
         mc = self.max_seq_len
-        self._k_idx   = torch.zeros(mc, BH, D, dtype=torch.int16,  device=self.device)
-        self._k_norms = torch.zeros(mc, BH,    dtype=torch.float16, device=self.device)
-        self._v_idx   = torch.zeros(mc, BH, D, dtype=torch.int16,  device=self.device)
-        self._v_norms = torch.zeros(mc, BH,    dtype=torch.float16, device=self.device)
+        self._k_idx   = torch.zeros(mc, BH, Dk, dtype=torch.int16,  device=self.device)
+        self._k_norms = torch.zeros(mc, BH,     dtype=torch.float16, device=self.device)
+        self._v_idx   = torch.zeros(mc, BH, Dv, dtype=torch.int16,  device=self.device)
+        self._v_norms = torch.zeros(mc, BH,     dtype=torch.float16, device=self.device)
         self._allocated = True
 
     # ------------------------------------------------------------------ #
     # Rotation helpers                                                     #
     # ------------------------------------------------------------------ #
 
-    def _rotate(self, x: torch.Tensor) -> torch.Tensor:
-        return x @ self._R.T
+    def _rotate_k(self, x: torch.Tensor) -> torch.Tensor:
+        return x @ self._R_k.T
 
-    def _unrotate(self, y: torch.Tensor) -> torch.Tensor:
-        return y @ self._R
+    def _unrotate_k(self, y: torch.Tensor) -> torch.Tensor:
+        return y @ self._R_k
+
+    def _rotate_v(self, x: torch.Tensor) -> torch.Tensor:
+        return x @ self._R_v.T
+
+    def _unrotate_v(self, y: torch.Tensor) -> torch.Tensor:
+        return y @ self._R_v
 
     # ------------------------------------------------------------------ #
     # Compress one chunk of tokens and store                              #
@@ -360,23 +393,24 @@ class _LayerKVStore:
         Also extends _dec_k/_dec_v with the dequantized reconstruction so
         we never need to re-decode old tokens.
         """
-        B, H, T, D = k.shape
+        B, H, T, Dk = k.shape
+        Dv = v.shape[-1]
         # Flatten to (T*B*H, D) — treat all as independent vectors
-        k_flat = k.permute(2, 0, 1, 3).reshape(T, B * H, D)
-        v_flat = v.permute(2, 0, 1, 3).reshape(T, B * H, D)
+        k_flat = k.permute(2, 0, 1, 3).reshape(T, B * H, Dk)
+        v_flat = v.permute(2, 0, 1, 3).reshape(T, B * H, Dv)
 
         for t in range(T):
             if self._comp_ptr >= self._k_idx.shape[0]:
                 # Grow the pre-allocated tensors (rare — only if max_seq_len underestimated)
                 extra = max(128, self._k_idx.shape[0] // 2)
                 BH_ = self.batch_size * self.num_heads
-                self._k_idx   = torch.cat([self._k_idx,   torch.zeros(extra, BH_, D, dtype=torch.int16,  device=self.device)])
+                self._k_idx   = torch.cat([self._k_idx,   torch.zeros(extra, BH_, Dk, dtype=torch.int16,  device=self.device)])
                 self._k_norms = torch.cat([self._k_norms, torch.zeros(extra, BH_,    dtype=torch.float16, device=self.device)])
-                self._v_idx   = torch.cat([self._v_idx,   torch.zeros(extra, BH_, D, dtype=torch.int16,  device=self.device)])
+                self._v_idx   = torch.cat([self._v_idx,   torch.zeros(extra, BH_, Dv, dtype=torch.int16,  device=self.device)])
                 self._v_norms = torch.cat([self._v_norms, torch.zeros(extra, BH_,    dtype=torch.float16, device=self.device)])
 
-            kt = k_flat[t].float()   # (BH, D)
-            vt = v_flat[t].float()
+            kt = k_flat[t].float()   # (BH, Dk)
+            vt = v_flat[t].float()   # (BH, Dv)
 
             # Normalise
             k_norms = kt.norm(dim=-1)  # (BH,)
@@ -384,9 +418,9 @@ class _LayerKVStore:
             kt_unit = kt / k_norms.unsqueeze(-1).clamp(min=1e-8)
             vt_unit = vt / v_norms.unsqueeze(-1).clamp(min=1e-8)
 
-            # Rotate
-            kt_rot = self._rotate(kt_unit)
-            vt_rot = self._rotate(vt_unit)
+            # Rotate (per-side matrices)
+            kt_rot = self._rotate_k(kt_unit)
+            vt_rot = self._rotate_v(vt_unit)
 
             # Quantize
             k_idx = self.k_cb.quantize(kt_rot)   # (BH, D) int16
@@ -403,12 +437,12 @@ class _LayerKVStore:
             dec_k_chunk = self._decode_range(
                 self._k_idx[self._comp_ptr - T : self._comp_ptr],
                 self._k_norms[self._comp_ptr - T : self._comp_ptr],
-                self.k_cb, B, H, T
+                self.k_cb, self._unrotate_k, Dk, B, H, T
             )
             dec_v_chunk = self._decode_range(
                 self._v_idx[self._comp_ptr - T : self._comp_ptr],
                 self._v_norms[self._comp_ptr - T : self._comp_ptr],
-                self.v_cb, B, H, T
+                self.v_cb, self._unrotate_v, Dv, B, H, T
             )
             # dec_k_chunk: (B, H, T, D)
             if self._dec_k is None:
@@ -424,16 +458,17 @@ class _LayerKVStore:
         idx_block:   torch.Tensor,
         norms_block: torch.Tensor,
         cb: FastLloydMaxCodebook,
+        unrotate,
+        D: int,
         B: int, H: int, T: int,
     ) -> torch.Tensor:
         """Decode T tokens from compressed storage -> (B, H, T, D) in self.dtype."""
-        D  = self.head_dim
         # Use dims stored at init — NOT the passed B/H args, which can mismatch
         # for models with GQA (e.g. Falcon num_key_value_heads=71).
         B_ = self.batch_size
         H_ = self.num_heads
         y_hat  = cb.dequantize(idx_block)                        # (T, BH, D) float32
-        x_unit = self._unrotate(y_hat)                           # (T, BH, D)
+        x_unit = unrotate(y_hat)                                 # (T, BH, D)
         norms  = norms_block.to(torch.float32).unsqueeze(-1)     # (T, BH, 1)
         x      = x_unit * norms                                  # (T, BH, D)
         return x.reshape(T, B_, H_, D).permute(1, 2, 0, 3).to(self.dtype)
@@ -454,8 +489,9 @@ class _LayerKVStore:
         O(1) amortised per decode step — the incremental decode cache
         means we only dequantize tokens at eviction time, not at read time.
         """
-        B, H, new_len, D = k.shape
-        self._lazy_alloc(B, H)   # no-op after first call
+        B, H, new_len, Dk = k.shape
+        Dv = v.shape[-1]
+        self._lazy_alloc(B, H, Dk, Dv)   # no-op after first call
 
         # Extend fp16 window
         if self._win_k is None:
@@ -538,11 +574,13 @@ class TurboQuantKVCache(BaseKVCache):
         dtype: torch.dtype = torch.bfloat16,
         device: torch.device = torch.device("cpu"),
         max_seq_len: int = 2048,
+        v_head_dim: int | None = None,
     ):
         self.num_layers       = num_layers
         self.batch_size       = batch_size
         self.num_heads        = num_heads
         self.head_dim         = head_dim
+        self.v_head_dim       = v_head_dim if v_head_dim is not None else head_dim
         self.key_bits         = key_bits
         self.value_bits       = value_bits
         self.residual_window  = residual_window
@@ -558,6 +596,7 @@ class TurboQuantKVCache(BaseKVCache):
                 _LayerKVStore(
                     num_layers=num_layers,
                     head_dim=head_dim,
+                    v_head_dim=v_head_dim,
                     key_bits=key_bits,
                     value_bits=value_bits,
                     max_seq_len=max_seq_len,
@@ -603,18 +642,32 @@ class TurboQuantKVCache(BaseKVCache):
     def memory_bytes(self) -> int:
         return sum(s.nbytes() for s in self._stores)
 
+    def _actual_seq(self) -> int:
+        if self._seq_len:
+            return self._seq_len
+        if not self._stores:
+            return 0
+        s = self._stores[0]
+        comp_toks = s._comp_ptr if s._comp_ptr else 0
+        win_toks = s._win_k.shape[2] if s._win_k is not None else 0
+        return comp_toks + win_toks
+
+    def get_usable_length(self, seq_length: int = 0,
+                          layer_idx: Optional[int] = 0) -> int:
+        return self._actual_seq()
+
+    @property
+    def seen_tokens(self) -> int:
+        return self._actual_seq()
+
     def compression_stats(self) -> dict:
         tq_bytes = self.memory_bytes()
         # Derive actual seq_len from the first store's data rather than the
         # external advance() counter (HF generate() never calls advance()).
-        actual_seq = self._seq_len
-        if actual_seq == 0 and self._stores:
-            s = self._stores[0]
-            comp_toks = s._comp_ptr if s._comp_ptr else 0
-            win_toks  = s._win_k.shape[2] if s._win_k is not None else 0
-            actual_seq = comp_toks + win_toks
-        elem       = self.batch_size * self.num_heads * actual_seq * self.head_dim
-        bf16_bytes = 2 * 2 * self.num_layers * max(elem, 1)
+        actual_seq = self._actual_seq()
+        elem_k     = self.batch_size * self.num_heads * actual_seq * (self.head_dim or 0)
+        elem_v     = self.batch_size * self.num_heads * actual_seq * (self.v_head_dim or 0)
+        bf16_bytes = 2 * self.num_layers * max(elem_k + elem_v, 1)
         ratio      = bf16_bytes / tq_bytes if tq_bytes > 0 else 0.0
         return {
             "tq_mb":             tq_bytes / 1e6,

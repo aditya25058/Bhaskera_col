@@ -250,6 +250,35 @@ def _render_output(
 
 
 # ---------------------------------------------------------------------------
+# Tiered KV mapping (COLOSSUS huge-model path)
+# ---------------------------------------------------------------------------
+
+def _tiered_kv_name(infer) -> str:
+    """Map engine kv_cache names onto tiered-loop strategies.
+
+    Tiered default stays full-precision DynamicCache (bitwise). Only an
+    explicit `turboquant` opts into approximate KV; `none` disables.
+    """
+    name = (getattr(infer, "kv_cache", None) or "full").lower()
+    if name in ("full", "dynamic", "static"):
+        return "full"
+    if name == "turboquant":
+        return "turboquant"
+    if name == "none":
+        return "none"
+    return "full"
+
+
+def _tiered_kv_kwargs(infer) -> dict:
+    tq = getattr(infer, "turboquant", None)
+    if tq is None:
+        return {}
+    return {"key_bits": tq.key_bits, "value_bits": tq.value_bits,
+            "residual_window": tq.residual_window,
+            "protected_layers": getattr(tq, "protected_layers", 2)}
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -408,13 +437,16 @@ def main(argv: List[str] = None) -> None:
             import json as _json
             with open(args.teacher_tokens) as f:
                 _teacher = _json.load(f)
+        _kv_name = _tiered_kv_name(infer)
         res = serve_huge_moe(
             model, tokenizer, profile, handles, device, prompts,
             max_new_tokens=args.max_new_tokens or infer.max_new_tokens,
             capacity=_cap, placement=_tier,
             prefill_chunk=_chunk, log_routing=args.log_routing,
             teacher_tokens=_teacher, audit_logits=args.audit_logits,
-            config=hf_cfg)
+            config=hf_cfg, kv_cache=_kv_name,
+            use_cache=(_kv_name != "none"),
+            kv_kwargs=_tiered_kv_kwargs(infer))
         elapsed = time.perf_counter() - t0
         outputs = res["texts"]
         total_output_tokens = sum(_count_output_tokens(o, tokenizer) for o in outputs)
@@ -429,6 +461,11 @@ def main(argv: List[str] = None) -> None:
               f"hits={res['total_hits']} misses={res['total_misses']} | "
               f"DMA={res['total_dma_mb']:.1f} MB | prefill={res['prefill_s']:.1f}s | "
               f"Peak VRAM: {res['peak_vram_gb']:.2f} GB")
+        if res.get("kv_stats"):
+            ks = res["kv_stats"]
+            print(f"KV: turboquant {ks['tq_mb']:.1f} MB "
+                  f"(bf16 {ks['bf16_mb']:.1f} MB, "
+                  f"ratio {ks['compression_ratio']:.1f}x, seq {ks['seq_len']})")
         if remote:
             st = handles.stats()
             print(f"REMOTE: net={st['network_bytes'] / 1e9:.2f} GB fetched, "

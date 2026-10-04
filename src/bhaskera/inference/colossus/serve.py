@@ -17,6 +17,34 @@ from .placement import TieredMoEWrapper, wrap_moe_layers
 _compat_installed = False
 
 
+def _build_tiered_cache(kv_cache: str, kv_kwargs: dict | None, profile: Any,
+                        config: Any, batch: int, max_seq_len: int,
+                        device: torch.device):
+    """Past-key-values store for the tiered loop (strategy by name)."""
+    from transformers.cache_utils import DynamicCache
+    if kv_cache in (None, "full", "dynamic"):
+        return DynamicCache()
+    if kv_cache == "turboquant":
+        from bhaskera.inference.kv_cache import TurboQuantKVCache
+        kw = dict(kv_kwargs or {})
+        n_layers = int(getattr(profile, "num_hidden_layers", 0) or 0)
+        if n_layers <= 0:
+            raise ValueError("turboquant KV needs profile.num_hidden_layers")
+        n_heads = int(getattr(config, "num_attention_heads", 0) or 0)
+        if n_heads <= 0:
+            raise ValueError("turboquant KV needs config.num_attention_heads")
+        return TurboQuantKVCache(
+            num_layers=n_layers, batch_size=batch, num_heads=n_heads,
+            head_dim=kw.pop("head_dim", None),
+            v_head_dim=kw.pop("v_head_dim", None),
+            key_bits=kw.pop("key_bits", 4), value_bits=kw.pop("value_bits", 2),
+            residual_window=kw.pop("residual_window", 128),
+            protected_layers=kw.pop("protected_layers", 2),
+            dtype=torch.bfloat16, device=device, max_seq_len=max_seq_len,
+            **kw)
+    raise ValueError(f"unknown tiered kv_cache {kv_cache!r}")
+
+
 def install_cache_compat(model_type: str | None = None) -> None:
     """Polyfills for modeling code written against older transformers cache APIs.
 
@@ -142,8 +170,15 @@ def serve_huge_moe(model, tokenizer, profile, handles: ShardHandles,
                    teacher_tokens: list[int] | None = None,
                    audit_logits: str | None = None,
                    config=None,
+                   kv_cache: str = "full",
+                   kv_kwargs: dict | None = None,
                    ) -> dict[str, Any]:
-    """Greedy lockstep serve with ledger. Returns results dict."""
+    """Greedy lockstep serve with ledger. Returns results dict.
+
+    kv_cache: "full" (DynamicCache, bitwise) | "turboquant" (K4/V2
+    approximate — leaves the bitwise contract; flip-audit before trusting
+    text) | "none" (no cache).
+    """
     from transformers.cache_utils import DynamicCache
 
     install_cache_compat(getattr(profile, "model_type", None))
@@ -167,7 +202,9 @@ def serve_huge_moe(model, tokenizer, profile, handles: ShardHandles,
         torch.cuda.synchronize(device)
         torch.cuda.reset_peak_memory_stats(device)
     t_prefill = time.perf_counter()
-    past = DynamicCache() if use_cache else None
+    past = _build_tiered_cache(kv_cache, kv_kwargs, profile, config,
+                               B, prompt_len + max_new_tokens + 8,
+                               device) if use_cache else None
     with torch.no_grad():
         if prefill_chunk > 0 and generated_ids.shape[1] > prefill_chunk:
             logits, seqlen = None, generated_ids.shape[1]
@@ -254,6 +291,12 @@ def serve_huge_moe(model, tokenizer, profile, handles: ShardHandles,
     total_hits = sum(w.hits for w in wrappers)
     total_misses = sum(w.misses for w in wrappers)
     total_dma_mb = sum(w.dma_bytes for w in wrappers) / (1024 ** 2)
+    kv_stats = None
+    if past is not None and hasattr(past, "compression_stats"):
+        try:
+            kv_stats = past.compression_stats()
+        except Exception:
+            kv_stats = None
     total_decode = sum(latencies)
     agg_tokens = sum(new_counts)
     peak = (torch.cuda.max_memory_allocated(device) / (1024 ** 3)
@@ -289,4 +332,5 @@ def serve_huge_moe(model, tokenizer, profile, handles: ShardHandles,
         "capacity": capacity,
         "routing_log_steps": routing_steps,
         "flip_audit": flip_audit,
+        "kv_stats": kv_stats,
     }
