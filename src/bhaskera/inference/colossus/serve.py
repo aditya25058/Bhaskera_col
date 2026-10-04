@@ -238,7 +238,8 @@ def serve_huge_moe(model, tokenizer, profile, handles: ShardHandles,
         own = int(ti[0])
         audit.append({"pos": 1, "own": own, "ref": teacher_tokens[0],
                       "match": own == teacher_tokens[0],
-                      "margin": float(tv[0] - tv[1])})
+                      "margin": float(tv[0] - tv[1]),
+                      "own_bf16": int(logits[0, -1, :].argmax())})
         next_token = torch.tensor([[teacher_tokens[0]]], device=device)
 
     finished = [False] * B
@@ -270,7 +271,8 @@ def serve_huge_moe(model, tokenizer, profile, handles: ShardHandles,
                     ref = teacher_tokens[pos - 1]
                     audit.append({"pos": pos, "own": own, "ref": ref,
                                   "match": own == ref,
-                                  "margin": float(tv[0] - tv[1])})
+                                  "margin": float(tv[0] - tv[1]),
+                                  "own_bf16": int(logits[0, -1, :].argmax())})
                     next_token = torch.tensor([[ref]], device=device)
         if device.type == "cuda":
             torch.cuda.synchronize(device)
