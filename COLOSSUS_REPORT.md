@@ -255,3 +255,11 @@ Old ceiling (B=64 shared, 38.6 agg) was not a ceiling — shared-batch union con
 | 512 | OOM (decode KV) | >93 GB | — | survived |
 
 Two findings: (1) cold-page-cache tax is 2× (16.5 → 32.9) — research scaffold prefaults, CLI does not; prefault/pin is the cheapest pending win for every first run. (2) The wall is decode-KV at B=512, prefill survives — TurboQuant KV wiring (exists in core, not in `serve_huge_moe`) is the key to past it, at the cost of leaving the bitwise contract (needs ulp-grade flip re-validation). Logs: `/tmp/b{64,128,256,384,448,512}*.log` on H100.
+
+## 22. TurboQuant KV in the tiered loop: works, exact below window, cannot lift the wall (branch `colossus-tqkv`)
+
+Wiring done and validated: dual-dim MLA store (K192/V128, lazy dims), HF-compat surface (per-layer usable_length — prefill double-count fixed — seen_tokens, get_max_length), `--kv-cache turboquant --residual-window N` in the tiered CLI, `--dump-ids` teacher artifacts, KV stats line. Five runs agree bitwise below the compression window (TQ == full-KV, same DMA to the byte).
+
+Negative result that matters: at B=64×200 (the known-OOM point) TQ still OOMs in decode. Memory audit: int16 indices are 2 B/element (same as bf16), and the O(1) incremental decoded-history cache holds full bf16 — so TQ memory = window + decoded + indices ≥ full KV, strictly bigger. Packing (4-bit→nibbles) alone cannot fix it; the decoded history dominates. Lifting the length wall needs packed indices AND a streaming (non-materialized-history) decode path — a separate project. B=512×12 also stands OOM (prefill logits transient, not KV — needs chunked-logits modeling surgery; not pursued).
+
+Shipped perf (unchanged): B=448 shared @ 218.4 tok/s agg (§21). Open P0 (separate ticket): cross-process prefill argmax variance 300-vs-185 with identical inputs — same-process deterministic, audit-visible, clouds all single-sample flip claims including Gemma 16/16.
