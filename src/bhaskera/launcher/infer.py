@@ -310,6 +310,7 @@ def main(argv: List[str] = None) -> None:
 
     # ── Config ───────────────────────────────────────────────────────
     cfg = _build_config(args)
+    infer = cfg.inference
 
     # ── Planner ────────────────────────────────────────────────────
     # Model + hardware discovery -> feasibility -> ranked plan table.
