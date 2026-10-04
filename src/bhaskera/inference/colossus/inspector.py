@@ -45,7 +45,8 @@ def inspect_handles(handles) -> dict[str, Any]:
                 inter = int(shape[0])
         else:
             nbytes["resident"] += n
-            if "embed_tokens" in k and len(shape) == 2:
+            if len(shape) == 2 and any(
+                    t in k for t in ("embed_tokens", "word_embeddings", "wte")):
                 hidden = int(shape[1])
     top_dtype = max(dtypes, key=dtypes.get) if dtypes else "BF16"
     return {
