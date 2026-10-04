@@ -109,7 +109,8 @@ def test_prepare_wraps_all_layers():
     assert all(isinstance(model.layers[i].mlp, TieredMoEWrapper) for i in (0, 1))
 
 
-def test_teacher_audit_records(tmp_path):    model = FakeCausalMoE()
+def test_teacher_audit_records(tmp_path):
+    model = FakeCausalMoE()
     tok = FakeTokenizer()
     handles = _stub_handles(model)
     audit_path = str(tmp_path / "audit.json")
