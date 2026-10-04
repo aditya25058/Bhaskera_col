@@ -59,7 +59,7 @@ def prepare_model(model: torch.nn.Module, profile: Any, handles: ShardHandles,
                   dtype: torch.dtype = torch.bfloat16,
                   placement: str = "slots", dma_stream: Any = None,
                   zssr: bool = False, prefetch_topk: int = 8,
-                  prefetch_conf: float = 0.0) -> list[TieredMoEWrapper]:
+                  prefetch_conf: float = 0.0, config=None) -> list[TieredMoEWrapper]:
     """Materialize resident weights + wrap MoE layers. Returns wrappers."""
     resident, _ = split_routed(handles.weight_map)
     materialize(model, resident, handles, device, dtype)
@@ -79,6 +79,22 @@ def prepare_model(model: torch.nn.Module, profile: Any, handles: ShardHandles,
                 remb.to(device)
             except Exception:
                 pass
+    # Generic fallback: modules computing rope tables inline in __init__
+    # (rope_init_fn + inv_freq buffer, no re-init hook) keep META tables
+    # under empty init. Recompute on device when config is available.
+    if config is not None:
+        for m in model.modules():
+            fn = getattr(m, "rope_init_fn", None)
+            inv = getattr(m, "inv_freq", None)
+            if callable(fn) and inv is not None and getattr(inv, "is_meta", False):
+                try:
+                    new_inv, _ = fn(config, device)
+                    m.register_buffer("inv_freq", new_inv.to(device),
+                                      persistent=False)
+                    if hasattr(m, "original_inv_freq"):
+                        m.original_inv_freq = m.inv_freq
+                except Exception:
+                    pass
     wrappers = wrap_moe_layers(
         model, profile, handles, device, capacity, dma_stream,
         zssr_prefetch=zssr, prefetch_topk=prefetch_topk,
@@ -96,6 +112,7 @@ def serve_huge_moe(model, tokenizer, profile, handles: ShardHandles,
                    log_routing: str | None = None,
                    teacher_tokens: list[int] | None = None,
                    audit_logits: str | None = None,
+                   config=None,
                    ) -> dict[str, Any]:
     """Greedy lockstep serve with ledger. Returns results dict."""
     from transformers.cache_utils import DynamicCache
@@ -106,7 +123,7 @@ def serve_huge_moe(model, tokenizer, profile, handles: ShardHandles,
                              dma_stream=(torch.cuda.Stream(device=device)
                                          if device.type == "cuda" else None),
                              zssr=zssr, prefetch_topk=prefetch_topk,
-                             prefetch_conf=prefetch_conf)
+                             prefetch_conf=prefetch_conf, config=config)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     enc = tokenizer(prompts, padding=True, return_tensors="pt")

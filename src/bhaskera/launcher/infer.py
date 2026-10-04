@@ -413,7 +413,8 @@ def main(argv: List[str] = None) -> None:
             max_new_tokens=args.max_new_tokens or infer.max_new_tokens,
             capacity=_cap, placement=_tier,
             prefill_chunk=_chunk, log_routing=args.log_routing,
-            teacher_tokens=_teacher, audit_logits=args.audit_logits)
+            teacher_tokens=_teacher, audit_logits=args.audit_logits,
+            config=hf_cfg)
         elapsed = time.perf_counter() - t0
         outputs = res["texts"]
         total_output_tokens = sum(_count_output_tokens(o, tokenizer) for o in outputs)
