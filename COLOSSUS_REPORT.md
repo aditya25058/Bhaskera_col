@@ -206,6 +206,10 @@ Offload trades 3–9× speed for 3× memory on a model that fits — optional he
 
 **Routing (the coarse counterexample):** consecutive-Jaccard **0.254** (vs 0.103 Lite, 0.041 V2-236B), K=8 union 3.33× → SVB oracle ceiling **2.4×**. The speculative kill is now **conditional with a measured threshold**: dead on fine-grained routing (Jaccard ≲ 0.15), viable-leaning on coarse (Jaccard ≳ 0.25). SP-MoE/MoE-SpeQ tested exactly this regime — reconciled, not contradicted.
 
+## 19. Fourth family: Param2-17B + the tied-head bug (Rudra/A100)
+
+Param2 (21 layers, 64 experts, top-6, `Param2MoEDecoderLayer`) serves through the identical CLI — 7.58 GB VRAM, hits 600+/723 — but first produced Bengali garbage while dense output was sane. Layer-by-layer bisection isolated it past gate/activation/shared/RoPE/weights/MoE-math (all verified, max 4.8e-7): **`lm_head.weight` has no index entry** (tied embeddings live only as `word_embeddings`); materialize never filled it, leaving a **meta head → constant-garbage logits**. Fix: replicate the tie (`lm_head.weight = embed weight`) when the head is still meta post-materialize. Output immediately sane (`if len(arr) <=`). Lesson banked in code: indexes omit tied weights; serving must reproduce factory ties, not just copy entries. Jaccard on Param2: **0.349** (stickiest yet — coarse/small routing confirmed as the trend).
+
 ## 15. Phase B (mock-first): remote-backed serving without full download
 
 **Design:** `RemoteShardHandles` mirrors the `ShardHandles` surface over HTTP Range + persistent content-addressed cache (verify-once, LRU byte-cap eviction, offline named errors, cold/warm split stats). Executors untouched by construction. Full spec in `docs/remote_handles_spec.md` (research branch only; PRs frozen and unaffected).
