@@ -109,8 +109,7 @@ def test_prepare_wraps_all_layers():
     assert all(isinstance(model.layers[i].mlp, TieredMoEWrapper) for i in (0, 1))
 
 
-def test_teacher_audit_records(tmp_path):
-    model = FakeCausalMoE()
+def test_teacher_audit_records(tmp_path):    model = FakeCausalMoE()
     tok = FakeTokenizer()
     handles = _stub_handles(model)
     audit_path = str(tmp_path / "audit.json")
@@ -126,3 +125,19 @@ def test_teacher_audit_records(tmp_path):
         assert set(e) == {"pos", "own", "ref", "match", "margin"}
         assert e["ref"] == 7 and e["match"] == (e["own"] == 7)
     assert res["flip_audit"] == audit
+
+
+def test_cache_compat_mask_patch_gated_by_family():
+    from transformers.modeling_attn_mask_utils import AttentionMaskConverter as AMC
+    from bhaskera.inference.colossus.serve import install_cache_compat
+    orig = AMC.to_causal_4d
+    try:
+        install_cache_compat("deepseek_v2")
+        assert getattr(AMC.to_causal_4d, "_colossus_patched", False) is True
+        install_cache_compat("deepseek_v2")  # re-entrant: no stacking
+        install_cache_compat("param2moe")
+        assert getattr(AMC.to_causal_4d, "_colossus_patched", False) is False
+        install_cache_compat(None)
+        assert getattr(AMC.to_causal_4d, "_colossus_patched", False) is False
+    finally:
+        AMC.to_causal_4d = orig

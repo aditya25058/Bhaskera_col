@@ -17,16 +17,16 @@ from .placement import TieredMoEWrapper, wrap_moe_layers
 _compat_installed = False
 
 
-def install_cache_compat() -> None:
+def install_cache_compat(model_type: str | None = None) -> None:
     """Polyfills for modeling code written against older transformers cache APIs.
 
-    Some custom modeling files (e.g. DeepSeek-V2) call
-    `DynamicCache.get_usable_length` and expect a non-None causal 4D mask.
-    Both shims are idempotent and model-agnostic in form.
+    get_usable_length is a pure method addition (harmless if unused).
+    The causal-mask patch (None -> zeros) is gated to DeepSeek-V2-family
+    modeling: other families (Param2, Mixtral, Qwen) rely on None meaning
+    "no mask" and break when it becomes zeros. Verified by bisection:
+    global patching corrupted Param2 prefill while DeepSeek needs it.
     """
     global _compat_installed
-    if _compat_installed:
-        return
     import torch as _torch
     from transformers.cache_utils import DynamicCache as _DC
     from transformers.modeling_attn_mask_utils import AttentionMaskConverter as _AMC
@@ -40,17 +40,24 @@ def install_cache_compat() -> None:
         return self.get_seq_length(layer_idx)
 
     _DC.get_usable_length = _get_usable_length
-    _orig = _AMC.to_causal_4d
+    want_mask_patch = bool(model_type and "deepseek" in model_type)
+    has_mask_patch = bool(getattr(_AMC.to_causal_4d, "_colossus_patched", False))
+    if want_mask_patch and not has_mask_patch:
+        _orig = _AMC.to_causal_4d
+        _AMC._colossus_orig = _orig
 
-    def _patched_to_causal_4d(self, batch_size, query_length, key_value_length,
-                              dtype, device="cpu"):
-        mask = _orig(self, batch_size, query_length, key_value_length, dtype, device)
-        if mask is None:
-            mask = _torch.zeros((batch_size, 1, query_length, key_value_length),
-                                dtype=dtype, device=device)
-        return mask
+        def _patched_to_causal_4d(self, batch_size, query_length, key_value_length,
+                                  dtype, device="cpu"):
+            mask = _orig(self, batch_size, query_length, key_value_length, dtype, device)
+            if mask is None:
+                mask = _torch.zeros((batch_size, 1, query_length, key_value_length),
+                                    dtype=dtype, device=device)
+            return mask
 
-    _AMC.to_causal_4d = _patched_to_causal_4d
+        _patched_to_causal_4d._colossus_patched = True
+        _AMC.to_causal_4d = _patched_to_causal_4d
+    elif not want_mask_patch and has_mask_patch:
+        _AMC.to_causal_4d = _AMC._colossus_orig
     _compat_installed = True
 
 
@@ -117,7 +124,7 @@ def serve_huge_moe(model, tokenizer, profile, handles: ShardHandles,
     """Greedy lockstep serve with ledger. Returns results dict."""
     from transformers.cache_utils import DynamicCache
 
-    install_cache_compat()
+    install_cache_compat(getattr(profile, "model_type", None))
     wrappers = prepare_model(model, profile, handles, device, capacity,
                              placement=placement,
                              dma_stream=(torch.cuda.Stream(device=device)
