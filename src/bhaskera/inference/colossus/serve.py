@@ -71,6 +71,20 @@ def prepare_model(model: torch.nn.Module, profile: Any, handles: ShardHandles,
     resident, _ = split_routed(handles.weight_map)
     materialize(model, resident, handles, device, dtype)
     model.eval()
+    # Tied LM head: indexes omit tied weights (no lm_head entry when tied to
+    # embeddings). from_pretrained shares storage; replicate the tie when the
+    # head is still meta after materialize. Silent meta heads produce
+    # constant garbage logits (found via Param2: prefill argmax pinned at 0).
+    try:
+        _head = getattr(model, "lm_head", None)
+        _hw = getattr(_head, "weight", None)
+        if _head is not None and getattr(_hw, "is_meta", False):
+            _emb = model.get_input_embeddings()
+            _ew = getattr(_emb, "weight", None) if _emb is not None else None
+            if _ew is not None and not getattr(_ew, "is_meta", False):
+                _head.weight = _ew
+    except Exception:
+        pass
     # RoPE-style computed buffers are meta after empty init; best-effort init
     # via duck-typed hooks (any attention exposing _init_rope).
     for m in model.modules():
@@ -86,10 +100,12 @@ def prepare_model(model: torch.nn.Module, profile: Any, handles: ShardHandles,
                 remb.to(device)
             except Exception:
                 pass
-    # Generic fallback: modules computing rope tables inline in __init__
-    # (rope_init_fn + inv_freq buffer, no re-init hook) keep META tables
-    # under empty init. Recompute on device when config is available.
+    # Generic fallback: REMOVED (was corrupting real rope tables on Param2:
+    # recompute fired on non-meta buffers via attribute confusion and rewrote
+    # working rotary state). Empty-init models must carry valid rope state
+    # through materialize/_init_rope paths only; silent recompute is banned.
     if config is not None:
+        n_recomputed = 0
         for m in model.modules():
             fn = getattr(m, "rope_init_fn", None)
             inv = getattr(m, "inv_freq", None)
@@ -100,8 +116,14 @@ def prepare_model(model: torch.nn.Module, profile: Any, handles: ShardHandles,
                                       persistent=False)
                     if hasattr(m, "original_inv_freq"):
                         m.original_inv_freq = m.inv_freq
+                    n_recomputed += 1
                 except Exception:
                     pass
+        if n_recomputed:
+            import logging as _logging
+            _logging.getLogger("bhaskera.serve").warning(
+                "recomputed %d meta rope tables (verify output!), model=%s",
+                n_recomputed, getattr(config, "model_type", "?"))
     wrappers = wrap_moe_layers(
         model, profile, handles, device, capacity, dma_stream,
         zssr_prefetch=zssr, prefetch_topk=prefetch_topk,
