@@ -126,6 +126,7 @@ def introspect_model(model: nn.Module) -> ModelProfile:
         profile.grouped_moe = True
         profile.grouped_containers = grouped
         profile.grouped_num_experts = grouped_n
+        profile.router_module_names = router_names
         if profile.num_experts == 0:
             profile.num_experts = grouped_n
         if profile.experts_per_token == 0:
