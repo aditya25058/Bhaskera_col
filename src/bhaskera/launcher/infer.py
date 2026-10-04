@@ -443,6 +443,9 @@ def main(argv: List[str] = None) -> None:
             if isinstance(_teacher, dict):
                 _teacher = _teacher.get("continuation_ids") or \
                     _teacher.get("teacher_tokens")
+            if isinstance(_teacher, list) and _teacher and \
+                    isinstance(_teacher[0], list):
+                _teacher = _teacher[0] if len(_teacher) == 1 else _teacher
         _kv_name = _tiered_kv_name(infer)
         res = serve_huge_moe(
             model, tokenizer, profile, handles, device, prompts,
