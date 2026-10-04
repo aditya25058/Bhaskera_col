@@ -512,6 +512,11 @@ def _find_lora_targets(
         # explicitly identified. No fragile substring matching here.
         if short_name in router_leaf_names:
             continue
+        # Composite routers (norm+proj submodules): a Linear nested INSIDE
+        # a detected router module is router machinery, not a LoRA target.
+        # Structural (path-based); module-based gates are leaves, unaffected.
+        if any(seg in router_leaf_names for seg in name.split(".")[:-1]):
+            continue
         targets.add(short_name)
 
     result = sorted(targets)
