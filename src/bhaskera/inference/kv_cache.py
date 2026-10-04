@@ -642,19 +642,24 @@ class TurboQuantKVCache(BaseKVCache):
     def memory_bytes(self) -> int:
         return sum(s.nbytes() for s in self._stores)
 
-    def _actual_seq(self) -> int:
-        if self._seq_len:
-            return self._seq_len
+    def _store_seq(self, layer_idx: int) -> int:
         if not self._stores:
             return 0
-        s = self._stores[0]
+        s = self._stores[layer_idx if 0 <= layer_idx < len(self._stores) else 0]
         comp_toks = s._comp_ptr if s._comp_ptr else 0
         win_toks = s._win_k.shape[2] if s._win_k is not None else 0
         return comp_toks + win_toks
 
+    def _actual_seq(self) -> int:
+        if self._seq_len:
+            return self._seq_len
+        return self._store_seq(0)
+
     def get_usable_length(self, seq_length: int = 0,
                           layer_idx: Optional[int] = 0) -> int:
-        return self._actual_seq()
+        # Per-layer: prefill walks layers sequentially, so a global count
+        # lies to every layer past the first (kv_seq_len double-count).
+        return self._store_seq(layer_idx or 0)
 
     @property
     def seen_tokens(self) -> int:
