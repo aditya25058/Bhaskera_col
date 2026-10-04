@@ -240,3 +240,18 @@ Param2 (21 layers, 64 experts, top-6, `Param2MoEDecoderLayer`) serves through th
 **Open threads:** step-latency decay within long runs (fast start → 3–6 s steps; page-cache churn of the 471 GB model on the 503 GB box + swap use — affects both paths); CPU per-layer 9.5 ms vs 3.1 ms bench (Python-loop overhead → torch.compile candidate for 3-2).
 
 **3-2 probe results (DNNL_VERBOSE, oneDNN v3.4.2, brg:avx512_core_bf16):** compile SLOWER than eager (1.34 vs 0.73 ms — dead); **zero primitive creates** (cache healthy, same descriptor everywhere — no capacity fix); sequential exec-sum ≈ wall (no fork/join gaps — 9.5 ms fully accounted: 18 matmuls × ~0.35 ms + pointwise + shuttle); pool serializes (18.9 ms wait vs 5.1 ms standalone — working-set churn over 354 distinct tensors/layer-token, not a tunable). C++ extension would save ~1 ms Python, not memory traffic — not pursued. Standing: sequential-6-thread CPU path, 9.5 ms/layer, 1.55 tok/s B=1.
+
+## 21. Batch wall remap: 38.6 → 218.4 tok/s agg (H100, DeepSeek-Coder-V2, C=12 shared)
+
+Old ceiling (B=64 shared, 38.6 agg) was not a ceiling — shared-batch union converges, so DMA/step stays ~constant (~19.6 GB) while tokens/step scale linearly. CLI repro matches research counters to <1% (hits 481/481, misses 5334/5306, DMA 240/238.8 GB, VRAM 60.47/60.47 GB).
+
+| B | agg tok/s | VRAM | DMA | prefill |
+|---|---|---|---|---|
+| 64 | 32.9 (38.6 orig; 16.5 cold) | 60.5 GB | 240 GB | 13.9 s |
+| 128 | 64.7 | 65.5 GB | 240 GB | 14.3 s |
+| 256 | 133.2 | 75.7 GB | 231 GB | 13.9 s |
+| 384 | 194.7 | 85.8 GB | 236 GB | 14.5 s |
+| 448 | **218.4** | 90.9 GB | 236 GB | 14.5 s |
+| 512 | OOM (decode KV) | >93 GB | — | survived |
+
+Two findings: (1) cold-page-cache tax is 2× (16.5 → 32.9) — research scaffold prefaults, CLI does not; prefault/pin is the cheapest pending win for every first run. (2) The wall is decode-KV at B=512, prefill survives — TurboQuant KV wiring (exists in core, not in `serve_huge_moe`) is the key to past it, at the cost of leaving the bitwise contract (needs ulp-grade flip re-validation). Logs: `/tmp/b{64,128,256,384,448,512}*.log` on H100.
