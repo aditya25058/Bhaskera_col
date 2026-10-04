@@ -129,6 +129,13 @@ def prepare_model(model: torch.nn.Module, profile: Any, handles: ShardHandles,
         zssr_prefetch=zssr, prefetch_topk=prefetch_topk,
         prefetch_conf=prefetch_conf,
         cpu_exec=(placement == "cpu"))
+    if getattr(profile, "grouped_moe", False):
+        # Representation 2 (grouped weights): the grouped adapter replaces
+        # experts containers in place; routing stays native upstream.
+        from .grouped import wrap_grouped_layers
+        wrappers = list(wrappers) + wrap_grouped_layers(
+            model, profile, handles, device, capacity,
+            dma_stream=dma_stream)
     return wrappers
 
 
