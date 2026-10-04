@@ -665,8 +665,13 @@ class TurboQuantKVCache(BaseKVCache):
         # Derive actual seq_len from the first store's data rather than the
         # external advance() counter (HF generate() never calls advance()).
         actual_seq = self._actual_seq()
-        elem_k     = self.batch_size * self.num_heads * actual_seq * (self.head_dim or 0)
-        elem_v     = self.batch_size * self.num_heads * actual_seq * (self.v_head_dim or 0)
+        dk = self.head_dim
+        dv = self.v_head_dim
+        if (dk is None or dv is None) and self._stores:
+            dk = self._stores[0].head_dim or 0
+            dv = self._stores[0].v_head_dim or 0
+        elem_k     = self.batch_size * self.num_heads * actual_seq * (dk or 0)
+        elem_v     = self.batch_size * self.num_heads * actual_seq * (dv or 0)
         bf16_bytes = 2 * self.num_layers * max(elem_k + elem_v, 1)
         ratio      = bf16_bytes / tq_bytes if tq_bytes > 0 else 0.0
         return {
