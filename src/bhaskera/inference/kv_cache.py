@@ -358,7 +358,10 @@ class _LayerKVStore:
         self.batch_size = B
         self.num_heads  = H
         BH = B * H
-        mc = self.max_seq_len
+        # Cap initial compressed prealloc: evicted tokens accumulate
+        # gradually and the grow path extends on demand. Full max_seq_len
+        # up front bankrupts big batches (B=256: ~60 GB of empty int16).
+        mc = min(self.max_seq_len, 64)
         self._k_idx   = torch.zeros(mc, BH, Dk, dtype=torch.int16,  device=self.device)
         self._k_norms = torch.zeros(mc, BH,     dtype=torch.float16, device=self.device)
         self._v_idx   = torch.zeros(mc, BH, Dv, dtype=torch.int16,  device=self.device)
