@@ -259,3 +259,17 @@ Two findings: (1) cold-page-cache tax is 2× (16.5 → 32.9) — research scaffo
 ## 26. Consolidation branch (`colossus-consolidated`, from `colossus-zssr` §21)
 
 Merge-ready main line, no experiments: prefill-token append + EOS-at-prefill guard, `--dump-ids`, teacher dict/batch unwrap, `infer` bind fix, bf16/fp32 audit discipline, `--prefault` (default off, §25 guidance), regression + prefault unit tests. Excludes: TQ-KV wiring (negative result, stays on `colossus-tqkv`), grouped adapter (stays on frozen `colossus-grouped-moe`, re-audit on `colossus-grouped-reaudit`). Verified: 59/59 colossus tests green (Rudra CPU) + H100 B=1 smoke — dump starts with prefill token 185, text regains leading newline, counters bit-identical to pre-fix trajectory (662/6376/286920). Prior branches untouched.
+
+## 27. Column thesis proven: exact inference at 10% expert residency (branch `colossus-column`, H100/DeepSeek-236B)
+
+Column-partitioned slots (`colres.py`: hot columns resident/LRU, cold per-use fetch into shared per-layer scratch, partial-GEMM + sum, native op order, router untouched; `--hot-col-frac`, generic wrapper hook). Two bugs caught en route by measurement: per-slot cold staging became shadow residency (91.6 GB — fixed to shared scratch), and a scaffold `columns.py` name-collision overwrite (restored + separated).
+
+| f (hot frac) | B=1 audit | margin | B=1 VRAM | B=64 tok/s | headline |
+|---|---|---|---|---|---|
+| expert (C=12) | 16/16 (prior) | — | 60.1 GB | 32.9 | baseline |
+| 1.0 | 16/16 | 1.75 | 60.1 | — | parity sanity |
+| 0.5 (C=24, equal HBM) | 16/16 | 1.75 | — | 31.8 (97%) | **B=512: 249.2 tok/s, 81.7 GB — expert-tier OOMs** |
+| 0.25 | 16/16 | 1.625 | 38.7 | — | — |
+| 0.1 | 16/16 | 1.75 | 34.4 | — | 0.3 tok/s B=1: cold-DMA wall, exactness intact |
+
+Success criterion (f ≤ 0.5, ≥30% slot-HBM drop, 16/16, throughput striking) MET at f=0.5 and exceeded: same-HBM parity at B=64, plus an HBM-bound operating point expert-tiering cannot reach. Exactness holds to f=0.1 by construction (summation partition), verified by audit — margins never collapse. Falsification status: gate 1 confirmed as cost (cold-DMA + 2× launches halve B=1 speed by f=0.1); gate 2 cleared (no margin collapse anywhere); gate 3 (FIRM matrix-granularity comparison) open — structural argument is that matrix units are strictly coarser than columns, but the head-to-head is not run. Literature position: FIRM-MoE (AAAI-26) must be cited as closest prior — matrix (not column) granularity, approximate edge setting, no exactness invariant; fMoE/MoEShard/SiDA differ in meaning/objective. Claim as framed: first column-granular HBM residency with exact inference + verification protocol.
