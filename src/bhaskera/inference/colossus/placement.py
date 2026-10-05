@@ -341,6 +341,7 @@ def wrap_moe_layers(model: nn.Module, profile: Any, handles: Any,
     import inspect as _inspect
     wrapper_cls = opts.pop("wrapper_cls", TieredMoEWrapper)
     hot_tiers = opts.pop("hot_tiers", None)
+    tier_pools = opts.pop("tier_pools", None)
     try:
         _takes_fracs = "hot_fracs" in _inspect.signature(
             wrapper_cls.__init__).parameters
@@ -372,6 +373,9 @@ def wrap_moe_layers(model: nn.Module, profile: Any, handles: Any,
             fr = hot_tiers.get(layer_idx)
             if fr is not None:
                 wkw["hot_fracs"] = [float(f) for f in fr]
+            if tier_pools is not None:
+                wkw["tier_pools"] = {float(k): int(v)
+                                     for k, v in tier_pools.items()}
         wrapper = wrapper_cls(
             layer_idx=layer_idx, spec=spec, expert_keys=keys, device=device,
             capacity=capacity, handles=handles, dma_stream=dma_stream,

@@ -92,6 +92,7 @@ class ColumnTieredMoEWrapper(nn.Module):
         tupled: bool = False,
         hot_frac: float = 1.0,
         hot_fracs: list[float] | None = None,
+        tier_pools: dict[float, int] | None = None,
         **opts,
     ):
         super().__init__()
@@ -115,13 +116,23 @@ class ColumnTieredMoEWrapper(nn.Module):
             capacity = 1
         self.capacity = capacity
         # Tier pools: one LRU pool per distinct fraction, so hot experts
-        # never share eviction pressure with thin ones. Capacity split
-        # evenly across tiers; remainder to the thickest tier.
+        # never share eviction pressure with thin ones. tier_pools pins
+        # exact slot counts per tier (pool >= tier members = pinned);
+        # otherwise capacity splits evenly, remainder to thickest tier.
         self.tiers = sorted(set(self.hot_fracs), reverse=True)
-        per, rem = divmod(capacity, len(self.tiers))
+        if tier_pools is not None:
+            pool_sizes = {t: int(tier_pools.get(t, tier_pools.get(str(t), 0)))
+                          for t in self.tiers}
+            missing = [t for t, n in pool_sizes.items() if n <= 0]
+            if missing:
+                raise ValueError(f"tier_pools lacks slots for tiers {missing}")
+        else:
+            per, rem = divmod(capacity, len(self.tiers))
+            pool_sizes = {t: max(1, per + (1 if i < rem else 0))
+                          for i, t in enumerate(self.tiers)}
         self.pools: dict[float, dict] = {}
-        for i, t in enumerate(self.tiers):
-            nslots = max(1, per + (1 if i < rem else 0))
+        for t in self.tiers:
+            nslots = pool_sizes[t]
             hot_n = self._hot_n(spec.inter, t)
             self.pools[t] = {
                 "slots": nn.ModuleList([

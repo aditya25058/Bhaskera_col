@@ -162,8 +162,9 @@ def serve_huge_moe(model, tokenizer, profile, handles: ShardHandles,
         from .colres import ColumnTieredMoEWrapper
         _wrap_opts = {"wrapper_cls": ColumnTieredMoEWrapper}
         if hot_tier_file is not None:
-            from .colprofile import load_tier_file
+            from .colprofile import load_tier_file, load_tier_pools
             _wrap_opts["hot_tiers"] = load_tier_file(hot_tier_file)
+            _wrap_opts["tier_pools"] = load_tier_pools(hot_tier_file)
         elif hot_col_frac is not None:
             _wrap_opts["hot_frac"] = float(hot_col_frac)
     wrappers = prepare_model(model, profile, handles, device, capacity,

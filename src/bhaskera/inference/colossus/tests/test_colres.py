@@ -134,20 +134,21 @@ def test_dma_split_and_lru():
 
 
 def test_mixed_tiers_match_native():
-    from bhaskera.inference.colossus.colprofile import assign_tiers
+    from bhaskera.inference.colossus.colprofile import assign_tiers, hbm_equiv
     from collections import Counter
     spec, handles, keys = _setup()
     dev = torch.device("cpu")
     freq = Counter({0: 50, 1: 30, 2: 10, 3: 5, 4: 2, 5: 1})
-    fracs = assign_tiers(freq, 6, budget=6 * 0.5)
-    # Greedy is optimal up to one tier step: residual smaller than the
-    # smallest upgrade (0.15) proves no affordable upgrade was skipped.
-    assert 3.0 - 0.15 <= sum(fracs) <= 3.0
-    assert fracs[0] >= fracs[5]  # monotone with frequency
+    fracs = assign_tiers(freq, 6, pin_top=2, thin_frac=0.25)
+    assert fracs[0] == 1.0 and fracs[1] == 1.0  # top-2 pinned
+    assert all(f == 0.25 for f in fracs[2:])
+    assert hbm_equiv({1.0: 2, 0.25: 6}) == 2 + 1.5
+    pools = {1.0: 2, 0.25: 4}
     w = ColumnTieredMoEWrapper(layer_idx=0, spec=spec, expert_keys=keys,
                                device=dev, capacity=6, handles=handles,
-                               hot_fracs=fracs)
-    assert len(w.pools) >= 2  # multiple tiers materialized
+                               hot_fracs=fracs, tier_pools=pools)
+    assert set(w.pools) == {1.0, 0.25}
+    assert len(w.pools[1.0]["slots"]) == 2
     x = _inputs()
     got = w(x)
     ref = _native_ref(spec, handles, keys, x) + _shared_forward(spec, x)
@@ -155,14 +156,12 @@ def test_mixed_tiers_match_native():
     assert torch.allclose(got.float(), ref.float(), atol=0.05, rtol=0.05)
 
 
-def test_assign_tiers_budget_and_base():
+def test_assign_tiers_pin_and_hbm():
     from bhaskera.inference.colossus.colprofile import assign_tiers
     from collections import Counter
-    fracs = assign_tiers(Counter(), 8, budget=8 * 0.1)
-    assert all(f == 0.1 for f in fracs)  # no freq info: all base
-    try:
-        assign_tiers(Counter(), 8, budget=0.5)
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("should reject below-base budget")
+    fracs = assign_tiers(Counter(), 8, pin_top=0, thin_frac=0.1)
+    assert all(f == 0.1 for f in fracs)  # no pinning: all thin
+    fracs = assign_tiers(Counter({3: 9, 7: 1}), 8, pin_top=3,
+                         thin_frac=0.5)
+    assert fracs[3] == 1.0  # most frequent is pinned
+    assert sum(1 for f in fracs if f == 1.0) == 3
