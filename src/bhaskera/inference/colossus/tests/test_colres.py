@@ -88,7 +88,7 @@ def test_f10_matches_native_bitwise():
     ref = _native_ref(spec, handles, keys, x) + _shared_forward(spec, x)
     assert torch.equal(got, ref)
     assert w.cold_dma_bytes == 0
-    assert w.slots[0].resident_bytes() > 0
+    assert w.pools[1.0]["slots"][0].resident_bytes() > 0
 
 
 def test_fraction_matches_native_within_summation_noise():
@@ -130,7 +130,7 @@ def test_dma_split_and_lru():
     full = FastSlot(spec.hidden, spec.inter, dev, spec.dtype,
                     spec.activation)
     full_bytes = sum(p.nbytes for p in full.parameters())
-    assert w.slots[0].resident_bytes() * 2 == full_bytes
+    assert w.pools[0.5]["slots"][0].resident_bytes() * 2 == full_bytes
 
 
 def test_mixed_tiers_match_native():

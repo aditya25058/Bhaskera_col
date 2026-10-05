@@ -136,12 +136,12 @@ class ColumnTieredMoEWrapper(nn.Module):
         # Shared per-layer cold scratch at max width; narrowed per use.
         max_cold = max(spec.inter - self._hot_n(spec.inter, t)
                        for t in self.tiers)
-        if self.cold_n > 0:
-            self._scratch_gc = torch.empty(self.cold_n, spec.hidden,
+        if max_cold > 0:
+            self._scratch_gc = torch.empty(max_cold, spec.hidden,
                                            device=device, dtype=spec.dtype)
-            self._scratch_uc = torch.empty(self.cold_n, spec.hidden,
+            self._scratch_uc = torch.empty(max_cold, spec.hidden,
                                            device=device, dtype=spec.dtype)
-            self._scratch_dc = torch.empty(spec.hidden, self.cold_n,
+            self._scratch_dc = torch.empty(spec.hidden, max_cold,
                                            device=device, dtype=spec.dtype)
         else:
             self._scratch_gc = self._scratch_uc = self._scratch_dc = None
