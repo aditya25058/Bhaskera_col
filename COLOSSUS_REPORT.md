@@ -286,3 +286,15 @@ Containment (formal): expert-tiering is column-tiering at f=1.0 — counters ide
 | B=64×12 | 32.9, 60.5 GB | 31.8 / adaptive 29.6 @ 50.4 GB | parity or efficiency |
 
 Claim as banked: column-tiering matches expert-tiering everywhere the latter runs, uses less HBM doing it, and runs a 512-wide batch the latter cannot — all at 16/16 audit exactness. Boundary drawn honestly: columns move the WEIGHT-residency wall, not the KV wall; length remains bounded for both (needs KV compression, §22 negative result stands).
+
+## 32. Gate 3 closed: expert == matrix < columns (branch `colossus-matrix`, H100/B=64)
+
+FIRM-like control (`matrix.py`): per-matrix-role LRU pools (gate/up/down, C matrices each = C full-expert HBM), demand-fetch, native op order, router untouched — residency half only, no predictor (scope stated). One real bug caught by unit test (missing LRU append on miss).
+
+| Config B=64x12, C=12 | tok/s | DMA | VRAM | audit |
+|---|---|---|---|---|
+| expert slots | 32.9 | 240 GB | 60.47 | 16/16 (prior) |
+| matrix pools | 30.7 | 241 GB | 60.47 | 16/16, margin 1.75 |
+| column f=0.5 (C=24) | 31.8 | 244 GB | 61.8 | 16/16 §27 |
+
+Prediction confirmed: an expert's three matrices are used in perfect correlation, so per-matrix LRU moves identical bytes (±0.5%) for 7% launch overhead. Expert == matrix is now a MEASURED null, not an assertion — which is precisely what makes the column result meaningful: whole-matrix splitting adds nothing; only sub-matrix (column) fractions change the HBM/DMA frontier. FIRM distinguished on all three axes (matrix granularity, approximate edge setting + predictor, no exactness invariant); cite as closest prior.
