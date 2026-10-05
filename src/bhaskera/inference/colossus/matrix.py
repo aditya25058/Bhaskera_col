@@ -112,6 +112,7 @@ class MatrixTieredMoEWrapper(nn.Module):
         pool["slot_to_expert"][slot_idx] = expert_id
         pool["expert_to_slot"][expert_id] = slot_idx
         self.dma_bytes += nbytes
+        pool["slot_lru"].append(slot_idx)
         self._sync_dma()
         return slot_idx
 
