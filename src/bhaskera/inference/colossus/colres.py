@@ -41,36 +41,26 @@ from .placement import apply_gate
 
 
 class ColumnSlot(nn.Module):
-    """HBM slot holding one expert's HOT columns + transient cold staging.
+    """HBM slot holding one expert's HOT columns ONLY.
 
-    Resident: gate_hot/up_hot [Hn, H], down_hot [H, Hn] (Hn = hot columns).
-    Staging (reused scratch, NOT residency): gate_cold/up_cold [Cn, H],
-    down_cold [H, Cn]. Cold staging bytes are never counted as resident.
+    Resident: gate_hot/up_hot [Hn, H], down_hot [H, Hn]. Cold columns live
+    in ONE shared per-layer scratch (wrapper-owned, reused across experts
+    and steps) — never per-slot, or staging becomes shadow residency.
     """
 
     def __init__(self, hidden: int, inter: int, hot_n: int,
                  device: torch.device, dtype: torch.dtype = torch.bfloat16,
                  activation: str = "silu"):
         super().__init__()
-        cold_n = inter - hot_n
-        assert 0 < hot_n <= inter and cold_n >= 0
+        assert 0 < hot_n <= inter
         self.hot_n = int(hot_n)
-        self.cold_n = int(cold_n)
+        self.cold_n = int(inter - hot_n)
         self.gate_hot = nn.Linear(hidden, hot_n, bias=False,
                                   device=device, dtype=dtype)
         self.up_hot = nn.Linear(hidden, hot_n, bias=False,
                                 device=device, dtype=dtype)
         self.down_hot = nn.Linear(hot_n, hidden, bias=False,
                                   device=device, dtype=dtype)
-        if cold_n > 0:
-            self.gate_cold = nn.Linear(hidden, cold_n, bias=False,
-                                       device=device, dtype=dtype)
-            self.up_cold = nn.Linear(hidden, cold_n, bias=False,
-                                     device=device, dtype=dtype)
-            self.down_cold = nn.Linear(cold_n, hidden, bias=False,
-                                       device=device, dtype=dtype)
-        else:
-            self.gate_cold = self.up_cold = self.down_cold = None
         self.activation = activation
         self.requires_grad_(False)
 
@@ -128,6 +118,18 @@ class ColumnTieredMoEWrapper(nn.Module):
                        spec.dtype, spec.activation)
             for _ in range(capacity)
         ])
+        # Shared per-layer cold scratch: ONE cold-half buffer set, reused
+        # across experts and steps (plain tensors, not modules).
+        self.cold_n = int(spec.inter - self.hot_n)
+        if self.cold_n > 0:
+            self._scratch_gc = torch.empty(self.cold_n, spec.hidden,
+                                           device=device, dtype=spec.dtype)
+            self._scratch_uc = torch.empty(self.cold_n, spec.hidden,
+                                           device=device, dtype=spec.dtype)
+            self._scratch_dc = torch.empty(spec.hidden, self.cold_n,
+                                           device=device, dtype=spec.dtype)
+        else:
+            self._scratch_gc = self._scratch_uc = self._scratch_dc = None
         self.slot_to_expert: dict[int, int] = {}
         self.expert_to_slot: dict[int, int] = {}
         self.slot_lru: list[int] = list(range(capacity))
@@ -177,8 +179,8 @@ class ColumnTieredMoEWrapper(nn.Module):
         self.dma_bytes += nbytes
         return nbytes
 
-    def _fetch_cold(self, expert_id: int, slot: ColumnSlot) -> int:
-        if slot.cold_n == 0:
+    def _fetch_cold(self, expert_id: int) -> int:
+        if self.cold_n == 0:
             return 0
         hn = self.hot_n
         t_gate, t_up, t_down = self._expert_tensors(expert_id)
@@ -188,13 +190,13 @@ class ColumnTieredMoEWrapper(nn.Module):
         with torch.no_grad():
             if use_stream:
                 with torch.cuda.stream(self.dma_stream):
-                    slot.gate_cold.weight.copy_(g_c, non_blocking=True)
-                    slot.up_cold.weight.copy_(u_c, non_blocking=True)
-                    slot.down_cold.weight.copy_(d_c, non_blocking=True)
+                    self._scratch_gc.copy_(g_c, non_blocking=True)
+                    self._scratch_uc.copy_(u_c, non_blocking=True)
+                    self._scratch_dc.copy_(d_c, non_blocking=True)
             else:
-                slot.gate_cold.weight.copy_(g_c)
-                slot.up_cold.weight.copy_(u_c)
-                slot.down_cold.weight.copy_(d_c)
+                self._scratch_gc.copy_(g_c)
+                self._scratch_uc.copy_(u_c)
+                self._scratch_dc.copy_(d_c)
         self.cold_dma_bytes += nbytes
         self.dma_bytes += nbytes
         return nbytes
@@ -241,7 +243,7 @@ class ColumnTieredMoEWrapper(nn.Module):
         for e in needed:
             slot_idx = self._ensure_hot(e)
             slot = self.slots[slot_idx]
-            self._fetch_cold(e, slot)
+            self._fetch_cold(e)
             self._sync_dma()
             kpos, rows = torch.where(mask[e])
             xe = flat[rows]
@@ -250,11 +252,10 @@ class ColumnTieredMoEWrapper(nn.Module):
                 gh = F.linear(xe, slot.gate_hot.weight)
                 uh = F.linear(xe, slot.up_hot.weight)
                 yh = F.linear(apply_gate(gh, uh, act), slot.down_hot.weight)
-                if slot.cold_n > 0:
-                    gc = F.linear(xe, slot.gate_cold.weight)
-                    uc = F.linear(xe, slot.up_cold.weight)
-                    yc = F.linear(apply_gate(gc, uc, act),
-                                  slot.down_cold.weight)
+                if self.cold_n > 0:
+                    gc = F.linear(xe, self._scratch_gc)
+                    uc = F.linear(xe, self._scratch_uc)
+                    yc = F.linear(apply_gate(gc, uc, act), self._scratch_dc)
                     ye = yh + yc.to(yh.dtype)
                 else:
                     ye = yh
