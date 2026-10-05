@@ -291,3 +291,7 @@ Correction first: column-frequency hot selection would be a placebo (exactness n
 | adaptive | 146.2 | 85.8 |
 
 Reading: adaptive wins HBM-efficiency + total DMA at moderate scale (90% speed, less DMA, 10 GB saved — pinned hots never re-fetch). At B=512 the thin tail churns (union >> 12 thin slots; prefill 21.7 s) and uniform-wide coverage wins. Tier SHAPE is a tuning dimension matched to union size, not a universal win — both exact everywhere (16/16 at every tested point). 64/64 suite green.
+
+## 29. Cold-column cache: falsified by the same churn that killed SVB (branch `colossus-coladapt`)
+
+Second-tier LRU over cold halves (hit = skip host DMA + staging copy; `--cold-cache N/layer`, streaming-cleared, hit/miss telemetry). Two strikes: (1) `--cold-cache 64` OOMs — per-layer caches multiply by 60 layers (64 x 23.5 MB x 60 = 90 GB); sizes must be per-layer-small, which the help now states. (2) At sane sizes it does not help: B=64 C=24x0.5 + cc8 -> cold_hits=278 (~5%), DMA 238 GB (vs 244 no-cache), speed HALVED 31.8 -> 17.4 tok/s (clone traffic + 11 GB cache pressure + cold-start churn); B=1 + cc8 -> 378 hits (~5.5%), 0.5 tok/s unchanged, trajectory correct [185, 300, ...]. Union churn (Jaccard 0.041) defeats small LRUs in both wide-shared and narrow-single regimes; sticky-head reuse is already better served by adaptive hot-pinning (which never re-fetches AND computes resident). Verdict: cold-cache LRU falsified here — kept default-off in code, not pursued. Remaining column lever: fetch/compute overlap (dual-stream), unbuilt.
