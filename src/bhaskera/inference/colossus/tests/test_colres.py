@@ -22,9 +22,12 @@ def _setup(n_exp=6, hidden=8, inter=10, top_k=2, seed=0):
     torch.manual_seed(seed)
     block = FakeDeepSeekBlock(n_exp=n_exp, hidden=hidden, top_k=top_k)
     for e in list(block.experts) + [block.shared_experts]:
-        e.gate_proj = nn.Linear(hidden, inter, bias=False)
-        e.up_proj = nn.Linear(hidden, inter, bias=False)
-        e.down_proj = nn.Linear(inter, hidden, bias=False)
+        e.gate_proj = nn.Linear(hidden, inter, bias=False,
+                                dtype=torch.bfloat16)
+        e.up_proj = nn.Linear(hidden, inter, bias=False,
+                              dtype=torch.bfloat16)
+        e.down_proj = nn.Linear(inter, hidden, bias=False,
+                                dtype=torch.bfloat16)
     spec = MoELayerSpec.from_block(block)
     assert spec.inter == inter
     table = {}
