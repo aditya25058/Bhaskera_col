@@ -165,3 +165,35 @@ def test_assign_tiers_pin_and_hbm():
                          thin_frac=0.5)
     assert fracs[3] == 1.0  # most frequent is pinned
     assert sum(1 for f in fracs if f == 1.0) == 3
+
+
+def test_cold_cache_hits_skip_dma():
+    spec, handles, keys = _setup()
+    dev = torch.device("cpu")
+    w = ColumnTieredMoEWrapper(layer_idx=0, spec=spec, expert_keys=keys,
+                               device=dev, capacity=6, handles=handles,
+                               hot_frac=0.5, cold_cache_cap=8)
+    x = _inputs()
+    ref = _native_ref(spec, handles, keys, x) + _shared_forward(spec, x)
+    w(x)
+    assert w.cold_misses > 0 and w.cold_hits == 0
+    d0 = w.cold_dma_bytes
+    got = w(x)
+    assert w.cold_hits > 0  # reuse turns refetch into hits
+    assert w.cold_dma_bytes == d0  # hits move zero host bytes
+    assert torch.allclose(got.float(), ref.float(), atol=0.05, rtol=0.05)
+
+
+def test_cold_cache_evicts_lru():
+    spec, handles, keys = _setup()
+    dev = torch.device("cpu")
+    w = ColumnTieredMoEWrapper(layer_idx=0, spec=spec, expert_keys=keys,
+                               device=dev, capacity=6, handles=handles,
+                               hot_frac=0.5, cold_cache_cap=1)
+    x = _inputs()
+    w(x)
+    n = len(w._cold_cache)
+    assert n <= 1
+    w(x)
+    # cap-1 with several experts: evictions force refetch misses
+    assert w.cold_misses > w.cold_hits

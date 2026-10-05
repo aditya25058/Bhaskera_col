@@ -93,6 +93,7 @@ class ColumnTieredMoEWrapper(nn.Module):
         hot_frac: float = 1.0,
         hot_fracs: list[float] | None = None,
         tier_pools: dict[float, int] | None = None,
+        cold_cache_cap: int = 0,
         **opts,
     ):
         super().__init__()
@@ -144,6 +145,15 @@ class ColumnTieredMoEWrapper(nn.Module):
                 "slot_lru": list(range(nslots)),
             }
         self.tier_of = list(self.hot_fracs)
+        # Cold-column second tier: LRU over cold halves (HBM-resident).
+        # A hit skips host DMA AND the staging copy (compute reads the
+        # cached tensors directly — same bytes, bitwise identical).
+        # Cap 0 = off (transient scratch only, current behavior).
+        self.cold_cache_cap = int(cold_cache_cap)
+        self._cold_cache: dict[int, tuple] = {}
+        self._cold_lru: list[int] = []
+        self.cold_hits = 0
+        self.cold_misses = 0
         # Shared per-layer cold scratch at max width; narrowed per use.
         max_cold = max(spec.inter - self._hot_n(spec.inter, t)
                        for t in self.tiers)
@@ -214,11 +224,24 @@ class ColumnTieredMoEWrapper(nn.Module):
         self.dma_bytes += nbytes
         return nbytes
 
-    def _fetch_cold(self, expert_id: int) -> int:
+    def _fetch_cold(self, expert_id: int):
+        """-> (gc, uc, dc) cold weight tensors (scratch views or cache).
+
+        Hit: cached tensors, zero DMA, zero copy. Miss: host -> staging,
+        then clone into the cold LRU (HBM->HBM, off the PCIe path).
+        """
         hn = self._hot_n(self.spec.inter, self.tier_of[expert_id])
         cn = self.spec.inter - hn
         if cn == 0:
-            return 0
+            return None, None, None
+        hit = self._cold_cache.get(expert_id)
+        if hit is not None:
+            self.cold_hits += 1
+            if expert_id in self._cold_lru:
+                self._cold_lru.remove(expert_id)
+            self._cold_lru.append(expert_id)
+            return hit
+        self.cold_misses += 1
         t_gate, t_up, t_down = self._expert_tensors(expert_id)
         g_c, u_c, d_c = t_gate[hn:], t_up[hn:], t_down[:, hn:]
         nbytes = int(g_c.nbytes + u_c.nbytes + d_c.nbytes)
@@ -235,7 +258,16 @@ class ColumnTieredMoEWrapper(nn.Module):
                 self._scratch_dc[:, :cn].copy_(d_c)
         self.cold_dma_bytes += nbytes
         self.dma_bytes += nbytes
-        return nbytes
+        out = (self._scratch_gc[:cn], self._scratch_uc[:cn],
+               self._scratch_dc[:, :cn])
+        if self.cold_cache_cap > 0:
+            with torch.no_grad():
+                self._cold_cache[expert_id] = (
+                    out[0].clone(), out[1].clone(), out[2].clone())
+            self._cold_lru.append(expert_id)
+            while len(self._cold_lru) > self.cold_cache_cap:
+                self._cold_cache.pop(self._cold_lru.pop(0), None)
+        return out
 
     def _sync_dma(self) -> None:
         if self.dma_stream is not None and self.device.type == "cuda":
@@ -282,7 +314,7 @@ class ColumnTieredMoEWrapper(nn.Module):
             slot = pool["slots"][slot_idx]
             hn = slot.hot_n
             cn = self.spec.inter - hn
-            self._fetch_cold(e)
+            gc, uc, dc = self._fetch_cold(e)
             self._sync_dma()
             kpos, rows = torch.where(mask[e])
             xe = flat[rows]
@@ -292,10 +324,9 @@ class ColumnTieredMoEWrapper(nn.Module):
                 uh = F.linear(xe, slot.up_hot.weight)
                 yh = F.linear(apply_gate(gh, uh, act), slot.down_hot.weight)
                 if cn > 0:
-                    gc = F.linear(xe, self._scratch_gc[:cn])
-                    uc = F.linear(xe, self._scratch_uc[:cn])
-                    yc = F.linear(apply_gate(gc, uc, act),
-                                  self._scratch_dc[:, :cn])
+                    gc = F.linear(xe, gc)
+                    uc = F.linear(xe, uc)
+                    yc = F.linear(apply_gate(gc, uc, act), dc)
                     ye = yh + yc.to(yh.dtype)
                 else:
                     ye = yh
@@ -309,6 +340,8 @@ class ColumnTieredMoEWrapper(nn.Module):
                 pool["expert_to_slot"].clear()
                 pool["slot_to_expert"].clear()
                 pool["slot_lru"] = list(range(len(pool["slots"])))
+            self._cold_cache.clear()
+            self._cold_lru.clear()
         if self.tupled:
             return out, None
         return out

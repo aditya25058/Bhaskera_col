@@ -152,6 +152,7 @@ def serve_huge_moe(model, tokenizer, profile, handles: ShardHandles,
                    dump_ids: str | None = None,
                    hot_col_frac: float | None = None,
                    hot_tier_file: str | None = None,
+                   cold_cache_cap: int = 0,
                    ) -> dict[str, Any]:
     """Greedy lockstep serve with ledger. Returns results dict."""
     from transformers.cache_utils import DynamicCache
@@ -161,6 +162,8 @@ def serve_huge_moe(model, tokenizer, profile, handles: ShardHandles,
     if hot_col_frac is not None or hot_tier_file is not None:
         from .colres import ColumnTieredMoEWrapper
         _wrap_opts = {"wrapper_cls": ColumnTieredMoEWrapper}
+        if cold_cache_cap > 0:
+            _wrap_opts["cold_cache_cap"] = int(cold_cache_cap)
         if hot_tier_file is not None:
             from .colprofile import load_tier_file, load_tier_pools
             _wrap_opts["hot_tiers"] = load_tier_file(hot_tier_file)
@@ -334,6 +337,7 @@ def serve_huge_moe(model, tokenizer, profile, handles: ShardHandles,
         "hot_frac": hot_col_frac,
         "hot_dma_mb": hot_dma_mb,
         "cold_dma_mb": cold_dma_mb,
+        "cold_hits": sum(getattr(w, "cold_hits", 0) for w in wrappers),
         "routing_log_steps": routing_steps,
         "flip_audit": flip_audit,
     }

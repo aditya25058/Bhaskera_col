@@ -139,6 +139,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--hot-tier-file", default=None, metavar="PATH",
                    help="Adaptive-f tier JSON from colprofile "
                         "(overrides --hot-col-frac)")
+    p.add_argument("--cold-cache", type=int, default=0, metavar="N",
+                   help="Cold-column second-tier LRU entries/layer "
+                        "(column slots only)")
     # Planner (inspect + probe + feasibility; serves nothing)
     p.add_argument("--plan", action="store_true",
                    help="Print ranked serving plans instead of serving")
@@ -434,7 +437,8 @@ def main(argv: List[str] = None) -> None:
             config=hf_cfg, prefault=args.prefault,
             dump_ids=args.dump_ids,
             hot_col_frac=args.hot_col_frac,
-            hot_tier_file=args.hot_tier_file)
+            hot_tier_file=args.hot_tier_file,
+            cold_cache_cap=args.cold_cache)
         elapsed = time.perf_counter() - t0
         outputs = res["texts"]
         total_output_tokens = sum(_count_output_tokens(o, tokenizer) for o in outputs)
@@ -452,7 +456,8 @@ def main(argv: List[str] = None) -> None:
         if res.get("hot_dma_mb") is not None:
             print(f"COLUMN f={res['hot_frac']} | "
                   f"hot={res['hot_dma_mb']:.1f} MB "
-                  f"cold={res['cold_dma_mb']:.1f} MB")
+                  f"cold={res['cold_dma_mb']:.1f} MB "
+                  f"(cold_hits={res.get('cold_hits', 0)})")
         if remote:
             st = handles.stats()
             print(f"REMOTE: net={st['network_bytes'] / 1e9:.2f} GB fetched, "
