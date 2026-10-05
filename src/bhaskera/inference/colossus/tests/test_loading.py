@@ -124,9 +124,13 @@ def test_set_module_tensor_prefix_tolerant():
 
 def test_conventions_in_sync():
     import bhaskera.introspect as intro
+    from bhaskera.inference.colossus import grouped as G
     from bhaskera.inference.colossus import loading as L
     assert set(intro._EXPERT_LEAF_NAMES) == {"experts", "local_experts", "routed_experts"}
     assert set(intro._SHARED_EXPERT_HINTS) == set(L.SHARED_HINTS)
+    # Grouped patterns single-sourced in grouped.py (no duplicated literal).
+    assert L.GROUPED_KEY_RES is G.GROUPED_KEY_RES
+    assert set(G.GROUPED_CONTAINER_NAMES) == set(intro._EXPERT_LEAF_NAMES)
 
 
 def test_prefault_shards_stats_only(tmp_path):

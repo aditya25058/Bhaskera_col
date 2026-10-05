@@ -30,6 +30,19 @@ EXPERT_CONTAINER_RES = tuple(
 )
 SHARED_HINTS = ("shared_expert", "shared_experts")
 
+# Grouped-weight experts: container leaf directly followed by the fused
+# parameter (no expert index). Single-sourced in grouped.py; the
+# sync test pins the import (no duplicated literal).
+from .grouped import GROUPED_KEY_RES  # noqa: E402
+
+
+def is_grouped_expert_key(key: str) -> bool:
+    """True iff key names a fused grouped-expert tensor (representation 2)."""
+    low = key.lower()
+    if any(h in low for h in SHARED_HINTS):
+        return False
+    return any(rx.search(key) is not None for rx in GROUPED_KEY_RES)
+
 
 def is_routed_expert_key(key: str) -> bool:
     """True iff key names a weight inside a routed (non-shared) expert."""
@@ -40,10 +53,15 @@ def is_routed_expert_key(key: str) -> bool:
 
 
 def split_routed(weight_map: dict[str, str]) -> tuple[list[str], list[str]]:
-    """-> (resident_keys, routed_keys), both sorted for determinism."""
+    """-> (resident_keys, routed_keys), both sorted for determinism.
+
+    Routed = per-expert keys (representation 1) + fused grouped-expert
+    tensors (representation 2). Shared-expert hints stay resident.
+    """
     resident, routed = [], []
     for k in weight_map:
-        (routed if is_routed_expert_key(k) else resident).append(k)
+        routed_key = is_routed_expert_key(k) or is_grouped_expert_key(k)
+        (routed if routed_key else resident).append(k)
     return sorted(resident), sorted(routed)
 
 

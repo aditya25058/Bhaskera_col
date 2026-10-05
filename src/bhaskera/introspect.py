@@ -67,6 +67,13 @@ class ModelProfile:
     # LoRA
     lora_targets: list[str] = field(default_factory=list)
 
+    # Grouped-weight MoE (representation 2): fused 3D expert tensors with a
+    # leading expert dim instead of per-expert submodules. Served by the
+    # grouped adapter, which discovers containers from these dotted paths.
+    grouped_moe: bool = False
+    grouped_containers: list[str] = field(default_factory=list)
+    grouped_num_experts: int = 0
+
     # Precision
     model_dtype: torch.dtype = torch.bfloat16
 
@@ -93,23 +100,37 @@ def introspect_model(model: nn.Module) -> ModelProfile:
         return profile
 
     # ── Basic metadata ──────────────────────────────────────────────
+    # Composite (multimodal) configs nest decoder counts one level down;
+    # _primary_config unwraps structurally (no architecture names).
+    primary = _primary_config(config)
     profile.model_type = getattr(config, "model_type", "")
-    profile.num_hidden_layers = getattr(config, "num_hidden_layers", 0)
+    profile.num_hidden_layers = getattr(primary, "num_hidden_layers", 0)
     profile.model_dtype = _resolve_dtype(model, config)
 
     # ── MoE detection from config ───────────────────────────────────
-    profile.is_moe = _detect_moe_from_config(config)
+    profile.is_moe = _detect_moe_from_config(primary)
     if profile.is_moe:
-        profile.num_experts = _read_num_experts(config)
-        profile.num_shared_experts = _read_num_shared_experts(config)
-        profile.experts_per_token = _read_experts_per_token(config)
+        profile.num_experts = _read_num_experts(primary)
+        profile.num_shared_experts = _read_num_shared_experts(primary)
+        profile.experts_per_token = _read_experts_per_token(primary)
 
     # ── Structural detection from module tree ───────────────────────
     decoder_cls = _find_decoder_layer_cls(model, profile.num_hidden_layers)
     profile.decoder_layer_cls = decoder_cls
 
     # MoE structural detection (validates / supplements config detection)
-    expert_cls, expert_modules, router_names = _find_moe_components(model)
+    expert_cls, expert_modules, router_names, grouped, grouped_n = \
+        _find_moe_components(model)
+    if grouped:
+        profile.is_moe = True
+        profile.grouped_moe = True
+        profile.grouped_containers = grouped
+        profile.grouped_num_experts = grouped_n
+        profile.router_module_names = router_names
+        if profile.num_experts == 0:
+            profile.num_experts = grouped_n
+        if profile.experts_per_token == 0:
+            profile.experts_per_token = _read_experts_per_token(primary)
     if expert_modules:
         profile.is_moe = True  # structural override — always trust the tree
         profile.expert_module_cls = expert_cls
@@ -119,14 +140,38 @@ def introspect_model(model: nn.Module) -> ModelProfile:
             profile.num_experts = len(expert_modules) // max(profile.num_hidden_layers, 1)
 
     # ── Aux loss detection ──────────────────────────────────────────
-    profile.has_aux_loss = _detect_aux_loss(config)
-    profile.aux_loss_attr = _detect_aux_loss_attr(config)
+    profile.has_aux_loss = _detect_aux_loss(primary)
+    profile.aux_loss_attr = _detect_aux_loss_attr(primary)
 
     # ── LoRA targets ────────────────────────────────────────────────
     profile.lora_targets = _find_lora_targets(model, decoder_cls, profile.router_module_names)
 
     _log_profile(profile)
     return profile
+
+
+def _primary_config(config):
+    """Innermost config carrying layer counts (unwraps composite configs).
+
+    Multimodal wrappers (vision+text) nest the decoder config under a
+    `*_config` attribute (commonly `text_config`). Structural: first
+    sub-config exposing `num_hidden_layers`. No architecture names.
+    """
+    if getattr(config, "num_hidden_layers", None) is not None:
+        return config
+    for attr in ("text_config",):
+        sub = getattr(config, attr, None)
+        if sub is not None and getattr(sub, "num_hidden_layers", None) is not None:
+            return sub
+    for attr in dir(config):
+        if attr.endswith("_config") and not attr.startswith("__"):
+            try:
+                sub = getattr(config, attr, None)
+            except Exception:
+                continue
+            if sub is not None and getattr(sub, "num_hidden_layers", None) is not None:
+                return sub
+    return config
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -173,7 +218,8 @@ def _read_num_shared_experts(config) -> int:
 
 
 def _read_experts_per_token(config) -> int:
-    for key in ["num_experts_per_tok", "top_k", "num_selected_experts", "experts_per_token"]:
+    for key in ["num_experts_per_tok", "top_k", "top_k_experts",
+                "num_selected_experts", "experts_per_token"]:
         val = getattr(config, key, None)
         if val is not None and val > 0:
             return int(val)
@@ -187,6 +233,7 @@ def _read_experts_per_token(config) -> int:
 # Common attribute names for the main layer container across architectures
 _LAYER_CONTAINER_ATTRS = [
     ("model", "layers"),       # LLaMA, Mistral, Mixtral, Qwen, Param2
+    ("model", "language_model", "layers"),  # multimodal wrappers (text stack)
     ("transformer", "h"),      # GPT-2, Falcon
     ("gpt_neox", "layers"),    # GPT-NeoX, Pythia
     ("model", "decoder", "layers"),  # BART / OPT-style
@@ -283,19 +330,28 @@ def _looks_like_router(leaf_name_lower: str) -> bool:
 
 def _find_moe_components(
     model: nn.Module,
-) -> tuple[Optional[type], list[nn.Module], list[str]]:
+) -> tuple[Optional[type], list[nn.Module], list[str], list[str], int]:
     """
     Walk the model tree structurally to identify expert modules and
     their associated router/gate modules.
+
+    Two representations (no architecture names anywhere):
+      module-based: experts container is a ModuleList of expert submodules.
+      grouped-weight: experts container holds fused 3D parameters sharing
+        a leading expert dim (no per-expert submodules).
 
     Returns:
         expert_cls:      type of individual expert (or None)
         expert_modules:  flat list of all expert nn.Module instances
         router_names:    list of full dotted names of router/gate modules
                          (only those sitting next to an experts container)
+        grouped_paths:   dotted paths of grouped experts containers
+        grouped_n:       leading expert dim (0 when none found)
     """
     expert_cls: Optional[type] = None
     expert_modules: list[nn.Module] = []
+    grouped_paths: list[str] = []
+    grouped_n: int = 0
 
     # Step 1 — find every expert container and remember its parent path.
     expert_parent_paths: set[str] = set()
@@ -311,6 +367,25 @@ def _find_moe_components(
                 # Parent path: everything before the leaf
                 parent = ".".join(name.split(".")[:-1])
                 expert_parent_paths.add(parent)
+
+    # Step 1b — grouped-weight experts: an experts-leaf module that is NOT
+    # a ModuleList but directly holds >=2 fused 3D parameters sharing one
+    # leading (expert) dim. Recorded separately; the grouped adapter (not
+    # per-expert submodules) serves these.
+    for name, module in model.named_modules():
+        leaf = name.split(".")[-1].lower() if name else ""
+        if leaf not in _EXPERT_LEAF_NAMES or isinstance(module, nn.ModuleList):
+            continue
+        try:
+            own = [p for _, p in module.named_parameters(recurse=False)]
+        except Exception:
+            continue
+        dims = [tuple(p.shape) for p in own if p.dim() == 3]
+        if len(dims) >= 2 and len({d[0] for d in dims}) == 1 and dims[0][0] > 1:
+            grouped_paths.append(name)
+            grouped_n = grouped_n or int(dims[0][0])
+            parent = ".".join(name.split(".")[:-1])
+            expert_parent_paths.add(parent)
 
     # Step 2 — find shared-expert blocks (structurally, by name hint).
     # These are siblings of (or in lieu of) the main experts container,
@@ -348,15 +423,16 @@ def _find_moe_components(
             if list(module.parameters()):
                 router_names.append(name)
 
-    if expert_modules:
+    if expert_modules or grouped_paths:
         logger.info(
             f"MoE detected: {len(expert_modules)} expert modules, "
             f"expert class={expert_cls.__name__ if expert_cls else 'N/A'}, "
             f"{len(router_names)} router modules, "
-            f"{len(expert_parent_paths)} expert-block parents"
+            f"{len(expert_parent_paths)} expert-block parents, "
+            f"grouped={len(grouped_paths)} (n={grouped_n})"
         )
 
-    return expert_cls, expert_modules, router_names
+    return expert_cls, expert_modules, router_names, grouped_paths, grouped_n
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -435,6 +511,11 @@ def _find_lora_targets(
         # ONLY excludes leaf names that the structural router pass
         # explicitly identified. No fragile substring matching here.
         if short_name in router_leaf_names:
+            continue
+        # Composite routers (norm+proj submodules): a Linear nested INSIDE
+        # a detected router module is router machinery, not a LoRA target.
+        # Structural (path-based); module-based gates are leaves, unaffected.
+        if any(seg in router_leaf_names for seg in name.split(".")[:-1]):
             continue
         targets.add(short_name)
 

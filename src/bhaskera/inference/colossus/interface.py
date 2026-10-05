@@ -31,12 +31,15 @@ GATE_LOGITS = "logits"
 # silu-gated form; plain FFNs use the elementwise one.
 ACT_SILU = ("silu", "swiglu", "sigmoid")
 ACT_GELU = ("gelu", "gelu_new", "gelu_pytorch_tanh")
+ACT_GELU_TANH = ("gelu_tanh", "tanh")
 ACT_RELU = ("relu",)
 
 
 def normalize_activation(name: Any) -> str:
     """Canonical activation id from a config string (default: silu)."""
     low = str(name or "silu").lower()
+    if any(k in low for k in ACT_GELU_TANH):
+        return "gelu_tanh"
     if any(k in low for k in ACT_GELU):
         return "gelu"
     if any(k in low for k in ACT_RELU):

@@ -46,6 +46,8 @@ def apply_gate(g: torch.Tensor, u: torch.Tensor, activation: str) -> torch.Tenso
     """Gated activation shared by slot and CPU paths (one definition)."""
     if activation == "gelu":
         return F.gelu(g) * u
+    if activation == "gelu_tanh":
+        return F.gelu(g, approximate="tanh") * u
     if activation == "relu":
         return F.relu(g) * u
     return F.silu(g) * u
@@ -383,7 +385,8 @@ def wrap_moe_layers(model: nn.Module, profile: Any, handles: Any,
         setattr(layer, attr, wrapper)
         wrappers.append(wrapper)
     _want = int(getattr(profile, "num_experts", 0) or 0)
-    if _want > 0 and not wrappers:
+    _grouped = bool(getattr(profile, "grouped_moe", False))
+    if _want > 0 and not wrappers and not _grouped:
         raise RuntimeError(
             "wrap_moe_layers: profile declares MoE experts but zero blocks "
             "were wrapped (block discovery failed silently)")
