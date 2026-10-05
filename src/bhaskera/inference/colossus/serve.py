@@ -151,6 +151,7 @@ def serve_huge_moe(model, tokenizer, profile, handles: ShardHandles,
                    prefault: bool = False,
                    dump_ids: str | None = None,
                    hot_col_frac: float | None = None,
+                   matrix_tiers: bool = False,
                    ) -> dict[str, Any]:
     """Greedy lockstep serve with ledger. Returns results dict."""
     from transformers.cache_utils import DynamicCache
@@ -161,6 +162,9 @@ def serve_huge_moe(model, tokenizer, profile, handles: ShardHandles,
         from .colres import ColumnTieredMoEWrapper
         _wrap_opts = {"wrapper_cls": ColumnTieredMoEWrapper,
                       "hot_frac": float(hot_col_frac)}
+    elif matrix_tiers:
+        from .matrix import MatrixTieredMoEWrapper
+        _wrap_opts = {"wrapper_cls": MatrixTieredMoEWrapper}
     wrappers = prepare_model(model, profile, handles, device, capacity,
                              placement=placement,
                              dma_stream=(torch.cuda.Stream(device=device)
@@ -326,6 +330,10 @@ def serve_huge_moe(model, tokenizer, profile, handles: ShardHandles,
         "placement": placement,
         "capacity": capacity,
         "hot_frac": hot_col_frac,
+        "matrix_tiers": matrix_tiers,
+        "role_misses": {r: sum(getattr(w, "role_misses", {}).get(r, 0)
+                               for w in wrappers) or None for r in
+                        ("gate", "up", "down")} if matrix_tiers else None,
         "hot_dma_mb": hot_dma_mb,
         "cold_dma_mb": cold_dma_mb,
         "routing_log_steps": routing_steps,

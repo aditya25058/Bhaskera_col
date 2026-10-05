@@ -136,6 +136,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--hot-col-frac", type=float, default=None, metavar="F",
                    help="Column-granular slots: hot column fraction per expert "
                         "(omit = whole-expert slots)")
+    p.add_argument("--matrix-tiers", action="store_true",
+                   help="FIRM-like control: per-matrix LRU pools instead of "
+                        "whole-expert or column slots")
     # Planner (inspect + probe + feasibility; serves nothing)
     p.add_argument("--plan", action="store_true",
                    help="Print ranked serving plans instead of serving")
@@ -430,7 +433,8 @@ def main(argv: List[str] = None) -> None:
             teacher_tokens=_teacher, audit_logits=args.audit_logits,
             config=hf_cfg, prefault=args.prefault,
             dump_ids=args.dump_ids,
-            hot_col_frac=args.hot_col_frac)
+            hot_col_frac=args.hot_col_frac,
+            matrix_tiers=args.matrix_tiers)
         elapsed = time.perf_counter() - t0
         outputs = res["texts"]
         total_output_tokens = sum(_count_output_tokens(o, tokenizer) for o in outputs)
