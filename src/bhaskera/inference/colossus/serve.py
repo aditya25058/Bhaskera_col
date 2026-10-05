@@ -65,8 +65,9 @@ def prepare_model(model: torch.nn.Module, profile: Any, handles: ShardHandles,
                   device: torch.device, capacity: int,
                   dtype: torch.dtype = torch.bfloat16,
                   placement: str = "slots", dma_stream: Any = None,
-                  zssr: bool = False, prefetch_topk: int = 8,
-                  prefetch_conf: float = 0.0, config=None) -> list[TieredMoEWrapper]:
+                   zssr: bool = False, prefetch_topk: int = 8,
+                   prefetch_conf: float = 0.0, config=None,
+                   hot_col_frac: float | None = None) -> list[TieredMoEWrapper]:
     """Materialize resident weights + wrap MoE layers. Returns wrappers."""
     resident, _ = split_routed(handles.weight_map)
     materialize(model, resident, handles, device, dtype)
@@ -166,7 +167,8 @@ def serve_huge_moe(model, tokenizer, profile, handles: ShardHandles,
                              dma_stream=(torch.cuda.Stream(device=device)
                                          if device.type == "cuda" else None),
                              zssr=zssr, prefetch_topk=prefetch_topk,
-                             prefetch_conf=prefetch_conf, config=config)
+                             prefetch_conf=prefetch_conf, config=config,
+                             hot_col_frac=hot_col_frac)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     enc = tokenizer(prompts, padding=True, return_tensors="pt")
