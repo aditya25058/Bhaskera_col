@@ -140,8 +140,8 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Adaptive-f tier JSON from colprofile "
                         "(overrides --hot-col-frac)")
     p.add_argument("--cold-cache", type=int, default=0, metavar="N",
-                   help="Cold-column second-tier LRU entries/layer "
-                        "(column slots only)")
+                   help="Cold-column second-tier LRU entries per MoE layer "
+                        "(column slots only; N=8/layer ~= 11 GB at f=0.5)")
     # Planner (inspect + probe + feasibility; serves nothing)
     p.add_argument("--plan", action="store_true",
                    help="Print ranked serving plans instead of serving")
