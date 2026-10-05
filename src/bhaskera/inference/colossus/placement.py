@@ -325,17 +325,20 @@ class TieredMoEWrapper(nn.Module):
 
 
 def wrap_moe_layers(model: nn.Module, profile: Any, handles: Any,
-                   device: torch.device, capacity: int,
-                   dma_stream: Any = None, **opts) -> list[TieredMoEWrapper]:
+                    device: torch.device, capacity: int,
+                    dma_stream: Any = None, **opts) -> list[TieredMoEWrapper]:
     """Replace every MoE block with a TieredMoEWrapper (model-agnostic).
 
     Discovery: profile.decoder_layer_cls instances -> find_moe_block each.
     Weight keys: expert dotted paths (from named_modules) grouped by
     interface.expert_weight_keys against handles.weight_map.
+    wrapper_cls: alternate executor with the same constructor contract
+    (e.g. column-granular slots); extra opts pass through.
     Returns wrappers in layer order.
     """
     from .interface import MoELayerSpec, expert_weight_keys, find_moe_block
 
+    wrapper_cls = opts.pop("wrapper_cls", TieredMoEWrapper)
     decoder_cls = getattr(profile, "decoder_layer_cls", None)
     if decoder_cls is not None:
         layers = [m for m in model.modules() if isinstance(m, decoder_cls)]
@@ -357,7 +360,7 @@ def wrap_moe_layers(model: nn.Module, profile: Any, handles: Any,
                 raise KeyError(f"layer {layer_idx}: no dotted path for MoE block")
             dotted_e = f"{prefix}.{spec.container_attr}.{e}"
             keys.append(expert_weight_keys(dotted_e, weight_keys))
-        wrapper = TieredMoEWrapper(
+        wrapper = wrapper_cls(
             layer_idx=layer_idx, spec=spec, expert_keys=keys, device=device,
             capacity=capacity, handles=handles, dma_stream=dma_stream,
             tupled=(attr == "block_sparse_moe"), **opts)

@@ -67,7 +67,7 @@ def prepare_model(model: torch.nn.Module, profile: Any, handles: ShardHandles,
                   placement: str = "slots", dma_stream: Any = None,
                   zssr: bool = False, prefetch_topk: int = 8,
                    prefetch_conf: float = 0.0, config=None,
-                   prefault: bool = False) -> list[TieredMoEWrapper]:
+                   prefault: bool = False, **opts) -> list[TieredMoEWrapper]:
     """Materialize resident weights + wrap MoE layers. Returns wrappers."""
     if prefault and hasattr(handles, "weight_map"):
         from .loading import prefault_shards
@@ -134,7 +134,7 @@ def prepare_model(model: torch.nn.Module, profile: Any, handles: ShardHandles,
         model, profile, handles, device, capacity, dma_stream,
         zssr_prefetch=zssr, prefetch_topk=prefetch_topk,
         prefetch_conf=prefetch_conf,
-        cpu_exec=(placement == "cpu"))
+        cpu_exec=(placement == "cpu"), **opts)
     return wrappers
 
 
@@ -150,18 +150,24 @@ def serve_huge_moe(model, tokenizer, profile, handles: ShardHandles,
                    config=None,
                    prefault: bool = False,
                    dump_ids: str | None = None,
+                   hot_col_frac: float | None = None,
                    ) -> dict[str, Any]:
     """Greedy lockstep serve with ledger. Returns results dict."""
     from transformers.cache_utils import DynamicCache
 
     install_cache_compat(getattr(profile, "model_type", None))
+    _wrap_opts: dict = {}
+    if hot_col_frac is not None:
+        from .columns import ColumnTieredMoEWrapper
+        _wrap_opts = {"wrapper_cls": ColumnTieredMoEWrapper,
+                      "hot_frac": float(hot_col_frac)}
     wrappers = prepare_model(model, profile, handles, device, capacity,
                              placement=placement,
                              dma_stream=(torch.cuda.Stream(device=device)
                                          if device.type == "cuda" else None),
                              zssr=zssr, prefetch_topk=prefetch_topk,
                              prefetch_conf=prefetch_conf, config=config,
-                             prefault=prefault)
+                             prefault=prefault, **_wrap_opts)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     enc = tokenizer(prompts, padding=True, return_tensors="pt")
@@ -276,6 +282,10 @@ def serve_huge_moe(model, tokenizer, profile, handles: ShardHandles,
     total_hits = sum(w.hits for w in wrappers)
     total_misses = sum(w.misses for w in wrappers)
     total_dma_mb = sum(w.dma_bytes for w in wrappers) / (1024 ** 2)
+    hot_dma_mb = (sum(getattr(w, "hot_dma_bytes", 0) for w in wrappers)
+                  / (1024 ** 2) or None)
+    cold_dma_mb = (sum(getattr(w, "cold_dma_bytes", 0) for w in wrappers)
+                   / (1024 ** 2) if hot_dma_mb is not None else None)
     total_decode = sum(latencies)
     agg_tokens = sum(new_counts)
     peak = (torch.cuda.max_memory_allocated(device) / (1024 ** 3)
@@ -315,6 +325,9 @@ def serve_huge_moe(model, tokenizer, profile, handles: ShardHandles,
         "peak_vram_gb": peak,
         "placement": placement,
         "capacity": capacity,
+        "hot_frac": hot_col_frac,
+        "hot_dma_mb": hot_dma_mb,
+        "cold_dma_mb": cold_dma_mb,
         "routing_log_steps": routing_steps,
         "flip_audit": flip_audit,
     }

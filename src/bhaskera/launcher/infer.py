@@ -133,6 +133,9 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Dump B=1 continuation token IDs (teacher artifacts)")
     p.add_argument("--prefault", action="store_true",
                    help="Page in weight shards up front (cold-start tax)")
+    p.add_argument("--hot-col-frac", type=float, default=None, metavar="F",
+                   help="Column-granular slots: hot column fraction per expert "
+                        "(omit = whole-expert slots)")
     # Planner (inspect + probe + feasibility; serves nothing)
     p.add_argument("--plan", action="store_true",
                    help="Print ranked serving plans instead of serving")
@@ -426,7 +429,8 @@ def main(argv: List[str] = None) -> None:
             prefill_chunk=_chunk, log_routing=args.log_routing,
             teacher_tokens=_teacher, audit_logits=args.audit_logits,
             config=hf_cfg, prefault=args.prefault,
-            dump_ids=args.dump_ids)
+            dump_ids=args.dump_ids,
+            hot_col_frac=args.hot_col_frac)
         elapsed = time.perf_counter() - t0
         outputs = res["texts"]
         total_output_tokens = sum(_count_output_tokens(o, tokenizer) for o in outputs)
@@ -441,6 +445,10 @@ def main(argv: List[str] = None) -> None:
               f"hits={res['total_hits']} misses={res['total_misses']} | "
               f"DMA={res['total_dma_mb']:.1f} MB | prefill={res['prefill_s']:.1f}s | "
               f"Peak VRAM: {res['peak_vram_gb']:.2f} GB")
+        if res.get("hot_dma_mb") is not None:
+            print(f"COLUMN f={res['hot_frac']} | "
+                  f"hot={res['hot_dma_mb']:.1f} MB "
+                  f"cold={res['cold_dma_mb']:.1f} MB")
         if remote:
             st = handles.stats()
             print(f"REMOTE: net={st['network_bytes'] / 1e9:.2f} GB fetched, "
