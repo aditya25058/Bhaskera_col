@@ -273,3 +273,16 @@ Column-partitioned slots (`colres.py`: hot columns resident/LRU, cold per-use fe
 | 0.1 | 16/16 | 1.75 | 34.4 | — | 0.3 tok/s B=1: cold-DMA wall, exactness intact |
 
 Success criterion (f ≤ 0.5, ≥30% slot-HBM drop, 16/16, throughput striking) MET at f=0.5 and exceeded: same-HBM parity at B=64, plus an HBM-bound operating point expert-tiering cannot reach. Exactness holds to f=0.1 by construction (summation partition), verified by audit — margins never collapse. Falsification status: gate 1 confirmed as cost (cold-DMA + 2× launches halve B=1 speed by f=0.1); gate 2 cleared (no margin collapse anywhere); gate 3 (FIRM matrix-granularity comparison) open — structural argument is that matrix units are strictly coarser than columns, but the head-to-head is not run. Literature position: FIRM-MoE (AAAI-26) must be cited as closest prior — matrix (not column) granularity, approximate edge setting, no exactness invariant; fMoE/MoEShard/SiDA differ in meaning/objective. Claim as framed: first column-granular HBM residency with exact inference + verification protocol.
+
+## 31. Better, proven three ways (H100/DeepSeek-236B)
+
+Containment (formal): expert-tiering is column-tiering at f=1.0 — counters identical on both representations (DeepSeek 662/6376; Gemma 1132/3332, cold=0). Column's feasible set contains expert's; the question was only whether the extra territory is useful.
+
+| Operating point | Expert C=12 | Column | Verdict |
+|---|---|---|---|
+| B=448×12 (same work) | 218.4 tok/s, 90.9 GB | 195.8 tok/s, 76.6 GB (f=0.5) | same work, −14 GB, 90% speed |
+| B=512×12 | OOM | 249.2 tok/s, 81.7 GB (f=0.5) | uniquely feasible |
+| B=64×200 (length) | OOM | OOM (f=0.5 and 0.25, decode KV) | shared wall — KV-bound, not residency-bound |
+| B=64×12 | 32.9, 60.5 GB | 31.8 / adaptive 29.6 @ 50.4 GB | parity or efficiency |
+
+Claim as banked: column-tiering matches expert-tiering everywhere the latter runs, uses less HBM doing it, and runs a 512-wide batch the latter cannot — all at 16/16 audit exactness. Boundary drawn honestly: columns move the WEIGHT-residency wall, not the KV wall; length remains bounded for both (needs KV compression, §22 negative result stands).
