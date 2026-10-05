@@ -273,3 +273,21 @@ Column-partitioned slots (`colres.py`: hot columns resident/LRU, cold per-use fe
 | 0.1 | 16/16 | 1.75 | 34.4 | — | 0.3 tok/s B=1: cold-DMA wall, exactness intact |
 
 Success criterion (f ≤ 0.5, ≥30% slot-HBM drop, 16/16, throughput striking) MET at f=0.5 and exceeded: same-HBM parity at B=64, plus an HBM-bound operating point expert-tiering cannot reach. Exactness holds to f=0.1 by construction (summation partition), verified by audit — margins never collapse. Falsification status: gate 1 confirmed as cost (cold-DMA + 2× launches halve B=1 speed by f=0.1); gate 2 cleared (no margin collapse anywhere); gate 3 (FIRM matrix-granularity comparison) open — structural argument is that matrix units are strictly coarser than columns, but the head-to-head is not run. Literature position: FIRM-MoE (AAAI-26) must be cited as closest prior — matrix (not column) granularity, approximate edge setting, no exactness invariant; fMoE/MoEShard/SiDA differ in meaning/objective. Claim as framed: first column-granular HBM residency with exact inference + verification protocol.
+
+## 28. Adaptive-f: frequency-budgeted tiers (branch `colossus-coladapt`)
+
+Correction first: column-frequency hot selection would be a placebo (exactness needs ALL columns of every selected expert, so which are hot changes no bytes). What works is EXPERT-frequency budgeting: pin top-K experts/layer at f=1.0 with dedicated slots, rest thin in a shared pool (`colprofile.py` from `--log-routing`; `hot_tiers` + `tier_pools` plumbing via signature inspection, no arch names). Shape tested: pin-6 + thin-12@0.1 = 7.2 full-expert equiv/layer (40% less slot HBM than C=12).
+
+| Config (B=64×12) | tok/s | DMA | VRAM | audit |
+|---|---|---|---|---|
+| expert C=12 | 32.9 | 240 GB | 60.5 | 16/16 (prior) |
+| uniform col C=24×0.5 | 31.8 | 244 GB | 61.8 | 16/16 §27 |
+| adaptive pin-6+thin-12 | 29.6 | 233 GB (hot 37 + cold 196) | 50.4 | 16/16, margin 1.625 |
+
+| Config (B=512×12) | tok/s | VRAM |
+|---|---|---|
+| expert C=12 | OOM | — |
+| uniform col C=12×0.5 | 249.2 | 81.7 |
+| adaptive | 146.2 | 85.8 |
+
+Reading: adaptive wins HBM-efficiency + total DMA at moderate scale (90% speed, less DMA, 10 GB saved — pinned hots never re-fetch). At B=512 the thin tail churns (union >> 12 thin slots; prefill 21.7 s) and uniform-wide coverage wins. Tier SHAPE is a tuning dimension matched to union size, not a universal win — both exact everywhere (16/16 at every tested point). 64/64 suite green.
