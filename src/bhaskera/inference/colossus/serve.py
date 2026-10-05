@@ -133,9 +133,14 @@ def prepare_model(model: torch.nn.Module, profile: Any, handles: ShardHandles,
         # Representation 2 (grouped weights): the grouped adapter replaces
         # experts containers in place; routing stays native upstream.
         from .grouped import wrap_grouped_layers
+        _gopts: dict = {}
+        if hot_col_frac is not None:
+            from .groupcol import GroupedColumnWrapper
+            _gopts = {"wrapper_cls": GroupedColumnWrapper,
+                      "hot_frac": float(hot_col_frac)}
         wrappers = list(wrappers) + wrap_grouped_layers(
             model, profile, handles, device, capacity,
-            dma_stream=dma_stream)
+            dma_stream=dma_stream, **_gopts)
     return wrappers
 
 
@@ -150,6 +155,7 @@ def serve_huge_moe(model, tokenizer, profile, handles: ShardHandles,
                    audit_logits: str | None = None,
                    config=None,
                    dump_ids: str | None = None,
+                   hot_col_frac: float | None = None,
                    ) -> dict[str, Any]:
     """Greedy lockstep serve with ledger. Returns results dict."""
     from transformers.cache_utils import DynamicCache
@@ -275,6 +281,10 @@ def serve_huge_moe(model, tokenizer, profile, handles: ShardHandles,
     total_hits = sum(w.hits for w in wrappers)
     total_misses = sum(w.misses for w in wrappers)
     total_dma_mb = sum(w.dma_bytes for w in wrappers) / (1024 ** 2)
+    hot_dma_mb = (sum(getattr(w, "hot_dma_bytes", 0) for w in wrappers)
+                  / (1024 ** 2) or None)
+    cold_dma_mb = (sum(getattr(w, "cold_dma_bytes", 0) for w in wrappers)
+                   / (1024 ** 2) if hot_dma_mb is not None else None)
     total_decode = sum(latencies)
     agg_tokens = sum(new_counts)
     peak = (torch.cuda.max_memory_allocated(device) / (1024 ** 3)
@@ -314,6 +324,9 @@ def serve_huge_moe(model, tokenizer, profile, handles: ShardHandles,
         "peak_vram_gb": peak,
         "placement": placement,
         "capacity": capacity,
+        "hot_frac": hot_col_frac,
+        "hot_dma_mb": hot_dma_mb,
+        "cold_dma_mb": cold_dma_mb,
         "routing_log_steps": routing_steps,
         "flip_audit": flip_audit,
     }

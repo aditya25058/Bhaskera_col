@@ -251,9 +251,13 @@ def wrap_grouped_layers(model: nn.Module, profile: Any, handles: Any,
 
     Discovery: profile.decoder_layer_cls instances -> grouped_container_attr.
     Weight keys: index keys under the container dotted path (exactly the
-    fused + down pair, classified by shape). Returns wrappers in order.
+    fused + down pair, classified by shape). wrapper_cls: alternate
+    executor with a compatible constructor (e.g. column-granular slots);
+    extra opts (e.g. hot_frac) pass through. Returns wrappers in order.
     """
     from .interface import normalize_activation
+
+    wrapper_cls = opts.pop("wrapper_cls", GroupedTieredMoEWrapper)
 
     decoder_cls = getattr(profile, "decoder_layer_cls", None)
     if decoder_cls is not None:
@@ -288,7 +292,7 @@ def wrap_grouped_layers(model: nn.Module, profile: Any, handles: Any,
         else:
             activation = normalize_activation(
                 getattr(getattr(layer, "config", None), "hidden_act", act_name))
-        wrapper = GroupedTieredMoEWrapper(
+        wrapper = wrapper_cls(
             layer_idx=layer_idx, fused_key=pair["fused"], down_key=pair["down"],
             n_experts=n_exp, hidden=hidden, inter=inter, device=device,
             capacity=capacity, handles=handles, activation=activation,
