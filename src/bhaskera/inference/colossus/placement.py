@@ -338,7 +338,14 @@ def wrap_moe_layers(model: nn.Module, profile: Any, handles: Any,
     """
     from .interface import MoELayerSpec, expert_weight_keys, find_moe_block
 
+    import inspect as _inspect
     wrapper_cls = opts.pop("wrapper_cls", TieredMoEWrapper)
+    hot_tiers = opts.pop("hot_tiers", None)
+    try:
+        _takes_fracs = "hot_fracs" in _inspect.signature(
+            wrapper_cls.__init__).parameters
+    except (TypeError, ValueError):
+        _takes_fracs = False
     decoder_cls = getattr(profile, "decoder_layer_cls", None)
     if decoder_cls is not None:
         layers = [m for m in model.modules() if isinstance(m, decoder_cls)]
@@ -360,10 +367,15 @@ def wrap_moe_layers(model: nn.Module, profile: Any, handles: Any,
                 raise KeyError(f"layer {layer_idx}: no dotted path for MoE block")
             dotted_e = f"{prefix}.{spec.container_attr}.{e}"
             keys.append(expert_weight_keys(dotted_e, weight_keys))
+        wkw = dict(opts)
+        if hot_tiers is not None and _takes_fracs:
+            fr = hot_tiers.get(layer_idx)
+            if fr is not None:
+                wkw["hot_fracs"] = [float(f) for f in fr]
         wrapper = wrapper_cls(
             layer_idx=layer_idx, spec=spec, expert_keys=keys, device=device,
             capacity=capacity, handles=handles, dma_stream=dma_stream,
-            tupled=(attr == "block_sparse_moe"), **opts)
+            tupled=(attr == "block_sparse_moe"), **wkw)
         setattr(layer, attr, wrapper)
         wrappers.append(wrapper)
     _want = int(getattr(profile, "num_experts", 0) or 0)

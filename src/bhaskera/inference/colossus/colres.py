@@ -91,11 +91,15 @@ class ColumnTieredMoEWrapper(nn.Module):
         dma_stream: Any = None,
         tupled: bool = False,
         hot_frac: float = 1.0,
+        hot_fracs: list[float] | None = None,
         **opts,
     ):
         super().__init__()
         assert len(expert_keys) == spec.n_routed, "keys/experts misaligned"
-        assert 0.0 < hot_frac <= 1.0, "hot_frac in (0, 1]"
+        if hot_fracs is None:
+            hot_fracs = [float(hot_frac)] * spec.n_routed
+        assert len(hot_fracs) == spec.n_routed, "fracs/experts misaligned"
+        assert all(0.0 < f <= 1.0 for f in hot_fracs), "fracs in (0, 1]"
         self.layer_idx = layer_idx
         self.spec = spec
         self.expert_keys = expert_keys
@@ -103,24 +107,35 @@ class ColumnTieredMoEWrapper(nn.Module):
         self.handles = handles
         self.dma_stream = dma_stream
         self.tupled = bool(tupled)
-        self.hot_frac = float(hot_frac)
-        self.hot_n = max(1, int(round(spec.inter * self.hot_frac)))
-        if self.hot_n >= spec.inter:
-            self.hot_n = spec.inter
+        self.hot_fracs = [float(f) for f in hot_fracs]
         if opts.get("cpu_exec"):
             raise ValueError("column slots need GPU placement (cpu_exec off)")
         self.streaming = (capacity == 0)
         if self.streaming:
             capacity = 1
         self.capacity = capacity
-        self.slots: list[nn.Module] = nn.ModuleList([
-            ColumnSlot(spec.hidden, spec.inter, self.hot_n, device,
-                       spec.dtype, spec.activation)
-            for _ in range(capacity)
-        ])
-        # Shared per-layer cold scratch: ONE cold-half buffer set, reused
-        # across experts and steps (plain tensors, not modules).
-        self.cold_n = int(spec.inter - self.hot_n)
+        # Tier pools: one LRU pool per distinct fraction, so hot experts
+        # never share eviction pressure with thin ones. Capacity split
+        # evenly across tiers; remainder to the thickest tier.
+        self.tiers = sorted(set(self.hot_fracs), reverse=True)
+        per, rem = divmod(capacity, len(self.tiers))
+        self.pools: dict[float, dict] = {}
+        for i, t in enumerate(self.tiers):
+            nslots = max(1, per + (1 if i < rem else 0))
+            hot_n = self._hot_n(spec.inter, t)
+            self.pools[t] = {
+                "slots": nn.ModuleList([
+                    ColumnSlot(spec.hidden, spec.inter, hot_n, device,
+                               spec.dtype, spec.activation)
+                    for _ in range(nslots)]),
+                "slot_to_expert": {},
+                "expert_to_slot": {},
+                "slot_lru": list(range(nslots)),
+            }
+        self.tier_of = list(self.hot_fracs)
+        # Shared per-layer cold scratch at max width; narrowed per use.
+        max_cold = max(spec.inter - self._hot_n(spec.inter, t)
+                       for t in self.tiers)
         if self.cold_n > 0:
             self._scratch_gc = torch.empty(self.cold_n, spec.hidden,
                                            device=device, dtype=spec.dtype)
@@ -148,15 +163,24 @@ class ColumnTieredMoEWrapper(nn.Module):
         self.cpu_n = 0
 
     # -- loading ------------------------------------------------------
+    @staticmethod
+    def _hot_n(inter: int, frac: float) -> int:
+        hn = max(1, int(round(inter * frac)))
+        return inter if hn >= inter else hn
+
     def _expert_tensors(self, expert_id: int):
         ks = self.expert_keys[expert_id]
         return (self.handles.get_tensor(ks["gate"]),
                 self.handles.get_tensor(ks["up"]),
                 self.handles.get_tensor(ks["down"]))
 
-    def _load_hot_to_slot(self, expert_id: int, slot_idx: int) -> int:
-        slot = self.slots[slot_idx]
-        hn = self.hot_n
+    def _pool(self, expert_id: int) -> dict:
+        return self.pools[self.tier_of[expert_id]]
+
+    def _load_hot_to_slot(self, expert_id: int, pool: dict,
+                          slot_idx: int) -> int:
+        slot = pool["slots"][slot_idx]
+        hn = slot.hot_n
         t_gate, t_up, t_down = self._expert_tensors(expert_id)
         g_h, u_h, d_h = t_gate[:hn], t_up[:hn], t_down[:, :hn]
         nbytes = int(g_h.nbytes + u_h.nbytes + d_h.nbytes)
@@ -171,18 +195,19 @@ class ColumnTieredMoEWrapper(nn.Module):
                 slot.gate_hot.weight.copy_(g_h)
                 slot.up_hot.weight.copy_(u_h)
                 slot.down_hot.weight.copy_(d_h)
-        if slot_idx in self.slot_to_expert:
-            self.expert_to_slot.pop(self.slot_to_expert.pop(slot_idx), None)
-        self.slot_to_expert[slot_idx] = expert_id
-        self.expert_to_slot[expert_id] = slot_idx
+        if slot_idx in pool["slot_to_expert"]:
+            pool["expert_to_slot"].pop(pool["slot_to_expert"].pop(slot_idx), None)
+        pool["slot_to_expert"][slot_idx] = expert_id
+        pool["expert_to_slot"][expert_id] = slot_idx
         self.hot_dma_bytes += nbytes
         self.dma_bytes += nbytes
         return nbytes
 
     def _fetch_cold(self, expert_id: int) -> int:
-        if self.cold_n == 0:
+        hn = self._hot_n(self.spec.inter, self.tier_of[expert_id])
+        cn = self.spec.inter - hn
+        if cn == 0:
             return 0
-        hn = self.hot_n
         t_gate, t_up, t_down = self._expert_tensors(expert_id)
         g_c, u_c, d_c = t_gate[hn:], t_up[hn:], t_down[:, hn:]
         nbytes = int(g_c.nbytes + u_c.nbytes + d_c.nbytes)
@@ -190,13 +215,13 @@ class ColumnTieredMoEWrapper(nn.Module):
         with torch.no_grad():
             if use_stream:
                 with torch.cuda.stream(self.dma_stream):
-                    self._scratch_gc.copy_(g_c, non_blocking=True)
-                    self._scratch_uc.copy_(u_c, non_blocking=True)
-                    self._scratch_dc.copy_(d_c, non_blocking=True)
+                    self._scratch_gc[:cn].copy_(g_c, non_blocking=True)
+                    self._scratch_uc[:cn].copy_(u_c, non_blocking=True)
+                    self._scratch_dc[:, :cn].copy_(d_c, non_blocking=True)
             else:
-                self._scratch_gc.copy_(g_c)
-                self._scratch_uc.copy_(u_c)
-                self._scratch_dc.copy_(d_c)
+                self._scratch_gc[:cn].copy_(g_c)
+                self._scratch_uc[:cn].copy_(u_c)
+                self._scratch_dc[:, :cn].copy_(d_c)
         self.cold_dma_bytes += nbytes
         self.dma_bytes += nbytes
         return nbytes
@@ -205,19 +230,20 @@ class ColumnTieredMoEWrapper(nn.Module):
         if self.dma_stream is not None and self.device.type == "cuda":
             torch.cuda.current_stream(self.device).wait_stream(self.dma_stream)
 
-    def _ensure_hot(self, expert_id: int) -> int:
-        if expert_id in self.expert_to_slot:
+    def _ensure_hot(self, expert_id: int):
+        pool = self._pool(expert_id)
+        if expert_id in pool["expert_to_slot"]:
             self.hits += 1
-            slot_idx = self.expert_to_slot[expert_id]
-            self.slot_lru.remove(slot_idx)
-            self.slot_lru.append(slot_idx)
-            return slot_idx
+            slot_idx = pool["expert_to_slot"][expert_id]
+            pool["slot_lru"].remove(slot_idx)
+            pool["slot_lru"].append(slot_idx)
+            return pool, slot_idx
         self.misses += 1
-        slot_idx = self.slot_lru.pop(0)
-        self._load_hot_to_slot(expert_id, slot_idx)
-        self.slot_lru.append(slot_idx)
+        slot_idx = pool["slot_lru"].pop(0)
+        self._load_hot_to_slot(expert_id, pool, slot_idx)
+        pool["slot_lru"].append(slot_idx)
         self._sync_dma()
-        return slot_idx
+        return pool, slot_idx
 
     # -- forward -------------------------------------------------------
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -241,8 +267,10 @@ class ColumnTieredMoEWrapper(nn.Module):
         mask = F.one_hot(TI, num_classes=self.spec.n_routed + 1).permute(2, 1, 0)
         act = self.spec.activation
         for e in needed:
-            slot_idx = self._ensure_hot(e)
-            slot = self.slots[slot_idx]
+            pool, slot_idx = self._ensure_hot(e)
+            slot = pool["slots"][slot_idx]
+            hn = slot.hot_n
+            cn = self.spec.inter - hn
             self._fetch_cold(e)
             self._sync_dma()
             kpos, rows = torch.where(mask[e])
@@ -252,10 +280,11 @@ class ColumnTieredMoEWrapper(nn.Module):
                 gh = F.linear(xe, slot.gate_hot.weight)
                 uh = F.linear(xe, slot.up_hot.weight)
                 yh = F.linear(apply_gate(gh, uh, act), slot.down_hot.weight)
-                if self.cold_n > 0:
-                    gc = F.linear(xe, self._scratch_gc)
-                    uc = F.linear(xe, self._scratch_uc)
-                    yc = F.linear(apply_gate(gc, uc, act), self._scratch_dc)
+                if cn > 0:
+                    gc = F.linear(xe, self._scratch_gc[:cn])
+                    uc = F.linear(xe, self._scratch_uc[:cn])
+                    yc = F.linear(apply_gate(gc, uc, act),
+                                  self._scratch_dc[:, :cn])
                     ye = yh + yc.to(yh.dtype)
                 else:
                     ye = yh
@@ -265,9 +294,10 @@ class ColumnTieredMoEWrapper(nn.Module):
             else torch.zeros_like(identity)
         out = shared_out + out.reshape(orig_shape)
         if self.streaming:
-            self.expert_to_slot.clear()
-            self.slot_to_expert.clear()
-            self.slot_lru = list(range(len(self.slots)))
+            for pool in self.pools.values():
+                pool["expert_to_slot"].clear()
+                pool["slot_to_expert"].clear()
+                pool["slot_lru"] = list(range(len(pool["slots"])))
         if self.tupled:
             return out, None
         return out

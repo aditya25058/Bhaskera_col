@@ -131,3 +131,36 @@ def test_dma_split_and_lru():
                     spec.activation)
     full_bytes = sum(p.nbytes for p in full.parameters())
     assert w.slots[0].resident_bytes() * 2 == full_bytes
+
+
+def test_mixed_tiers_match_native():
+    from bhaskera.inference.colossus.colprofile import assign_tiers
+    from collections import Counter
+    spec, handles, keys = _setup()
+    dev = torch.device("cpu")
+    freq = Counter({0: 50, 1: 30, 2: 10, 3: 5, 4: 2, 5: 1})
+    fracs = assign_tiers(freq, 6, budget=6 * 0.5)
+    assert abs(sum(fracs) - 3.0) < 1e-9  # budget respected exactly-ish
+    assert fracs[0] >= fracs[5]  # monotone with frequency
+    w = ColumnTieredMoEWrapper(layer_idx=0, spec=spec, expert_keys=keys,
+                               device=dev, capacity=6, handles=handles,
+                               hot_fracs=fracs)
+    assert len(w.pools) >= 2  # multiple tiers materialized
+    x = _inputs()
+    got = w(x)
+    ref = _native_ref(spec, handles, keys, x) + _shared_forward(spec, x)
+    assert got.shape == ref.shape
+    assert torch.allclose(got.float(), ref.float(), atol=0.05, rtol=0.05)
+
+
+def test_assign_tiers_budget_and_base():
+    from bhaskera.inference.colossus.colprofile import assign_tiers
+    from collections import Counter
+    fracs = assign_tiers(Counter(), 8, budget=8 * 0.1)
+    assert all(f == 0.1 for f in fracs)  # no freq info: all base
+    try:
+        assign_tiers(Counter(), 8, budget=0.5)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("should reject below-base budget")
