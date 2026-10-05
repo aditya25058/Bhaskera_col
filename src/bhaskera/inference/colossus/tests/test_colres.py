@@ -11,7 +11,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from bhaskera.inference.colossus.columns import ColumnTieredMoEWrapper
+from bhaskera.inference.colossus.colres import ColumnTieredMoEWrapper
 from bhaskera.inference.colossus.interface import MoELayerSpec
 from bhaskera.inference.colossus.placement import apply_gate
 from bhaskera.inference.colossus.tests.test_interface import FakeDeepSeekBlock

@@ -158,7 +158,7 @@ def serve_huge_moe(model, tokenizer, profile, handles: ShardHandles,
     install_cache_compat(getattr(profile, "model_type", None))
     _wrap_opts: dict = {}
     if hot_col_frac is not None:
-        from .columns import ColumnTieredMoEWrapper
+        from .colres import ColumnTieredMoEWrapper
         _wrap_opts = {"wrapper_cls": ColumnTieredMoEWrapper,
                       "hot_frac": float(hot_col_frac)}
     wrappers = prepare_model(model, profile, handles, device, capacity,
