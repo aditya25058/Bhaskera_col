@@ -245,11 +245,22 @@ def serve_huge_moe(model, tokenizer, profile, handles: ShardHandles,
     finished = [False] * B
     eos_id = tokenizer.eos_token_id
     new_counts = [1] * B
+    # Prefill token is the first generated token: append BEFORE the loop
+    # (previously dropped — continuation missed position 1 and every
+    # teacher comparison shifted by one).
+    generated_ids = torch.cat([generated_ids, next_token], dim=1)
+    for bi in range(B):
+        if int(next_token[bi, 0].item()) == eos_id:
+            finished[bi] = True
     latencies: list[float] = []
     if log_routing:
         for w in wrappers:
             w.routing_log = []
+    if all(finished):
+        latencies = []
     for step in range(max_new_tokens - 1):
+        if all(finished):
+            break
         if device.type == "cuda":
             torch.cuda.synchronize(device)
         t0 = time.perf_counter()

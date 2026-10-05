@@ -109,6 +109,30 @@ def test_prepare_wraps_all_layers():
     assert all(isinstance(model.layers[i].mlp, TieredMoEWrapper) for i in (0, 1))
 
 
+def test_prefill_token_appended_not_dropped(tmp_path):
+    """Regression: prefill's next_token is generated token #1.
+
+    The loop used to overwrite it before appending, dropping position 1
+    from every continuation (and shifting all teacher comparisons).
+    """
+    import json
+
+    torch.manual_seed(0)
+    model = FakeCausalMoE()
+    tok = FakeTokenizer()
+    tok.eos_token_id = -1  # no early stop: expect exactly max_new_tokens
+    handles = _stub_handles(model)
+    ids_path = str(tmp_path / "ids.json")
+    res = serve_huge_moe(model, tok, FakeProfile(), handles,
+                         torch.device("cpu"), ["hi"],
+                         max_new_tokens=4, capacity=8,
+                         dump_ids=ids_path)
+    assert res["generated_tokens"] == 4
+    cont = json.load(open(ids_path))["continuation_ids"]
+    assert len(cont) == 4, f"prefill token dropped: {cont}"
+    assert len(res["texts"]) == 1
+
+
 def test_teacher_audit_records(tmp_path):
     model = FakeCausalMoE()
     tok = FakeTokenizer()
@@ -123,7 +147,7 @@ def test_teacher_audit_records(tmp_path):
     audit = json.load(open(audit_path))["audit"]
     assert len(audit) == 6
     for e in audit:
-        assert set(e) == {"pos", "own", "ref", "match", "margin"}
+        assert set(e) == {"pos", "own", "ref", "match", "margin", "own_bf16"}
         assert e["ref"] == 7 and e["match"] == (e["own"] == 7)
     assert res["flip_audit"] == audit
 
