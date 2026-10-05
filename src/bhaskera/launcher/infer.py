@@ -129,6 +129,8 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="JSON int list; teacher-forced flip protocol (B=1 only)")
     p.add_argument("--audit-logits", default=None, metavar="PATH",
                    help="Dump per-position {own, ref, margin} flip audit")
+    p.add_argument("--dump-ids", default=None, metavar="PATH",
+                   help="Dump B=1 continuation token IDs (teacher artifacts)")
     # Planner (inspect + probe + feasibility; serves nothing)
     p.add_argument("--plan", action="store_true",
                    help="Print ranked serving plans instead of serving")
@@ -279,6 +281,7 @@ def main(argv: List[str] = None) -> None:
 
     # ── Config ───────────────────────────────────────────────────────
     cfg = _build_config(args)
+    infer = cfg.inference
 
     # ── Planner ────────────────────────────────────────────────────
     # Model + hardware discovery -> feasibility -> ranked plan table.
@@ -408,13 +411,19 @@ def main(argv: List[str] = None) -> None:
             import json as _json
             with open(args.teacher_tokens) as f:
                 _teacher = _json.load(f)
+            if isinstance(_teacher, dict):
+                _teacher = _teacher.get("continuation_ids") or \
+                    _teacher.get("teacher_tokens")
+            if isinstance(_teacher, list) and _teacher and \
+                    isinstance(_teacher[0], list):
+                _teacher = _teacher[0] if len(_teacher) == 1 else _teacher
         res = serve_huge_moe(
             model, tokenizer, profile, handles, device, prompts,
             max_new_tokens=args.max_new_tokens or infer.max_new_tokens,
             capacity=_cap, placement=_tier,
             prefill_chunk=_chunk, log_routing=args.log_routing,
             teacher_tokens=_teacher, audit_logits=args.audit_logits,
-            config=hf_cfg)
+            config=hf_cfg, dump_ids=args.dump_ids)
         elapsed = time.perf_counter() - t0
         outputs = res["texts"]
         total_output_tokens = sum(_count_output_tokens(o, tokenizer) for o in outputs)
