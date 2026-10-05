@@ -140,7 +140,9 @@ def test_mixed_tiers_match_native():
     dev = torch.device("cpu")
     freq = Counter({0: 50, 1: 30, 2: 10, 3: 5, 4: 2, 5: 1})
     fracs = assign_tiers(freq, 6, budget=6 * 0.5)
-    assert abs(sum(fracs) - 3.0) < 1e-9  # budget respected exactly-ish
+    # Greedy is optimal up to one tier step: residual smaller than the
+    # smallest upgrade (0.15) proves no affordable upgrade was skipped.
+    assert 3.0 - 0.15 <= sum(fracs) <= 3.0
     assert fracs[0] >= fracs[5]  # monotone with frequency
     w = ColumnTieredMoEWrapper(layer_idx=0, spec=spec, expert_keys=keys,
                                device=dev, capacity=6, handles=handles,
