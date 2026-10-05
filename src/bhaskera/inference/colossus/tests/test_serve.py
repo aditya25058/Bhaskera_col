@@ -129,7 +129,8 @@ def test_prefill_token_appended_not_dropped(tmp_path):
                          dump_ids=ids_path)
     assert res["generated_tokens"] == 4
     cont = json.load(open(ids_path))["continuation_ids"]
-    assert len(cont) == 4, f"prefill token dropped: {cont}"
+    assert isinstance(cont, list) and len(cont) == 1  # batched
+    assert len(cont[0]) == 4, f"prefill token dropped: {cont}"
     assert len(res["texts"]) == 1
 
 
