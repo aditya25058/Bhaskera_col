@@ -66,8 +66,14 @@ def prepare_model(model: torch.nn.Module, profile: Any, handles: ShardHandles,
                   dtype: torch.dtype = torch.bfloat16,
                   placement: str = "slots", dma_stream: Any = None,
                   zssr: bool = False, prefetch_topk: int = 8,
-                  prefetch_conf: float = 0.0, config=None) -> list[TieredMoEWrapper]:
+                   prefetch_conf: float = 0.0, config=None,
+                   prefault: bool = False) -> list[TieredMoEWrapper]:
     """Materialize resident weights + wrap MoE layers. Returns wrappers."""
+    if prefault and hasattr(handles, "weight_map"):
+        from .loading import prefault_shards
+        model_dir = getattr(handles, "model_dir", "") or ""
+        if model_dir:
+            prefault_shards(handles.weight_map, model_dir, verbose=True)
     resident, _ = split_routed(handles.weight_map)
     materialize(model, resident, handles, device, dtype)
     model.eval()
@@ -142,6 +148,8 @@ def serve_huge_moe(model, tokenizer, profile, handles: ShardHandles,
                    teacher_tokens: list[int] | None = None,
                    audit_logits: str | None = None,
                    config=None,
+                   prefault: bool = False,
+                   dump_ids: str | None = None,
                    ) -> dict[str, Any]:
     """Greedy lockstep serve with ledger. Returns results dict."""
     from transformers.cache_utils import DynamicCache
@@ -152,7 +160,8 @@ def serve_huge_moe(model, tokenizer, profile, handles: ShardHandles,
                              dma_stream=(torch.cuda.Stream(device=device)
                                          if device.type == "cuda" else None),
                              zssr=zssr, prefetch_topk=prefetch_topk,
-                             prefetch_conf=prefetch_conf, config=config)
+                             prefetch_conf=prefetch_conf, config=config,
+                             prefault=prefault)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     enc = tokenizer(prompts, padding=True, return_tensors="pt")
@@ -200,17 +209,29 @@ def serve_huge_moe(model, tokenizer, profile, handles: ShardHandles,
         own = int(ti[0])
         audit.append({"pos": 1, "own": own, "ref": teacher_tokens[0],
                       "match": own == teacher_tokens[0],
-                      "margin": float(tv[0] - tv[1])})
+                      "margin": float(tv[0] - tv[1]),
+                      "own_bf16": int(logits[0, -1, :].argmax())})
         next_token = torch.tensor([[teacher_tokens[0]]], device=device)
 
     finished = [False] * B
     eos_id = tokenizer.eos_token_id
     new_counts = [1] * B
+    # Prefill token is generated token #1: append BEFORE the loop
+    # (previously dropped — continuation missed position 1 and every
+    # teacher comparison shifted by one).
+    generated_ids = torch.cat([generated_ids, next_token], dim=1)
+    for bi in range(B):
+        if int(next_token[bi, 0].item()) == eos_id:
+            finished[bi] = True
     latencies: list[float] = []
     if log_routing:
         for w in wrappers:
             w.routing_log = []
+    if all(finished):
+        latencies = []
     for step in range(max_new_tokens - 1):
+        if all(finished):
+            break
         if device.type == "cuda":
             torch.cuda.synchronize(device)
         t0 = time.perf_counter()
@@ -232,7 +253,8 @@ def serve_huge_moe(model, tokenizer, profile, handles: ShardHandles,
                     ref = teacher_tokens[pos - 1]
                     audit.append({"pos": pos, "own": own, "ref": ref,
                                   "match": own == ref,
-                                  "margin": float(tv[0] - tv[1])})
+                                  "margin": float(tv[0] - tv[1]),
+                                  "own_bf16": int(logits[0, -1, :].argmax())})
                     next_token = torch.tensor([[ref]], device=device)
         if device.type == "cuda":
             torch.cuda.synchronize(device)
@@ -273,6 +295,12 @@ def serve_huge_moe(model, tokenizer, profile, handles: ShardHandles,
         with open(audit_logits, "w") as f:
             _json2.dump({"audit": audit}, f)
         flip_audit = audit
+    if dump_ids:
+        import json as _json3
+        with open(dump_ids, "w") as f:
+            _json3.dump({"continuation_ids": generated_ids[:, prompt_len:].tolist()
+                         if B == 1 else None,
+                         "batch": B, "prompt_len": prompt_len}, f)
     return {
         "texts": texts,
         "batch_size": B,

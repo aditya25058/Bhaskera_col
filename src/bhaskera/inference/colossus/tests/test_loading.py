@@ -17,6 +17,7 @@ from bhaskera.inference.colossus.loading import (
     ShardHandles,
     is_routed_expert_key,
     materialize,
+    prefault_shards,
     split_routed,
 )
 
@@ -126,3 +127,15 @@ def test_conventions_in_sync():
     from bhaskera.inference.colossus import loading as L
     assert set(intro._EXPERT_LEAF_NAMES) == {"experts", "local_experts", "routed_experts"}
     assert set(intro._SHARED_EXPERT_HINTS) == set(L.SHARED_HINTS)
+
+
+def test_prefault_shards_stats_only(tmp_path):
+    from bhaskera.inference.colossus.loading import prefault_shards
+    d = tmp_path / "w"
+    d.mkdir()
+    (d / "a.safetensors").write_bytes(b"x" * 1000)
+    (d / "b.safetensors").write_bytes(b"y" * 3000)
+    wm = {"k1": "a.safetensors", "k2": "b.safetensors", "k3": "a.safetensors"}
+    st = prefault_shards(wm, str(d))
+    assert st["shards"] == 2 and abs(st["gb"] - 4000 / 1e9) < 1e-9
+    assert st["advise_s"] >= 0.0

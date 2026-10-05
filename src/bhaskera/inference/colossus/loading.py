@@ -47,6 +47,39 @@ def split_routed(weight_map: dict[str, str]) -> tuple[list[str], list[str]]:
     return sorted(resident), sorted(routed)
 
 
+def prefault_shards(weight_map: dict[str, str], model_dir: str,
+                    verbose: bool = False) -> dict:
+    """Advise the kernel to page in every weight shard (cold-start tax).
+
+    `POSIX_FADV_WILLNEED` per shard: non-blocking readahead hint, no
+    memory pressure, no behavior change — converts thousands of scattered
+    demand major-faults during materialize/decode into one sequential
+    streaming read. Returns {"shards": n, "gb": size, "advise_s": wall}.
+    Conditional win: helps cold boxes with RAM >> model; on
+    marginal-cache boxes the streaming readahead races demand I/O (§25).
+    """
+    import logging as _logging
+    import time as _time
+    log = _logging.getLogger("bhaskera.loading")
+    shards = sorted(set(weight_map.values()))
+    total = 0
+    t0 = _time.perf_counter()
+    for shard in shards:
+        path = os.path.join(model_dir, shard)
+        try:
+            total += os.path.getsize(path)
+            with open(path, "rb") as f:
+                os.posix_fadvise(f.fileno(), 0, 0, os.POSIX_FADV_WILLNEED)
+        except Exception as e:
+            log.warning("prefault %s: %s", shard, e)
+    dt = _time.perf_counter() - t0
+    stats = {"shards": len(shards), "gb": total / 1e9, "advise_s": dt}
+    if verbose:
+        log.info("prefault: %d shards %.1f GB advise %.1fs",
+                 stats["shards"], stats["gb"], dt)
+    return stats
+
+
 class ShardMap:
     """One aligned mmap per safetensors shard; zero-copy tensor views."""
 
