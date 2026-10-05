@@ -255,3 +255,7 @@ Old ceiling (B=64 shared, 38.6 agg) was not a ceiling — shared-batch union con
 | 512 | OOM (decode KV) | >93 GB | — | survived |
 
 Two findings: (1) cold-page-cache tax is 2× (16.5 → 32.9) — research scaffold prefaults, CLI does not; prefault/pin is the cheapest pending win for every first run. (2) The wall is decode-KV at B=512, prefill survives — TurboQuant KV wiring (exists in core, not in `serve_huge_moe`) is the key to past it, at the cost of leaving the bitwise contract (needs ulp-grade flip re-validation). Logs: `/tmp/b{64,128,256,384,448,512}*.log` on H100.
+
+## 26. Consolidation branch (`colossus-consolidated`, from `colossus-zssr` §21)
+
+Merge-ready main line, no experiments: prefill-token append + EOS-at-prefill guard, `--dump-ids`, teacher dict/batch unwrap, `infer` bind fix, bf16/fp32 audit discipline, `--prefault` (default off, §25 guidance), regression + prefault unit tests. Excludes: TQ-KV wiring (negative result, stays on `colossus-tqkv`), grouped adapter (stays on frozen `colossus-grouped-moe`, re-audit on `colossus-grouped-reaudit`). Verified: 59/59 colossus tests green (Rudra CPU) + H100 B=1 smoke — dump starts with prefill token 185, text regains leading newline, counters bit-identical to pre-fix trajectory (662/6376/286920). Prior branches untouched.
