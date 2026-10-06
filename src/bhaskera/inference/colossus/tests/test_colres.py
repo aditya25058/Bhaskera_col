@@ -197,3 +197,22 @@ def test_cold_cache_evicts_lru():
     w(x)
     # cap-1 with several experts: evictions force refetch misses
     assert w.cold_misses > w.cold_hits
+
+
+def test_grouped_gemm_matches_loop_path():
+    spec, handles, keys = _setup()
+    dev = torch.device("cpu")
+    loop = ColumnTieredMoEWrapper(layer_idx=0, spec=spec, expert_keys=keys,
+                                  device=dev, capacity=6, handles=handles,
+                                  hot_frac=0.5)
+    batched = ColumnTieredMoEWrapper(layer_idx=0, spec=spec, expert_keys=keys,
+                                     device=dev, capacity=6, handles=handles,
+                                     hot_frac=0.5, grouped_gemm=True)
+    # Skewed token distribution across experts (uneven rows stress padding).
+    g = torch.Generator().manual_seed(7)
+    x = torch.randn(13, 8, dtype=torch.bfloat16, generator=g)
+    a = loop(x)
+    b = batched(x)
+    assert a.shape == b.shape
+    assert torch.allclose(a.float(), b.float(), atol=0.05, rtol=0.05)
+    assert batched.dma_bytes == loop.dma_bytes  # same bytes, fewer launches

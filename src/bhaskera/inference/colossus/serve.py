@@ -167,6 +167,7 @@ def serve_huge_moe(model, tokenizer, profile, handles: ShardHandles,
                    hot_col_frac: float | None = None,
                    hot_tier_file: str | None = None,
                    cold_cache_cap: int = 0,
+                   grouped_gemm: bool = False,
                    matrix_tiers: bool = False,
                    ) -> dict[str, Any]:
     """Greedy lockstep serve with ledger. Returns results dict."""
@@ -179,6 +180,8 @@ def serve_huge_moe(model, tokenizer, profile, handles: ShardHandles,
         _wrap_opts = {"wrapper_cls": ColumnTieredMoEWrapper}
         if cold_cache_cap > 0:
             _wrap_opts["cold_cache_cap"] = int(cold_cache_cap)
+        if grouped_gemm:
+            _wrap_opts["grouped_gemm"] = True
         if hot_tier_file is not None:
             from .colprofile import load_tier_file, load_tier_pools
             _wrap_opts["hot_tiers"] = load_tier_file(hot_tier_file)

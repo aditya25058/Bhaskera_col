@@ -142,6 +142,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--cold-cache", type=int, default=0, metavar="N",
                    help="Cold-column second-tier LRU entries per MoE layer "
                         "(column slots only; N=8/layer ~= 11 GB at f=0.5)")
+    p.add_argument("--grouped-gemm", action="store_true",
+                   help="Batched dispatch: one bmm trio per tier per layer "
+                        "(fewer launches; audit-gated, ulp risk)")
     p.add_argument("--matrix-tiers", action="store_true",
                    help="FIRM-like control: per-matrix LRU pools instead of "
                         "whole-expert or column slots")

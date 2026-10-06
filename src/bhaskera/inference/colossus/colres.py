@@ -95,6 +95,7 @@ class ColumnTieredMoEWrapper(nn.Module):
         hot_fracs: list[float] | None = None,
         tier_pools: dict[float, int] | None = None,
         cold_cache_cap: int = 0,
+        grouped_gemm: bool = False,
         **opts,
     ):
         super().__init__()
@@ -111,6 +112,11 @@ class ColumnTieredMoEWrapper(nn.Module):
         self.dma_stream = dma_stream
         self.tupled = bool(tupled)
         self.hot_fracs = [float(f) for f in hot_fracs]
+        # Batched dispatch: one bmm trio per tier per layer instead of
+        # per-expert-per-half launches. Same math, fewer launches; bmm
+        # kernel selection may differ by ~1 ulp from per-expert GEMMs —
+        # audit-gated, same discipline as split-summation.
+        self.grouped_gemm = bool(grouped_gemm)
         if opts.get("cpu_exec"):
             raise ValueError("column slots need GPU placement (cpu_exec off)")
         self.streaming = (capacity == 0)
@@ -290,6 +296,96 @@ class ColumnTieredMoEWrapper(nn.Module):
         self._sync_dma()
         return pool, slot_idx
 
+    def _clear_all(self) -> None:
+        for pool in self.pools.values():
+            pool["expert_to_slot"].clear()
+            pool["slot_to_expert"].clear()
+            pool["slot_lru"] = list(range(len(pool["slots"])))
+        self._cold_cache.clear()
+        self._cold_lru.clear()
+
+    def _forward_grouped(self, flat, TI, TW, needed, mask, act, out):
+        """Batched dispatch: one bmm trio per tier (MoEShard-style fusion).
+
+        Per tier: ensure hot for all needed experts, stack hot weights +
+        padded token rows, single bmm trio for hot, one coalesced cold
+        fetch + single bmm trio for cold, single index_add scatter.
+        Zero padding never scatters (only real rows land in out).
+        """
+        K = TI.shape[-1]
+        dev, dt = flat.device, flat.dtype
+        for t in self.tiers:
+            es = [e for e in needed if self.tier_of[e] == t]
+            if not es:
+                continue
+            pool = self.pools[t]
+            hn = pool["slots"][0].hot_n
+            inter = self.spec.inter
+            cn = inter - hn
+            per_rows, per_w = [], []
+            for e in es:
+                slot_idx = self._ensure_hot(e)
+                kpos, rows = torch.where(mask[e])
+                per_rows.append(rows)
+                per_w.append(TW[rows, kpos])
+            nes = [r.numel() for r in per_rows]
+            nmax = max(nes)
+            E = len(es)
+            H = flat.shape[-1]
+            xb = flat.new_zeros(E, nmax, H)
+            wb = flat.new_zeros(E, nmax, 1)
+            wg = flat.new_empty(E, hn, H)
+            wu = flat.new_empty(E, hn, H)
+            wd = flat.new_empty(E, H, hn)
+            for i, e in enumerate(es):
+                n = nes[i]
+                if n == 0:
+                    continue
+                xb[i, :n] = flat[per_rows[i]]
+                wb[i, :n, 0] = per_w[i].to(dt)
+                slot = pool["slots"][pool["expert_to_slot"][e]]
+                wg[i].copy_(slot.gate_hot.weight)
+                wu[i].copy_(slot.up_hot.weight)
+                wd[i].copy_(slot.down_hot.weight)
+            with torch.no_grad():
+                gh = torch.bmm(xb, wg.transpose(1, 2))
+                uh = torch.bmm(xb, wu.transpose(1, 2))
+                yh = torch.bmm(apply_gate(gh, uh, act), wd.transpose(1, 2))
+                if cn > 0:
+                    fu = flat.new_empty(E, 2 * cn, H)
+                    dc = flat.new_empty(E, H, cn)
+                    for i, e in enumerate(es):
+                        gc, uc, dcc = self._fetch_cold_slices(e, hn, cn)
+                        fu[i, :cn].copy_(gc)
+                        fu[i, cn:].copy_(uc)
+                        dc[i].copy_(dcc)
+                        # NOTE: grouped path bypasses the cold-cache tier
+                        # (values identical; hits simply not harvested).
+                        nbytes = int(gc.nbytes + uc.nbytes + dcc.nbytes)
+                        self.cold_dma_bytes += nbytes
+                        self.dma_bytes += nbytes
+                    self._sync_dma()
+                    g, u = torch.bmm(xb, fu.transpose(1, 2)).chunk(2, dim=-1)
+                    yc = torch.bmm(apply_gate(g, u, act), dc.transpose(1, 2))
+                    yh = yh + yc.to(yh.dtype)
+                ye = yh * wb.to(yh.dtype)
+            rows_all, ye_all = [], []
+            for i in range(E):
+                if nes[i]:
+                    rows_all.append(per_rows[i])
+                    ye_all.append(ye[i, :nes[i]].to(out.dtype))
+            if rows_all:
+                out.index_add_(0, torch.cat(rows_all),
+                               torch.cat(ye_all))
+        if self.streaming:
+            self._clear_all()
+        return out
+
+    def _fetch_cold_slices(self, expert_id: int, hn: int, cn: int):
+        """Cold slices as views (caller copies + accounts)."""
+        t_gate, t_up, t_down = self._expert_tensors(expert_id)
+        return t_gate[hn:], t_up[hn:], t_down[:, hn:]
+
     # -- forward -------------------------------------------------------
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         identity = hidden_states
@@ -311,6 +407,17 @@ class ColumnTieredMoEWrapper(nn.Module):
         # summed per expert (summation partition = exact).
         mask = F.one_hot(TI, num_classes=self.spec.n_routed + 1).permute(2, 1, 0)
         act = self.spec.activation
+        if self.grouped_gemm:
+            out = self._forward_grouped(flat, TI, TW, needed, mask, act, out)
+            shared_out = self.shared_experts(identity) \
+                if self.shared_experts is not None \
+                else torch.zeros_like(identity)
+            out = shared_out + out.reshape(orig_shape)
+            if self.streaming:
+                self._clear_all()
+            if self.tupled:
+                return out, None
+            return out
         for e in needed:
             pool, slot_idx = self._ensure_hot(e)
             slot = pool["slots"][slot_idx]
