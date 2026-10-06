@@ -361,6 +361,7 @@ def serve_huge_moe(model, tokenizer, profile, handles: ShardHandles,
         "hot_dma_mb": hot_dma_mb,
         "cold_dma_mb": cold_dma_mb,
         "cold_hits": sum(getattr(w, "cold_hits", 0) for w in wrappers),
+        "stall_ms": sum(getattr(w, "stall_ms", 0.0) for w in wrappers),
         "routing_log_steps": routing_steps,
         "flip_audit": flip_audit,
     }

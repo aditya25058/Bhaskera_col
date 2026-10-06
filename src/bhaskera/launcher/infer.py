@@ -461,7 +461,8 @@ def main(argv: List[str] = None) -> None:
             print(f"COLUMN f={res['hot_frac']} | "
                   f"hot={res['hot_dma_mb']:.1f} MB "
                   f"cold={res['cold_dma_mb']:.1f} MB "
-                  f"(cold_hits={res.get('cold_hits', 0)})")
+                  f"(cold_hits={res.get('cold_hits', 0)}, "
+                  f"stall={res.get('stall_ms', 0.0):.0f} ms)")
         if remote:
             st = handles.stats()
             print(f"REMOTE: net={st['network_bytes'] / 1e9:.2f} GB fetched, "

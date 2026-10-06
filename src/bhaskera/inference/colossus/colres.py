@@ -31,6 +31,7 @@ correctness never depends on WHICH columns are hot).
 """
 from __future__ import annotations
 
+import time
 from typing import Any
 
 import torch
@@ -182,6 +183,7 @@ class ColumnTieredMoEWrapper(nn.Module):
         self.routing_log = None
         self.cpu_ms = 0.0
         self.cpu_n = 0
+        self.stall_ms = 0.0
 
     # -- loading ------------------------------------------------------
     @staticmethod
@@ -314,8 +316,11 @@ class ColumnTieredMoEWrapper(nn.Module):
             slot = pool["slots"][slot_idx]
             hn = slot.hot_n
             cn = self.spec.inter - hn
+            # Overlap: issue cold fetch async, compute the HOT partial
+            # immediately (hot weights are resident — no dependency), and
+            # only then wait for cold. Cold-fetch latency hides behind
+            # hot GEMMs; the wait left over is the exposed stall.
             gc, uc, dc = self._fetch_cold(e)
-            self._sync_dma()
             kpos, rows = torch.where(mask[e])
             xe = flat[rows]
             w = TW[rows, kpos].unsqueeze(-1)
@@ -324,6 +329,9 @@ class ColumnTieredMoEWrapper(nn.Module):
                 uh = F.linear(xe, slot.up_hot.weight)
                 yh = F.linear(apply_gate(gh, uh, act), slot.down_hot.weight)
                 if cn > 0:
+                    t0 = time.perf_counter()
+                    self._sync_dma()
+                    self.stall_ms += (time.perf_counter() - t0) * 1000.0
                     gc = F.linear(xe, gc)
                     uc = F.linear(xe, uc)
                     yc = F.linear(apply_gate(gc, uc, act), dc)
