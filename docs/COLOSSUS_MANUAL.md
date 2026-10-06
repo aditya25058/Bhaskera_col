@@ -188,6 +188,8 @@ the decision guide. CLI flags override YAML values.
 | `--hot-col-frac` | float (0,1] | — | column slots: hot fraction (module + grouped) |
 | `--hot-tier-file` | path | — | adaptive-f tier JSON (overrides frac) |
 | `--cold-cache` | int | 0 | cold-column LRU/layer; falsified — leave 0 |
+| `--grouped-gemm` | — | off | batched dispatch; falsified as implemented — leave off |
+| `--matrix-tiers` | — | off | FIRM-like per-matrix control |
 | `--matrix-tiers` | — | off | FIRM-like per-matrix control |
 | `--prefault` | — | off | page-in shards first; helps cold big-RAM boxes only |
 | `--dump-ids` | path | — | B=1 continuation IDs (teacher artifacts) |
