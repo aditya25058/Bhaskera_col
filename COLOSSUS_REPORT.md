@@ -319,3 +319,14 @@ Ported the §23 harness fixes (prefill append, dump-ids, teacher unwrap) onto th
 | 0.25 | 16/16 | 1.75 | 6.46 | 47.4 (9.5+38.0) |
 
 bf16==fp32 at all positions, all runs. Routing wobble is audit-neutral (1128/3337 vs 1132/3332). Claim upgrades from "a DeepSeek result" to structural: column-granular exact residency works for per-expert modules AND fused grouped tensors through the same summation-partition principle, with zero architecture-specific code in either executor.
+## 32. Gate 3 closed: expert == matrix < columns (branch `colossus-matrix`, H100/B=64)
+
+FIRM-like control (`matrix.py`): per-matrix-role LRU pools (gate/up/down, C matrices each = C full-expert HBM), demand-fetch, native op order, router untouched — residency half only, no predictor (scope stated). One real bug caught by unit test (missing LRU append on miss).
+
+| Config B=64x12, C=12 | tok/s | DMA | VRAM | audit |
+|---|---|---|---|---|
+| expert slots | 32.9 | 240 GB | 60.47 | 16/16 (prior) |
+| matrix pools | 30.7 | 241 GB | 60.47 | 16/16, margin 1.75 |
+| column f=0.5 (C=24) | 31.8 | 244 GB | 61.8 | 16/16 §27 |
+
+Prediction confirmed: an expert's three matrices are used in perfect correlation, so per-matrix LRU moves identical bytes (±0.5%) for 7% launch overhead. Expert == matrix is now a MEASURED null, not an assertion — which is precisely what makes the column result meaningful: whole-matrix splitting adds nothing; only sub-matrix (column) fractions change the HBM/DMA frontier. FIRM distinguished on all three axes (matrix granularity, approximate edge setting + predictor, no exactness invariant); cite as closest prior.

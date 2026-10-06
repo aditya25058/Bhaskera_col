@@ -142,6 +142,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--cold-cache", type=int, default=0, metavar="N",
                    help="Cold-column second-tier LRU entries per MoE layer "
                         "(column slots only; N=8/layer ~= 11 GB at f=0.5)")
+    p.add_argument("--matrix-tiers", action="store_true",
+                   help="FIRM-like control: per-matrix LRU pools instead of "
+                        "whole-expert or column slots")
     # Planner (inspect + probe + feasibility; serves nothing)
     p.add_argument("--plan", action="store_true",
                    help="Print ranked serving plans instead of serving")
@@ -438,7 +441,8 @@ def main(argv: List[str] = None) -> None:
             dump_ids=args.dump_ids,
             hot_col_frac=args.hot_col_frac,
             hot_tier_file=args.hot_tier_file,
-            cold_cache_cap=args.cold_cache)
+            cold_cache_cap=args.cold_cache,
+            matrix_tiers=args.matrix_tiers)
         elapsed = time.perf_counter() - t0
         outputs = res["texts"]
         total_output_tokens = sum(_count_output_tokens(o, tokenizer) for o in outputs)
