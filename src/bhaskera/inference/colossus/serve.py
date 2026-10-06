@@ -65,9 +65,11 @@ def prepare_model(model: torch.nn.Module, profile: Any, handles: ShardHandles,
                   device: torch.device, capacity: int,
                   dtype: torch.dtype = torch.bfloat16,
                   placement: str = "slots", dma_stream: Any = None,
-                  zssr: bool = False, prefetch_topk: int = 8,
+                   zssr: bool = False, prefetch_topk: int = 8,
                    prefetch_conf: float = 0.0, config=None,
-                   prefault: bool = False, **opts) -> list[TieredMoEWrapper]:
+                   prefault: bool = False,
+                   hot_col_frac: float | None = None,
+                   **opts) -> list[TieredMoEWrapper]:
     """Materialize resident weights + wrap MoE layers. Returns wrappers."""
     if prefault and hasattr(handles, "weight_map"):
         from .loading import prefault_shards
@@ -139,9 +141,14 @@ def prepare_model(model: torch.nn.Module, profile: Any, handles: ShardHandles,
         # Representation 2 (grouped weights): the grouped adapter replaces
         # experts containers in place; routing stays native upstream.
         from .grouped import wrap_grouped_layers
+        _gopts: dict = {}
+        if hot_col_frac is not None:
+            from .groupcol import GroupedColumnWrapper
+            _gopts = {"wrapper_cls": GroupedColumnWrapper,
+                      "hot_frac": float(hot_col_frac)}
         wrappers = list(wrappers) + wrap_grouped_layers(
             model, profile, handles, device, capacity,
-            dma_stream=dma_stream)
+            dma_stream=dma_stream, **_gopts)
     return wrappers
 
 
@@ -183,7 +190,8 @@ def serve_huge_moe(model, tokenizer, profile, handles: ShardHandles,
                                          if device.type == "cuda" else None),
                              zssr=zssr, prefetch_topk=prefetch_topk,
                              prefetch_conf=prefetch_conf, config=config,
-                             prefault=prefault, **_wrap_opts)
+                             prefault=prefault,
+                             hot_col_frac=hot_col_frac, **_wrap_opts)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     enc = tokenizer(prompts, padding=True, return_tensors="pt")

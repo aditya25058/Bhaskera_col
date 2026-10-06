@@ -302,3 +302,20 @@ Tester sequence, honestly recorded: storage/RAM/HBM sizing ✅ → config load �
 **Representation 2 (grouped weights):** `gate_up_proj [128, 1408, 2816]` + `down_proj [128, 2816, 704]` — fused 3D tensors with leading expert dim, plus dense-MLP+MoE layer composition (`mlp(x) + moe(x)`, `enable_moe_block`), scaled routing (RMSNorm → proj → softmax → topk → renorm → ×`per_expert_scale`, no post renorm), GELUTanh activation, multimodal `model.language_model.layers` container, composite config. Layering rule enforced: zero architecture names in core — `grouped.py` adapter (shape-structural fused/down classification, zero-copy expert slices, native op order incl. promoted-precision weighting for bitwise parity), generic composite-config unwrap, generic nested-router LoRA exclusion, `gelu_tanh` activation grade. Routing stays native/resident (experts-only wrap); no routing reimplementation.
 
 **A100 proof (16-token quicksort):** native dense 7.61 tok/s vs tiered slots C=8 **1.2 tok/s, 8.2 GB VRAM** (1132 hits / 3332 misses, 37.8 GB DMA) — identical text AND **teacher-forced flip audit 16/16 match, min margin 1.75** (no near-flips). Support story now: module-based AND grouped-weight MoE through one architecture-neutral interface. Suite: 63/63 colossus green (10 `test_inference.py` KV failures are transformers-5.x `StaticKVCache.batch_size` fallout, untouched files, pre-existing). Param2 path untouched (separate branch).
+
+## 24. Gemma re-audit with fixed harness: 16/16 valid (branch `colossus-grouped-reaudit`, Rudra/A100)
+
+Ported the §23 harness fixes (prefill append, dump-ids, teacher unwrap) onto the frozen grouped adapter — no adapter code touched. Fixed dump yields 16 IDs starting with prefill token 107 (old dump happened to match at pos1 by luck of the shift, not by validity). Teacher-forced audit vs native dense: **16/16 match, min margin 1.75, bf16==fp32 at all positions**. The grouped-weight exactness claim (§20) is re-proven under the valid protocol. Colossus suite on this branch: 18/18 green (serve+grouped+loading; 10 `test_inference.py` failures remain pre-existing transformers-5.19 fallout).
+
+## 30. Columns x grouped weights: thesis holds on representation 2 (branch `colossus-groupcol`, Gemma-4/A100)
+
+`groupcol.py`: hot fused halves ([gate_h|up_h] + down_h) resident per slot, cold halves into shared scratch, native op order, router native; `--hot-col-frac` threaded through the grouped wrap path (wrapper_cls hook mirrors placement.py). 9/9 unit tests green (f=1.0 bitwise vs whole-slice wrapper).
+
+| f | audit | margin | VRAM | DMA (hot+cold) |
+|---|---|---|---|---|
+| 1.0 (whole-slice) | 16/16 (prior §24) | — | 8.20 GB | 37.8 GB |
+| 1.0 (grouped-col) | parity: same IDs, same counters (1132/3332), cold=0 | — | 8.20 | 37.8 |
+| 0.5 | 16/16 | 1.75 | 7.04 | 44.3 (18.9+25.3) |
+| 0.25 | 16/16 | 1.75 | 6.46 | 47.4 (9.5+38.0) |
+
+bf16==fp32 at all positions, all runs. Routing wobble is audit-neutral (1128/3337 vs 1132/3332). Claim upgrades from "a DeepSeek result" to structural: column-granular exact residency works for per-expert modules AND fused grouped tensors through the same summation-partition principle, with zero architecture-specific code in either executor.
