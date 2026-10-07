@@ -121,6 +121,12 @@ class TieredMoEWrapper(nn.Module):
         self.hits = 0
         self.misses = 0
         self.dma_bytes = 0
+        self.seed_loads = 0
+        # Prefill self-profile: first forward's union + per-expert token
+        # frequency (the request's own touch pattern — a zero-mispredict
+        # predictor for decode, free with the prefill pass).
+        self.prefill_union = None
+        self.prefill_freq = None
         self.zssr_predictions = 0
         self.zssr_correct = 0
         self.zssr_suppressed = 0
@@ -162,6 +168,37 @@ class TieredMoEWrapper(nn.Module):
     def _sync_dma(self) -> None:
         if self.dma_stream is not None and self.device.type == "cuda":
             torch.cuda.current_stream(self.device).wait_stream(self.dma_stream)
+
+    def seed_from_prefill(self, policy: str = "freq") -> int:
+        """Pre-position decode slots from the prefill self-profile.
+
+        Policies: "freq" (load top-C prefill-frequent experts, most
+        frequent most-recent), anything else = no-op (control: LRU tail
+        left by prefill). Data movement only — values never change, so
+        exactness is unaffected by construction. Returns seed loads.
+        """
+        if policy != "freq" or not self.prefill_union:
+            return 0
+        import torch as _torch
+        freq = self.prefill_freq or [1] * self.spec.n_routed
+        order = sorted(self.prefill_union,
+                       key=lambda e: freq[e] if e < len(freq) else 0)
+        loaded = 0
+        with torch.no_grad():
+            for exp_id in order[:self.capacity]:
+                if exp_id in self.expert_to_slot:
+                    slot_idx = self.expert_to_slot[exp_id]
+                    self.slot_lru.remove(slot_idx)
+                    self.slot_lru.append(slot_idx)
+                    continue
+                self.misses += 1
+                slot_idx = self.slot_lru.pop(0)
+                self._load_expert_to_slot(exp_id, slot_idx)
+                self.slot_lru.append(slot_idx)
+                loaded += 1
+        self._sync_dma()
+        self.seed_loads += loaded
+        return loaded
 
     # -- ZSSR prefetch (whole experts; prediction moves data only) ----
     def zssr_prefetch(self, hidden_in: torch.Tensor):
@@ -249,6 +286,17 @@ class TieredMoEWrapper(nn.Module):
         needed_experts = topk_indices.unique().tolist()
         if self.routing_log is not None:
             self.routing_log.append((self.layer_idx, needed_experts))
+        if self.prefill_union is None:
+            # First forward is the prefill pass: record its union and
+            # per-expert token counts (single bincount, off the hot path
+            # thereafter). Values untouched — telemetry only.
+            self.prefill_union = list(needed_experts)
+            try:
+                self.prefill_freq = torch.bincount(
+                    topk_indices.reshape(-1).long(),
+                    minlength=self.spec.n_routed).tolist()
+            except Exception:
+                self.prefill_freq = [1] * self.spec.n_routed
 
         if self._prefetched:
             actual = set(needed_experts)

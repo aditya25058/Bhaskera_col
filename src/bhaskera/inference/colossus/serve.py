@@ -169,6 +169,7 @@ def serve_huge_moe(model, tokenizer, profile, handles: ShardHandles,
                    cold_cache_cap: int = 0,
                    grouped_gemm: bool = False,
                    matrix_tiers: bool = False,
+                   prefill_seed: str = "off",
                    ) -> dict[str, Any]:
     """Greedy lockstep serve with ledger. Returns results dict."""
     from transformers.cache_utils import DynamicCache
@@ -234,6 +235,17 @@ def serve_huge_moe(model, tokenizer, profile, handles: ShardHandles,
     if device.type == "cuda":
         torch.cuda.synchronize(device)
     t_prefill = time.perf_counter() - t_prefill
+    seed_loads = 0
+    if prefill_seed and prefill_seed != "off":
+        # Self-seeding: pre-position decode slots from each wrapper's
+        # prefill self-profile (data movement only — values untouched).
+        for w in wrappers:
+            seed = getattr(w, "seed_from_prefill", None)
+            if callable(seed):
+                try:
+                    seed_loads += seed(prefill_seed)
+                except Exception:
+                    pass
     if next_token.device != device:
         next_token = next_token.to(device)
     # Teacher-forced flip audit (B=1 only): feed reference tokens, record own
@@ -365,6 +377,7 @@ def serve_huge_moe(model, tokenizer, profile, handles: ShardHandles,
         "cold_dma_mb": cold_dma_mb,
         "cold_hits": sum(getattr(w, "cold_hits", 0) for w in wrappers),
         "stall_ms": sum(getattr(w, "stall_ms", 0.0) for w in wrappers),
+        "seed_loads": seed_loads,
         "routing_log_steps": routing_steps,
         "flip_audit": flip_audit,
     }

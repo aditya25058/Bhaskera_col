@@ -227,3 +227,21 @@ def test_streaming_floor_misses_everything_exact():
     assert torch.equal(y1, y2)  # deterministic despite zero residency
     assert not w.expert_to_slot  # bindings die every forward
     assert w.hits == 0 and w.misses > 0
+
+
+def test_seed_from_prefill_moves_data_not_values():
+    torch.manual_seed(9)
+    model, wrappers, _ = _wrapped_model()
+    x = torch.randn(2, 3, 16)
+    with torch.no_grad():
+        y_before = model(x)
+    n = sum(w.seed_from_prefill("freq") for w in wrappers)
+    assert n >= 0
+    # Seeding is data movement only: outputs bitwise identical.
+    with torch.no_grad():
+        y_after = model(x)
+    assert torch.equal(y_before, y_after)
+    # Control policy is a no-op returning zero.
+    assert sum(w.seed_from_prefill("off") for w in wrappers) == 0
+    # Prefill profile recorded on first forward.
+    assert all(w.prefill_union for w in wrappers)

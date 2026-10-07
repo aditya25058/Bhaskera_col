@@ -145,6 +145,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--grouped-gemm", action="store_true",
                    help="Batched dispatch: one bmm trio per tier per layer "
                         "(fewer launches; audit-gated, ulp risk)")
+    p.add_argument("--prefill-seed", default="off", choices=["off", "freq"],
+                   help="Seed decode slots from prefill self-profile "
+                        "(data movement only; exactness unaffected)")
     p.add_argument("--matrix-tiers", action="store_true",
                    help="FIRM-like control: per-matrix LRU pools instead of "
                         "whole-expert or column slots")
@@ -445,7 +448,8 @@ def main(argv: List[str] = None) -> None:
             hot_col_frac=args.hot_col_frac,
             hot_tier_file=args.hot_tier_file,
             cold_cache_cap=args.cold_cache,
-            matrix_tiers=args.matrix_tiers)
+            matrix_tiers=args.matrix_tiers,
+            prefill_seed=args.prefill_seed)
         elapsed = time.perf_counter() - t0
         outputs = res["texts"]
         total_output_tokens = sum(_count_output_tokens(o, tokenizer) for o in outputs)
@@ -460,6 +464,8 @@ def main(argv: List[str] = None) -> None:
               f"hits={res['total_hits']} misses={res['total_misses']} | "
               f"DMA={res['total_dma_mb']:.1f} MB | prefill={res['prefill_s']:.1f}s | "
               f"Peak VRAM: {res['peak_vram_gb']:.2f} GB")
+        if res.get("seed_loads"):
+            print(f"SEED: prefill-seeded {res['seed_loads']} slot loads")
         if res.get("hot_dma_mb") is not None:
             print(f"COLUMN f={res['hot_frac']} | "
                   f"hot={res['hot_dma_mb']:.1f} MB "
